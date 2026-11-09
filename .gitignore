@@ -1,0 +1,23 @@
+/app/target/
+/app/shots/
+
+# Local investigation and workspace artifacts
+/app/tools/
+/app/MECHANICS.md
+/app/mechanics.json
+/capture/
+/checks/
+/inbox/
+/investigation.cany/
+/pinned/
+/reference/
+/agent-session.jsonl
+/build-activity.log
+/craft.json
+/feed.json
+/usage.json
+
+# Local credentials and settings
+.env
+.env.*
+livemix_preset.txt

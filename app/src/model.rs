@@ -1,0 +1,2005 @@
+// Switcher state and rules. Numbers come from MECHANICS.md.
+
+use eframe::egui::Color32;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    Fade,
+    Zoom,
+    Wipe,
+    Slide,
+    Fly,
+    CrossZoom,
+    FlyRotate,
+    Cube,
+    CubeZoom,
+    VerticalWipe,
+    VerticalSlide,
+    Merge,
+    WipeReverse,
+    SlideReverse,
+    VerticalWipeReverse,
+    VerticalSlideReverse,
+    BarnDoor,
+    RollerDoor,
+    Cut,
+}
+
+/// Same order as the original's effect list (19 effects).
+pub const ALL_EFFECTS: [Effect; 19] = [
+    Effect::Fade,
+    Effect::Zoom,
+    Effect::Wipe,
+    Effect::Slide,
+    Effect::Fly,
+    Effect::CrossZoom,
+    Effect::FlyRotate,
+    Effect::Cube,
+    Effect::CubeZoom,
+    Effect::VerticalWipe,
+    Effect::VerticalSlide,
+    Effect::Merge,
+    Effect::WipeReverse,
+    Effect::SlideReverse,
+    Effect::VerticalWipeReverse,
+    Effect::VerticalSlideReverse,
+    Effect::BarnDoor,
+    Effect::RollerDoor,
+    Effect::Cut,
+];
+
+pub const OVERLAY_EFFECTS: [Effect; 6] = [Effect::Fade, Effect::Zoom, Effect::Wipe, Effect::Slide, Effect::VerticalSlide, Effect::Cut];
+
+impl Effect {
+    pub fn name(self) -> &'static str {
+        match self {
+            Effect::Fade => "Fade",
+            Effect::Zoom => "Zoom",
+            Effect::Wipe => "Wipe",
+            Effect::Slide => "Slide",
+            Effect::Fly => "Fly",
+            Effect::CrossZoom => "CrossZoom",
+            Effect::FlyRotate => "FlyRotate",
+            Effect::Cube => "Cube",
+            Effect::CubeZoom => "CubeZoom",
+            Effect::VerticalWipe => "VerticalWipe",
+            Effect::VerticalSlide => "VerticalSlide",
+            Effect::Merge => "Merge",
+            Effect::WipeReverse => "WipeReverse",
+            Effect::SlideReverse => "SlideReverse",
+            Effect::VerticalWipeReverse => "VWipeReverse",
+            Effect::VerticalSlideReverse => "VSlideReverse",
+            Effect::BarnDoor => "BarnDoor",
+            Effect::RollerDoor => "RollerDoor",
+            Effect::Cut => "Cut",
+        }
+    }
+    fn code(self) -> usize {
+        ALL_EFFECTS.iter().position(|e| *e == self).unwrap_or(0)
+    }
+    fn from_code(c: usize) -> Effect {
+        ALL_EFFECTS.get(c).copied().unwrap_or(Effect::Fade)
+    }
+    pub fn code_pub(self) -> usize {
+        self.code()
+    }
+    pub fn from_code_pub(c: usize) -> Effect {
+        Self::from_code(c)
+    }
+}
+
+pub const CATEGORIES: [(&str, Color32); 6] = [
+    ("Green", Color32::from_rgb(0x3c, 0xc0, 0x4a)),
+    ("Red", Color32::from_rgb(0xe0, 0x40, 0x40)),
+    ("Purple", Color32::from_rgb(0xa0, 0x5c, 0xe0)),
+    ("Orange", Color32::from_rgb(0xff, 0x8c, 0x00)),
+    ("Blue", Color32::from_rgb(0x40, 0x8c, 0xff)),
+    ("Aqua", Color32::from_rgb(0x30, 0xd0, 0xd0)),
+];
+
+#[derive(Clone, Debug)]
+pub enum Kind {
+    Colour(Color32),
+    Bars,
+    Title { text: String, sub: String },
+    Blank,
+    Clock,
+    Camera(u32),
+    Video { hue: f32 },
+    Image(u32),
+    /// A real capture device (webcam, capture card, Blackmagic device).
+    Device { link: String, blackmagic: bool },
+    /// A real video file.
+    VideoFile { path: String },
+    /// A real picture file.
+    ImageFile { path: String },
+    /// "List": several video files played one after another (original's Video List input).
+    VideoList { paths: Vec<String>, idx: usize },
+    /// "NDI / Desktop Capture": the whole Windows desktop.
+    Desktop,
+    /// "Image Sequence / Stinger": a folder of numbered pictures played as video.
+    ImageSequence { folder: String },
+    /// "Photos": a slideshow of the pictures in a folder.
+    Photos { folder: String },
+}
+
+impl Kind {
+    pub fn playable(&self) -> bool {
+        matches!(self, Kind::Video { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::ImageSequence { .. } | Kind::Photos { .. })
+    }
+    /// Only the test inputs have (simulated) sound; real audio capture is not built yet.
+    pub fn has_audio(&self) -> bool {
+        matches!(self, Kind::Video { .. } | Kind::Camera(_))
+    }
+    pub fn transparent(&self) -> bool {
+        matches!(self, Kind::Title { .. } | Kind::Blank | Kind::ImageFile { .. } | Kind::ImageSequence { .. })
+    }
+    pub fn keyable(&self) -> bool {
+        matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop)
+    }
+    /// Inputs whose picture comes from a media thread (camera, files, desktop…).
+    pub fn streamed(&self) -> bool {
+        matches!(
+            self,
+            Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. }
+        )
+    }
+}
+
+/// Green-screen (chroma key) settings of an input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Key {
+    pub on: bool,
+    pub colour: [u8; 3],
+    pub tolerance: u8,
+}
+
+impl Default for Key {
+    fn default() -> Self {
+        Key { on: false, colour: [0, 177, 64], tolerance: 60 }
+    }
+}
+
+/// Where an input (or a layer) sits in the frame — the original's MatrixPosition
+/// (ctor @0x2bc140: zoom 1, pan 0; matrix @0x2bc778: scale by zoom, then move by
+/// Pan X × half the width and Pan Y × half the height, up positive). Crop is the original's
+/// 0–10000 trackbar scale (frmInputSettings tCropX1..Y2) stored as 0..1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Position {
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    /// x1, y1, x2, y2 (0..1); default 0, 0, 1, 1 = no crop.
+    pub crop: [f32; 4],
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Position { zoom: 1.0, pan_x: 0.0, pan_y: 0.0, crop: [0.0, 0.0, 1.0, 1.0] }
+    }
+}
+
+/// One of an input's layers (the original has 10: ShortcutFunction SetLayer1..10Zoom/PanX/…).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Layer {
+    pub on: bool,
+    pub input: Option<u32>,
+    pub place: Position,
+}
+
+/// Number of layers per input (ShortcutFunction SetLayer1..SetLayer10).
+pub const LAYERS: usize = 10;
+
+#[derive(Clone, Debug)]
+pub struct Input {
+    /// Position in the frame (Input Settings → Position).
+    pub place: Position,
+    /// Tile shrunk to its title bar (double-click the title).
+    pub collapsed: bool,
+    /// Up to 10 other inputs drawn on top (Input Settings → Layers).
+    pub layers: [Layer; LAYERS],
+    pub id: u32,
+    pub title: String,
+    pub kind: Kind,
+    pub category: Option<u8>,
+    pub loop_on: bool,
+    pub playing: bool,
+    pub pos: f32,
+    pub duration: f32,
+    pub audio_on: bool,
+    pub volume: f32,
+    pub bus_m: bool,
+    pub bus_a: bool,
+    pub bus_b: bool,
+    /// Live picture of a real input (texture id and pixel size), filled in by the UI.
+    pub tex: Option<(eframe::egui::TextureId, [usize; 2])>,
+    /// Photos: previous picture during the fade, with fade progress 0..1.
+    pub prev_tex: Option<(eframe::egui::TextureId, [usize; 2], f32)>,
+    /// "Starting…", "No signal …" etc. for real inputs.
+    pub status: String,
+    pub restart_req: bool,
+    pub key: Key,
+    /// Camera: the capture mode chosen in Input Settings (None = Auto), every mode the camera
+    /// offers and the one in use (filled in from the camera reader).
+    pub cam_mode: Option<crate::media::CamMode>,
+    pub cam_modes: Vec<crate::media::CamMode>,
+    pub cam_current: Option<crate::media::CamMode>,
+}
+
+impl Input {
+    pub fn new(id: u32, title: &str, kind: Kind) -> Self {
+        Input {
+            place: Position::default(),
+            collapsed: false,
+            layers: [Layer::default(); LAYERS],
+            id,
+            title: title.to_string(),
+            kind,
+            category: None,
+            loop_on: false,
+            playing: false,
+            pos: 0.0,
+            duration: 60.0,
+            audio_on: true,
+            volume: 80.0,
+            bus_m: true,
+            bus_a: false,
+            bus_b: false,
+            tex: None,
+            prev_tex: None,
+            status: String::new(),
+            restart_req: false,
+            key: Key::default(),
+            cam_mode: None,
+            cam_modes: Vec::new(),
+            cam_current: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TransBtn {
+    pub effect: Effect,
+    pub ms: u32,
+}
+
+/// A running transition. `progress` is on the original's 0–255 scale (hm::r @0x8b760).
+pub struct Trans {
+    pub from: Option<u32>,
+    pub to: u32,
+    pub effect: Effect,
+    pub progress: f32,
+    pub step: f32,
+    pub manual: bool,
+    /// Per-input Quick Play / Cut: Output becomes `to`, Preview is kept (ms::w @0x12e904).
+    pub direct: bool,
+}
+
+/// An overlay layer; `level` is 0–255 like the original's `rs::b` (rs::t @0x1b0890).
+pub struct Overlay {
+    pub input: Option<u32>,
+    pub on: bool,
+    pub level: f32,
+    pub effect: Effect,
+    pub ms: u32,
+    /// Right-click puts the overlay on Preview instead of Output (ms::zzo @0x1301ac).
+    pub on_preview: bool,
+}
+
+// ---- numbers from the mechanics sheet ----
+/// Output render rate for the frame-based step: the project's Master Frame Rate (Settings →
+/// Display). Default 59.94 (1080i59.94 in the screenshot of the original); interlaced formats
+/// render per field (md::e @0x11ebe8 halves the frame duration), so the field rate is used.
+static OUTPUT_FPS_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub const DEFAULT_FPS: f32 = 59.94;
+pub fn output_fps() -> f32 {
+    match OUTPUT_FPS_BITS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DEFAULT_FPS,
+        b => f32::from_bits(b),
+    }
+}
+pub fn set_output_fps(fps: f32) {
+    OUTPUT_FPS_BITS.store(fps.clamp(1.0, 240.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Output sizes offered for the project (the original's size list 640x480 … 1920x1080, plus
+/// 2560x1440 and 3840x2160).
+pub const OUTPUT_SIZES: [(u32, u32); 9] = [(640, 480), (720, 480), (720, 576), (768, 480), (768, 576), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
+/// Master Frame Rate choices (frames per second; for interlaced output: fields per second).
+pub const FRAME_RATES: [(&str, f32); 8] = [("23.976", 23.976), ("24", 24.0), ("25", 25.0), ("29.97", 29.97), ("30", 30.0), ("50", 50.0), ("59.94", 59.94), ("60", 60.0)];
+/// Full scale of transition progress, overlay level and T-bar (hm::r, rs::t, ms::zzzzzze).
+pub const FULL: f32 = 255.0;
+/// mr::zzy @0x12ce3c: step = 256 / round(ms * fps / 1000).
+const STEP_NUMERATOR: f32 = 256.0;
+/// ms::zzzz @0x131c20: durations <= 0 or >= 10000 are replaced with 500.
+pub const MAX_DURATION_MS: u32 = 10000;
+const INVALID_DURATION_MS: u32 = 500;
+
+/// mr::zzy: frames-based step on the 0–255 scale.
+pub fn step_for(ms: u32) -> f32 {
+    let frames = (ms as f32 * output_fps() / 1000.0).round();
+    if frames <= 0.0 {
+        // hm::f: a zero step becomes 1; a zero frame count makes the step "infinite",
+        // which finishes on the next frame.
+        return FULL;
+    }
+    STEP_NUMERATOR / frames
+}
+
+/// ms::zzzz duration rule.
+pub fn sanitize_ms(ms: u32) -> u32 {
+    if ms == 0 || ms >= MAX_DURATION_MS {
+        INVALID_DURATION_MS
+    } else {
+        ms
+    }
+}
+
+/// Input types of the Add Input window, in the original's order (language file
+/// frmInput.tMenu.*), followed by this app's extras.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AddKind {
+    VideoFile,
+    Dvd,
+    List,
+    Camera,
+    Desktop,
+    StreamSrt,
+    Replay,
+    ImageSequence,
+    VideoDelay,
+    ImageFile,
+    Photos,
+    PowerPoint,
+    Colour,
+    AudioFile,
+    AudioInput,
+    Title,
+    VirtualSet,
+    WebBrowser,
+    VideoCall,
+    Zoom,
+    Telestrator,
+    // extras of this app
+    Blackmagic,
+    Clock,
+    TestCamera,
+    TestVideo,
+    TestImage,
+}
+
+pub const ADD_KINDS: [AddKind; 26] = [
+    AddKind::VideoFile,
+    AddKind::Dvd,
+    AddKind::List,
+    AddKind::Camera,
+    AddKind::Desktop,
+    AddKind::StreamSrt,
+    AddKind::Replay,
+    AddKind::ImageSequence,
+    AddKind::VideoDelay,
+    AddKind::ImageFile,
+    AddKind::Photos,
+    AddKind::PowerPoint,
+    AddKind::Colour,
+    AddKind::AudioFile,
+    AddKind::AudioInput,
+    AddKind::Title,
+    AddKind::VirtualSet,
+    AddKind::WebBrowser,
+    AddKind::VideoCall,
+    AddKind::Zoom,
+    AddKind::Telestrator,
+    AddKind::Blackmagic,
+    AddKind::Clock,
+    AddKind::TestCamera,
+    AddKind::TestVideo,
+    AddKind::TestImage,
+];
+
+/// Number of entries that come from the original's list (the rest are this app's extras).
+pub const ORIGINAL_ADD_KINDS: usize = 21;
+
+impl AddKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            AddKind::VideoFile => "Video",
+            AddKind::Dvd => "DVD",
+            AddKind::List => "List",
+            AddKind::Camera => "Camera",
+            AddKind::Desktop => "NDI / Desktop Capture",
+            AddKind::StreamSrt => "Stream / SRT",
+            AddKind::Replay => "Instant Replay",
+            AddKind::ImageSequence => "Image Sequence / Stinger",
+            AddKind::VideoDelay => "Video Delay",
+            AddKind::ImageFile => "Image",
+            AddKind::Photos => "Photos",
+            AddKind::PowerPoint => "PowerPoint",
+            AddKind::Colour => "Colour",
+            AddKind::AudioFile => "Audio",
+            AddKind::AudioInput => "Audio Input",
+            AddKind::Title => "Title",
+            AddKind::VirtualSet => "Virtual Set",
+            AddKind::WebBrowser => "Web Browser",
+            AddKind::VideoCall => "Video Call",
+            AddKind::Zoom => "Zoom",
+            AddKind::Telestrator => "Telestrator",
+            AddKind::Blackmagic => "Blackmagic",
+            AddKind::Clock => "Production Clock",
+            AddKind::TestCamera => "Test Camera",
+            AddKind::TestVideo => "Test Video",
+            AddKind::TestImage => "Test Image",
+        }
+    }
+    /// Built in this version?
+    pub fn available(self) -> bool {
+        !matches!(
+            self,
+            AddKind::Dvd
+                | AddKind::StreamSrt
+                | AddKind::Replay
+                | AddKind::VideoDelay
+                | AddKind::PowerPoint
+                | AddKind::AudioFile
+                | AddKind::AudioInput
+                | AddKind::VirtualSet
+                | AddKind::WebBrowser
+                | AddKind::VideoCall
+                | AddKind::Zoom
+                | AddKind::Telestrator
+        )
+    }
+    pub fn help(self) -> &'static str {
+        match self {
+            AddKind::VideoFile => "A video file (MP4, MOV, WMV, AVI, MKV…). Plays, pauses, restarts and loops.",
+            AddKind::List => "Several video files played one after another. Loop repeats the whole list.",
+            AddKind::Camera => "A webcam, USB camera, HDMI/SDI capture card, Blackmagic device or NDI Webcam on this computer.",
+            AddKind::Desktop => "Captures this computer's desktop (main screen). NDI sources appear under Camera through NDI Webcam.",
+            AddKind::ImageSequence => "A folder of numbered pictures (PNG with transparency works as a stinger) played as a clip at the output frame rate.",
+            AddKind::ImageFile => "A picture file (PNG, JPG, BMP). PNG transparency is kept, so logos work as Overlays.",
+            AddKind::Photos => "A slideshow of every picture in a folder (JPG, PNG, BMP, TIF, GIF); while playing it moves to the next picture every 2 seconds.",
+            AddKind::Colour => "A solid colour, a transparent (empty) input or colour bars.",
+            AddKind::Title => "A lower-third title with a transparent background, ideal as an Overlay.",
+            AddKind::Blackmagic => "Blackmagic DeckLink, Intensity, UltraStudio, ATEM Mini or Web Presenter. DeckLink/Intensity/UltraStudio need Blackmagic Desktop Video installed.",
+            AddKind::Clock => "A clock counting up from when the show started.",
+            AddKind::TestCamera => "A drawn stand-in camera picture (for practice without hardware).",
+            AddKind::TestVideo => "A drawn stand-in clip with a play position.",
+            AddKind::TestImage => "A drawn stand-in still picture.",
+            AddKind::Dvd => "Play a DVD disc — not available in this version.",
+            AddKind::StreamSrt => "Receive an RTMP/RTSP/SRT stream — not available in this version.",
+            AddKind::Replay => "Instant Replay with slow motion — not available in this version.",
+            AddKind::VideoDelay => "A delayed copy of another input — not available in this version.",
+            AddKind::PowerPoint => "PowerPoint slides — not available in this version (export the slides as pictures and use Photos).",
+            AddKind::AudioFile => "An audio file — not available in this version (audio is not built yet).",
+            AddKind::AudioInput => "A microphone or line input — not available in this version (audio is not built yet).",
+            AddKind::VirtualSet => "Virtual studio sets — not available in this version.",
+            AddKind::WebBrowser => "A web page as an input — not available in this version.",
+            AddKind::VideoCall => "Remote guests by video call — not available in this version.",
+            AddKind::Zoom => "Zoom meeting participants — not available in this version.",
+            AddKind::Telestrator => "Drawing over video — not available in this version.",
+        }
+    }
+    pub fn uses_device(self) -> bool {
+        matches!(self, AddKind::Camera | AddKind::Blackmagic)
+    }
+    /// Needs a file (Some(true) = video, Some(false) = picture).
+    pub fn file_kind(self) -> Option<bool> {
+        match self {
+            AddKind::VideoFile => Some(true),
+            AddKind::ImageFile => Some(false),
+            _ => None,
+        }
+    }
+    pub fn uses_folder(self) -> bool {
+        matches!(self, AddKind::ImageSequence | AddKind::Photos)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceChoice {
+    pub name: String,
+    pub link: String,
+    pub blackmagic: bool,
+}
+
+pub struct AddDialog {
+    pub open: bool,
+    pub kind: AddKind,
+    pub name: String,
+    pub text: String,
+    pub text2: String,
+    pub colour: Color32,
+    pub length: f32,
+    pub devices: Vec<DeviceChoice>,
+    pub devices_loaded: bool,
+    pub device: usize,
+    pub path: String,
+    /// Colour type options of the original (frmInput rColour / rTransparent / rColourBars):
+    /// 0 = Colour, 1 = Transparent, 2 = Colour Bars.
+    pub colour_mode: u8,
+    /// Files of a List input.
+    pub list: Vec<String>,
+    /// Folder of an Image Sequence or Photos input.
+    pub folder: String,
+}
+
+pub struct Switcher {
+    pub inputs: Vec<Input>,
+    next_id: u32,
+    pub preview: Option<u32>,
+    pub output: Option<u32>,
+    pub trans: Option<Trans>,
+    pub transitions: [TransBtn; 4],
+    pub quickplay_effect: Effect,
+    pub quickplay_ms: u32,
+    pub ftb_on: bool,
+    pub ftb_level: f32,
+    pub ftb_ms: u32,
+    pub ftb_audio: bool,
+    pub overlays: [Overlay; 4],
+    pub rec: Option<f64>,
+    pub multicorder: Option<f64>,
+    pub playlist: Option<f64>,
+    pub playlist_secs: f32,
+    /// Fullscreen display (top bar "Fullscreen"): its own borderless window filling the chosen screen.
+    pub fullscreen: bool,
+    /// The External window switched to fullscreen (double-click on it).
+    pub ext_full: bool,
+    /// Setup windows of the gear buttons next to Record, Stream, MultiCorder and PlayList
+    /// (frmmain cmdRecSetup, cmdStreamingSetup, cmdMultiCorderSetup, cmdPlayListSetup).
+    pub rec_setup: bool,
+    pub stream_setup: bool,
+    pub mc_setup: bool,
+    pub playlist_setup: bool,
+    /// Inputs left out of the MultiCorder / the PlayList (ticked off in their setup windows).
+    pub mc_off: std::collections::HashSet<u32>,
+    pub playlist_off: std::collections::HashSet<u32>,
+    /// Which field a folder picked with Browse goes to: 0 = Add Input, 1 = Recording, 2 = MultiCorder.
+    pub browse_for: u8,
+    pub show_mixer: bool,
+    pub settings_open: bool,
+    pub overlay_dialog: bool,
+    pub add_dialog: AddDialog,
+    pub filter: Option<u8>,
+    pub confirm_close: Option<u32>,
+    pub master_volume: f32,
+    pub master_on: bool,
+    pub pause_preview: bool,
+    pub play_active: bool,
+    pub restart_active: bool,
+    pub preset_name: String,
+    pub notice: String,
+    notice_until: f64,
+    now: f64,
+    /// T-bar value on the 0–255 scale (ms::zzzzzze @0x133cc0).
+    tbar: f32,
+    tbar_rest_bottom: bool,
+    frame_acc: f32,
+    // ---- requests from the UI to the app (real media, files, windows) ----
+    /// Where the Output monitor is on screen (for snapshots and recording).
+    pub output_rect: eframe::egui::Rect,
+    /// Where the Preview monitor's picture is on screen (for its waveform).
+    pub preview_rect: eframe::egui::Rect,
+    /// Waveform picture of the Preview (made by the app from window pictures), when shown.
+    pub waveform_tex: Option<eframe::egui::TextureId>,
+    /// Interface frame counter (Preview Skip).
+    pub ui_frame: u64,
+    pub snapshot_req: bool,
+    /// Some(true) = pick a video file, Some(false) = pick a picture.
+    pub browse_req: Option<crate::media::PickKind>,
+    pub refresh_devices: bool,
+    pub dialog_error: String,
+    /// External window open (the "External" button).
+    pub output_window: bool,
+    /// Input whose settings window (name, green-screen key) is open.
+    pub settings_input: Option<u32>,
+    /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
+    pub confirm_stop: Option<&'static str>,
+    /// Position copied in Input Settings (Copy / Paste buttons of the original).
+    pub position_clipboard: Option<Position>,
+    /// Options from the original's Settings window (defaults from its settings file).
+    pub cfg: Settings,
+}
+
+// What an output window or a MultiView box shows: 0 = Output, 1 = Preview, an input id + 1,
+// or MultiView 1 / 2 (Settings → Outputs "Source" column of the original).
+pub const SRC_OUTPUT: u32 = 0;
+pub const SRC_PREVIEW: u32 = 1;
+pub const SRC_MV1: u32 = u32::MAX - 1;
+pub const SRC_MV2: u32 = u32::MAX - 2;
+/// MultiView box left on automatic: the next input in list order.
+pub const MV_AUTO: u32 = u32::MAX;
+
+/// The original's enum vMix.MultiViewLayout (token 0x0200105c), in its order:
+/// Pro (= 0, the config default), Standard, Quad, Sixteen, One.
+pub const MV_LAYOUTS: [&str; 5] = ["Pro", "Standard", "Quad", "Sixteen", "One"];
+
+/// MultiView frame the original lays out in (output format 1080i59.94).
+const MV_W: i32 = 1920;
+const MV_H: i32 = 1080;
+
+/// .NET Math.Round(double): halves go to the even number.
+fn round_net(v: f64) -> i32 {
+    v.round_ties_even() as i32
+}
+
+/// Sizes of a MultiView layout — `qu::b` (0x06003e56 @ 0x193cf4) called with
+/// (rows of title strips, small boxes per column):
+/// returns (small box w, h), title strip height, column pitch, left margin of the small grid,
+/// big box pitch and left margin of the big boxes.
+fn mv_sizes(rows: i32, cols: i32) -> ((i32, i32), i32, i32, i32, i32, i32) {
+    // Title strip first guess = round(H / 36); the pictures share what is left.
+    let b0 = round_net(MV_H as f64 / 36.0);
+    let mut h6 = MV_H - b0 * rows;
+    while h6 % cols != 0 {
+        h6 -= 1;
+    }
+    let aspect = (MV_W as f64 / MV_H as f64) as f32;
+    let width = |h6: i32| ((h6 as f64 / cols as f64) * aspect as f64) as f32;
+    let mut w = width(h6);
+    // For 16:9 and 4:3 frames the picture height drops until the box width is a whole pixel.
+    if aspect == 16.0_f32 / 9.0 || aspect == 4.0_f32 / 3.0 {
+        while (w as f64) != (w as f64).round_ties_even() {
+            h6 -= 1;
+            w = width(h6);
+        }
+    }
+    let total_w = round_net(w as f64);
+    // The title strips share the remaining height evenly (rounded down to fit).
+    let mut rest = MV_H - h6;
+    while rest % rows != 0 {
+        rest -= 1;
+    }
+    let b = round_net(rest as f64 / rows as f64);
+    let gap = round_net(b as f64 / 2.0); // e: space between columns
+    let small = (total_w, round_net(h6 as f64 / cols as f64));
+    let pitch = small.0 + gap; // i
+    let left = round_net((MV_W - pitch * cols) as f64 / 2.0); // j
+    let big_pitch = small.0 * 2 + b; // k = m.Width + g
+    let big_left = round_net((MV_W - big_pitch * 2) as f64 / 2.0); // l
+    (small, b, pitch, left, big_pitch, big_left)
+}
+
+/// Boxes of a MultiView layout as [x, y, w, h] in 0..1 of the frame (the picture only; its
+/// name strip is right below it, `mv_title_height` tall), each with what it shows by default.
+/// From the original's layout builders in class `qu`:
+/// - Pro / Standard → `qu::f` (@ 0x1944c4, b(10, 8, 3, 4)): Preview and Output twice the small
+///   size side by side on top, then two rows of four inputs.
+/// - Quad → `qu::d` (@ 0x194124, b(4, 2, 2, 2)): 2×2 — Preview, Output, then two inputs.
+/// - Sixteen → `qu::e` (@ 0x1942e4, b(16, 14, 4, 4)): 4×4 — Preview, Output, then 14 inputs.
+/// - One → `qu::c` (@ 0x193fa4, b(1, 1, 1, 1)): the Output alone.
+pub fn mv_layout_boxes(layout: u8) -> Vec<([f32; 4], u32)> {
+    let norm = |x: i32, y: i32, w: i32, h: i32| [x as f32 / MV_W as f32, y as f32 / MV_H as f32, w as f32 / MV_W as f32, h as f32 / MV_H as f32];
+    let grid = |rows: i32, cols: i32, count: i32| -> Vec<([f32; 4], u32)> {
+        let ((sw, sh), b, pitch, left, _, _) = mv_sizes(rows, cols);
+        (0..count)
+            .map(|k| {
+                let (r, c) = (k / cols, k % cols);
+                let def = match k {
+                    0 => SRC_PREVIEW,
+                    1 => SRC_OUTPUT,
+                    _ => MV_AUTO,
+                };
+                (norm(left + c * pitch, r * (sh + b), sw, sh), def)
+            })
+            .collect()
+    };
+    match layout {
+        0 | 1 => {
+            let ((sw, sh), b, pitch, left, big_pitch, big_left) = mv_sizes(3, 4);
+            let (bw, bh) = (sw * 2, sh * 2);
+            let mut v = vec![(norm(big_left, 0, bw, bh), SRC_PREVIEW), (norm(big_left + big_pitch, 0, bw, bh), SRC_OUTPUT)];
+            for k in 0..8 {
+                let (r, c) = (k / 4, k % 4);
+                v.push((norm(left + c * pitch, bh + b + r * (sh + b), sw, sh), MV_AUTO));
+            }
+            v
+        }
+        2 => grid(2, 2, 4),
+        3 => grid(4, 4, 16),
+        _ => {
+            let ((sw, sh), _, pitch, left, _, _) = mv_sizes(1, 1);
+            let _ = pitch;
+            vec![(norm(left, 0, sw, sh), SRC_OUTPUT)]
+        }
+    }
+}
+
+/// Height of the name strip under each MultiView box, as a share of the frame height.
+pub fn mv_title_height(layout: u8) -> f32 {
+    let (rows, cols) = match layout {
+        0 | 1 => (3, 4),
+        2 => (2, 2),
+        3 => (4, 4),
+        _ => (1, 1),
+    };
+    mv_sizes(rows, cols).1 as f32 / MV_H as f32
+}
+
+/// Settings window options. Defaults are the original's config defaults.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// InputSize = 208x156 (ms::.cctor @0x12e000 falls back to 200x150).
+    pub input_w: f32,
+    pub input_h: f32,
+    /// InputNumbers = True.
+    pub input_numbers: bool,
+    /// InputCloseConfirm = False ("Display confirmation for Input Close button").
+    pub input_close_confirm: bool,
+    /// RecordingConfirm = True ("Display confirmation for Record, External, Stream and MultiCorder").
+    pub recording_confirm: bool,
+    /// PreviewClick = False ("Activate QuickPlay by clicking Preview Window").
+    pub preview_click: bool,
+    /// Transition Display: ShowQuickPlay / ShowTransitions24 / ShowFTB / ShowTBar = True.
+    pub show_quickplay: bool,
+    pub show_trans24: bool,
+    pub show_ftb: bool,
+    pub show_tbar: bool,
+    /// Overlay buttons in the transition column (no default in config — estimated True).
+    pub show_overlays: bool,
+    /// MasterAudioMeter = True, InputAudioMeter = True.
+    pub master_meter: bool,
+    pub input_meter: bool,
+    /// Alerts (AlertsXML empty = off): no-recording alert, FTB alert.
+    pub recording_alert: bool,
+    pub ftb_alert: bool,
+    /// Fullscreen = False, External = False (start-up options), Maximise = True.
+    pub start_fullscreen: bool,
+    pub start_external: bool,
+    pub start_maximised: bool,
+    /// External window source (config OutputsExternal, empty = Output): SRC_OUTPUT, SRC_PREVIEW,
+    /// SRC_MV1 / SRC_MV2 (MultiView 1 / 2) or an input id + 1.
+    pub ext_source: u32,
+    /// Include the overlays (Settings → Outputs "Overlays" column; estimated default on).
+    pub ext_overlays: bool,
+    /// Fullscreen display source (config OutputsFullscreen, empty = Output), same codes.
+    pub fs_source: u32,
+    pub fs_overlays: bool,
+    /// Screen the Fullscreen display fills (frmSettings lblOutputScreen "Display:"),
+    /// index into the monitor list; estimated default: the second screen when there is one.
+    pub fs_display: u8,
+    /// MultiView 1 and 2 layout (config MultiViewLayout / MultiViewLayout2 = 0 = Pro).
+    pub mv_layout: [u8; 2],
+    /// "Customise Layout" (config MultiViewInputs): what each small box shows.
+    /// MV_AUTO = the next input in list order, otherwise a source code as above.
+    pub mv_boxes: [Vec<u32>; 2],
+    /// OutputAlwaysOnTop = False, OutputHideCursor = False (config defaults).
+    pub ext_on_top: bool,
+    pub ext_hide_cursor: bool,
+    /// Window size: 0 = 960x540, 1 = 1280x720, 2 = 1920x1080.
+    pub ext_size: u8,
+    /// Recording Setup (frmRecordingSetup): folder ("" = Documents\LiveMixStorage), the name
+    /// that goes in front of the date (RecordingFilenameFormat "{0} - {1:dd MMMM yyyy - hh-mm-ss tt}"),
+    /// MP4 video bit rate in Mbps and "New File Every" minutes (0 = one file).
+    pub rec_folder: String,
+    pub rec_name: String,
+    pub rec_mbps: u32,
+    pub rec_split_min: u32,
+    /// MultiCorder (frmMultiCorder): folder ("Change Recording Folder"), video bit rate, new file every.
+    pub mc_folder: String,
+    pub mc_mbps: u32,
+    pub mc_split_min: u32,
+    /// Streaming Settings (frmStreaming): destination, URL, stream name or key, quality.
+    pub stream_dest: u8,
+    pub stream_url: String,
+    pub stream_key: String,
+    pub stream_quality: u8,
+    /// PlayList (frmPlaylist chkLoop): start again after the last input.
+    pub playlist_loop: bool,
+    /// Project format (Settings → Display "Output Size", "Master Frame Rate", interlaced):
+    /// indexes into OUTPUT_SIZES / FRAME_RATES. Default 1920x1080, 59.94, interlaced (the
+    /// original's status bar shows 1080i59,94; config Interlaced = True).
+    pub out_size: u8,
+    pub out_rate: u8,
+    pub interlaced: bool,
+    /// Performance (Settings → Performance): Preview Skip (draw the input boxes every Nth frame,
+    /// 1 = every frame), Synchronize Output with Refresh Rate (config LockBackBuffer = False:
+    /// otherwise the window redraws at the Master Frame Rate), Disable Effects on Input Previews
+    /// (input boxes skip layers and colour key), hardware encoder for recordings
+    /// (recording key "HardwareAcceleration" = 1, kh::get_n @0xe4334), and the largest camera
+    /// mode Auto picks.
+    pub preview_skip: u8,
+    pub lock_refresh: bool,
+    pub no_input_effects: bool,
+    pub hw_encoder: bool,
+    pub auto_cam_max_h: u32,
+    /// Preview monitor tools: safe areas and waveform.
+    pub show_safe: bool,
+    pub show_waveform: bool,
+    /// Selected section of the Input Settings window.
+    pub input_page: usize,
+    /// Selected page in the Settings window.
+    pub page: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            input_w: 208.0,
+            input_h: 156.0,
+            input_numbers: true,
+            input_close_confirm: false,
+            recording_confirm: true,
+            preview_click: false,
+            show_quickplay: true,
+            show_trans24: true,
+            show_ftb: true,
+            show_tbar: true,
+            show_overlays: true,
+            master_meter: true,
+            input_meter: true,
+            recording_alert: false,
+            ftb_alert: false,
+            start_fullscreen: false,
+            start_external: false,
+            start_maximised: true,
+            ext_source: SRC_OUTPUT,
+            ext_overlays: true,
+            fs_source: SRC_OUTPUT,
+            fs_overlays: true,
+            fs_display: 1,
+            mv_layout: [0, 0],
+            mv_boxes: [Vec::new(), Vec::new()],
+            ext_on_top: false,
+            ext_hide_cursor: false,
+            ext_size: 0,
+            rec_folder: String::new(),
+            rec_name: "capture".into(),
+            rec_mbps: crate::media::DEFAULT_MBPS,
+            rec_split_min: 0,
+            mc_folder: String::new(),
+            mc_mbps: crate::media::DEFAULT_MBPS,
+            mc_split_min: 0,
+            stream_dest: 0,
+            stream_url: String::new(),
+            stream_key: String::new(),
+            stream_quality: 1,
+            playlist_loop: true,
+            out_size: 6,
+            out_rate: 6,
+            interlaced: true,
+            preview_skip: 1,
+            lock_refresh: false,
+            no_input_effects: false,
+            hw_encoder: true,
+            auto_cam_max_h: 1080,
+            show_safe: false,
+            show_waveform: false,
+            input_page: 0,
+            page: 0,
+        }
+    }
+}
+
+impl Settings {
+    /// Project picture size in pixels.
+    pub fn out_dims(&self) -> (u32, u32) {
+        OUTPUT_SIZES[(self.out_size as usize).min(OUTPUT_SIZES.len() - 1)]
+    }
+    /// Master Frame Rate (fields per second when interlaced).
+    pub fn rate(&self) -> f32 {
+        FRAME_RATES[(self.out_rate as usize).min(FRAME_RATES.len() - 1)].1
+    }
+    /// Pictures per second written to a recording: interlaced formats carry two fields per frame.
+    pub fn frame_rate(&self) -> f32 {
+        if self.interlaced { self.rate() / 2.0 } else { self.rate() }
+    }
+    /// Status bar name of the format, as the original writes it: "1080i59,94".
+    pub fn format_label(&self) -> String {
+        let (_, h) = self.out_dims();
+        let rate = FRAME_RATES[(self.out_rate as usize).min(FRAME_RATES.len() - 1)].0.replace('.', ",");
+        format!("{}{}{}", h, if self.interlaced { "i" } else { "p" }, rate)
+    }
+}
+
+impl Switcher {
+    fn settings_path() -> std::path::PathBuf {
+        crate::media::storage_folder().join("settings.txt")
+    }
+
+    /// Saves the Settings window options (key=value lines).
+    pub fn save_settings(&self) {
+        let c = &self.cfg;
+        let b = |v: bool| if v { "1" } else { "0" };
+        let lines = [
+            format!("input_size={}x{}", c.input_w, c.input_h),
+            format!("input_numbers={}", b(c.input_numbers)),
+            format!("input_close_confirm={}", b(c.input_close_confirm)),
+            format!("recording_confirm={}", b(c.recording_confirm)),
+            format!("preview_click={}", b(c.preview_click)),
+            format!("show_quickplay={}", b(c.show_quickplay)),
+            format!("show_trans24={}", b(c.show_trans24)),
+            format!("show_ftb={}", b(c.show_ftb)),
+            format!("show_tbar={}", b(c.show_tbar)),
+            format!("show_overlays={}", b(c.show_overlays)),
+            format!("master_meter={}", b(c.master_meter)),
+            format!("input_meter={}", b(c.input_meter)),
+            format!("recording_alert={}", b(c.recording_alert)),
+            format!("ftb_alert={}", b(c.ftb_alert)),
+            format!("start_fullscreen={}", b(c.start_fullscreen)),
+            format!("start_external={}", b(c.start_external)),
+            format!("start_maximised={}", b(c.start_maximised)),
+            format!("ext_source={}", c.ext_source),
+            format!("ext_overlays={}", b(c.ext_overlays)),
+            format!("ext_on_top={}", b(c.ext_on_top)),
+            format!("ext_hide_cursor={}", b(c.ext_hide_cursor)),
+            format!("ext_size={}", c.ext_size),
+            format!("fs_source={}", c.fs_source),
+            format!("fs_overlays={}", b(c.fs_overlays)),
+            format!("fs_display={}", c.fs_display),
+            format!("mv_layout={},{}", c.mv_layout[0], c.mv_layout[1]),
+            format!("mv_boxes1={}", c.mv_boxes[0].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")),
+            format!("mv_boxes2={}", c.mv_boxes[1].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")),
+            format!("rec_folder={}", c.rec_folder),
+            format!("rec_name={}", c.rec_name),
+            format!("rec_mbps={}", c.rec_mbps),
+            format!("rec_split_min={}", c.rec_split_min),
+            format!("mc_folder={}", c.mc_folder),
+            format!("mc_mbps={}", c.mc_mbps),
+            format!("mc_split_min={}", c.mc_split_min),
+            format!("stream_dest={}", c.stream_dest),
+            format!("stream_url={}", c.stream_url),
+            format!("stream_key={}", c.stream_key),
+            format!("stream_quality={}", c.stream_quality),
+            format!("playlist_loop={}", b(c.playlist_loop)),
+            format!("out_size={}", c.out_size),
+            format!("out_rate={}", c.out_rate),
+            format!("interlaced={}", b(c.interlaced)),
+            format!("preview_skip={}", c.preview_skip),
+            format!("lock_refresh={}", b(c.lock_refresh)),
+            format!("no_input_effects={}", b(c.no_input_effects)),
+            format!("hw_encoder={}", b(c.hw_encoder)),
+            format!("auto_cam_max_h={}", c.auto_cam_max_h),
+            format!("show_safe={}", b(c.show_safe)),
+            format!("show_waveform={}", b(c.show_waveform)),
+            format!("quickplay={},{}", self.quickplay_effect.code_pub(), self.quickplay_ms),
+            format!("ftb_ms={}", self.ftb_ms),
+            format!("ftb_audio={}", b(self.ftb_audio)),
+            format!("pause_preview={}", b(self.pause_preview)),
+            format!("play_active={}", b(self.play_active)),
+            format!("restart_active={}", b(self.restart_active)),
+            format!("playlist_secs={}", self.playlist_secs),
+        ];
+        let _ = std::fs::write(Self::settings_path(), lines.join("\n"));
+    }
+
+    /// Loads saved Settings window options, if any.
+    pub fn load_settings(&mut self) {
+        let Ok(text) = std::fs::read_to_string(Self::settings_path()) else { return };
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let on = v == "1";
+            let c = &mut self.cfg;
+            match k {
+                "input_size" => {
+                    if let Some((w, h)) = v.split_once('x') {
+                        c.input_w = w.parse::<f32>().unwrap_or(208.0).clamp(120.0, 480.0);
+                        c.input_h = h.parse::<f32>().unwrap_or(156.0).clamp(68.0, 360.0);
+                    }
+                }
+                "input_numbers" => c.input_numbers = on,
+                "input_close_confirm" => c.input_close_confirm = on,
+                "recording_confirm" => c.recording_confirm = on,
+                "preview_click" => c.preview_click = on,
+                "show_quickplay" => c.show_quickplay = on,
+                "show_trans24" => c.show_trans24 = on,
+                "show_ftb" => c.show_ftb = on,
+                "show_tbar" => c.show_tbar = on,
+                "show_overlays" => c.show_overlays = on,
+                "master_meter" => c.master_meter = on,
+                "input_meter" => c.input_meter = on,
+                "recording_alert" => c.recording_alert = on,
+                "ftb_alert" => c.ftb_alert = on,
+                "start_fullscreen" => c.start_fullscreen = on,
+                "start_external" => c.start_external = on,
+                "start_maximised" => c.start_maximised = on,
+                "ext_source" => c.ext_source = v.parse().unwrap_or(0),
+                "ext_overlays" => c.ext_overlays = on,
+                "ext_on_top" => c.ext_on_top = on,
+                "ext_hide_cursor" => c.ext_hide_cursor = on,
+                "ext_size" => c.ext_size = v.parse().unwrap_or(0),
+                "fs_source" => c.fs_source = v.parse().unwrap_or(SRC_OUTPUT),
+                "fs_overlays" => c.fs_overlays = on,
+                "fs_display" => c.fs_display = v.parse().unwrap_or(1),
+                "mv_layout" => {
+                    for (k, p) in v.split(',').take(2).enumerate() {
+                        c.mv_layout[k] = p.parse::<u8>().unwrap_or(0).min(MV_LAYOUTS.len() as u8 - 1);
+                    }
+                }
+                "rec_folder" => c.rec_folder = v.to_string(),
+                "rec_name" => c.rec_name = if v.trim().is_empty() { "capture".into() } else { v.to_string() },
+                "rec_mbps" => c.rec_mbps = v.parse().unwrap_or(crate::media::DEFAULT_MBPS).clamp(1, 100),
+                "rec_split_min" => c.rec_split_min = v.parse().unwrap_or(0),
+                "mc_folder" => c.mc_folder = v.to_string(),
+                "mc_mbps" => c.mc_mbps = v.parse().unwrap_or(crate::media::DEFAULT_MBPS).clamp(1, 100),
+                "mc_split_min" => c.mc_split_min = v.parse().unwrap_or(0),
+                "stream_dest" => c.stream_dest = v.parse().unwrap_or(0),
+                "stream_url" => c.stream_url = v.to_string(),
+                "stream_key" => c.stream_key = v.to_string(),
+                "stream_quality" => c.stream_quality = v.parse().unwrap_or(1),
+                "playlist_loop" => c.playlist_loop = on,
+                "out_size" => c.out_size = v.parse::<u8>().unwrap_or(6).min(OUTPUT_SIZES.len() as u8 - 1),
+                "out_rate" => c.out_rate = v.parse::<u8>().unwrap_or(6).min(FRAME_RATES.len() as u8 - 1),
+                "interlaced" => c.interlaced = on,
+                "preview_skip" => c.preview_skip = v.parse::<u8>().unwrap_or(1).clamp(1, 8),
+                "lock_refresh" => c.lock_refresh = on,
+                "no_input_effects" => c.no_input_effects = on,
+                "hw_encoder" => c.hw_encoder = on,
+                "auto_cam_max_h" => c.auto_cam_max_h = v.parse().unwrap_or(1080),
+                "show_safe" => c.show_safe = on,
+                "show_waveform" => c.show_waveform = on,
+                "mv_boxes1" | "mv_boxes2" => {
+                    let k = if k == "mv_boxes1" { 0 } else { 1 };
+                    c.mv_boxes[k] = v.split(',').filter_map(|p| p.parse().ok()).collect();
+                }
+                "quickplay" => {
+                    if let Some((e, ms)) = v.split_once(',') {
+                        self.quickplay_effect = Effect::from_code_pub(e.parse().unwrap_or(0));
+                        self.quickplay_ms = ms.parse().unwrap_or(500);
+                    }
+                }
+                "ftb_ms" => self.ftb_ms = v.parse().unwrap_or(500),
+                "ftb_audio" => self.ftb_audio = on,
+                "pause_preview" => self.pause_preview = on,
+                "play_active" => self.play_active = on,
+                "restart_active" => self.restart_active = on,
+                "playlist_secs" => self.playlist_secs = v.parse().unwrap_or(10.0),
+                _ => {}
+            }
+        }
+    }
+}
+
+// Values from the mechanics sheet.
+const QUICKPLAY_MS: u32 = 500; // config QuickPlayDuration (read by ms::zzzzj @0xdd55)
+const FTB_MS: u32 = 500; // config FTBDuration (read by me::.ctor @0x11edbc)
+const OVERLAY_MS: u32 = 500; // na::.ctor field e
+/// ii::.ctor @0xad634: default transition buttons.
+const DEFAULT_TRANSITIONS: [TransBtn; 4] = [
+    TransBtn { effect: Effect::Fade, ms: 500 },
+    TransBtn { effect: Effect::Merge, ms: 1000 },
+    TransBtn { effect: Effect::Wipe, ms: 1000 },
+    TransBtn { effect: Effect::CubeZoom, ms: 1000 },
+];
+const DEFAULT_TRANSITION_MS: u32 = 500; // ii::e fallback for an unknown button
+
+impl Switcher {
+    fn empty() -> Self {
+        let ov = || Overlay { input: None, on: false, level: 0.0, effect: Effect::Fade, ms: OVERLAY_MS, on_preview: false };
+        Switcher {
+            inputs: Vec::new(),
+            next_id: 1,
+            preview: None,
+            output: None,
+            trans: None,
+            transitions: DEFAULT_TRANSITIONS,
+            quickplay_effect: Effect::Fade,
+            quickplay_ms: QUICKPLAY_MS,
+            ftb_on: false,
+            ftb_level: 0.0,
+            ftb_ms: FTB_MS,
+            ftb_audio: true,
+            overlays: [ov(), ov(), ov(), ov()],
+            rec: None,
+            multicorder: None,
+            playlist: None,
+            playlist_secs: 10.0,
+            fullscreen: false,
+            ext_full: false,
+            rec_setup: false,
+            stream_setup: false,
+            mc_setup: false,
+            playlist_setup: false,
+            mc_off: Default::default(),
+            playlist_off: Default::default(),
+            browse_for: 0,
+            show_mixer: true,
+            settings_open: false,
+            overlay_dialog: false,
+            add_dialog: AddDialog {
+                open: false,
+                kind: AddKind::Camera,
+                name: String::new(),
+                text: "Headline".into(),
+                text2: "Description".into(),
+                colour: Color32::from_rgb(0x20, 0x40, 0x80),
+                length: 60.0,
+                devices: Vec::new(),
+                devices_loaded: false,
+                device: 0,
+                path: String::new(),
+                colour_mode: 0,
+                list: Vec::new(),
+                folder: String::new(),
+            },
+            filter: None,
+            confirm_close: None,
+            master_volume: 85.0,
+            master_on: true,
+            pause_preview: true,
+            play_active: true,
+            restart_active: false,
+            preset_name: "Untitled preset".into(),
+            notice: String::new(),
+            notice_until: 0.0,
+            now: 0.0,
+            tbar: 0.0,
+            tbar_rest_bottom: true,
+            frame_acc: 0.0,
+            output_rect: eframe::egui::Rect::NOTHING,
+            preview_rect: eframe::egui::Rect::NOTHING,
+            waveform_tex: None,
+            ui_frame: 0,
+            snapshot_req: false,
+            browse_req: None,
+            refresh_devices: false,
+            dialog_error: String::new(),
+            output_window: false,
+            settings_input: None,
+            confirm_stop: None,
+            position_clipboard: None,
+            cfg: Settings::default(),
+        }
+    }
+
+    pub fn notice(&mut self, text: &str) {
+        self.notify(text);
+    }
+
+    pub fn demo() -> Self {
+        let mut s = Self::empty();
+        s.add(Input::new(0, "Colour Bars", Kind::Bars));
+        let c1 = s.add(Input::new(0, "Camera 1", Kind::Camera(1)));
+        let c2 = s.add(Input::new(0, "Camera 2", Kind::Camera(2)));
+        let mut v = Input::new(0, "Intro Video", Kind::Video { hue: 0.58 });
+        v.duration = 95.0;
+        v.pos = 12.0;
+        v.loop_on = true;
+        v.playing = true;
+        v.category = Some(1);
+        let vid = s.add(v);
+        let mut lt = Input::new(0, "Lower Third", Kind::Title { text: "Alex Morgan".into(), sub: "Host · Live from the studio".into() });
+        lt.category = Some(4);
+        let lt = s.add(lt);
+        s.add(Input::new(0, "Blue", Kind::Colour(Color32::from_rgb(0x1e, 0x3c, 0x78))));
+        s.add(Input::new(0, "Production Clock", Kind::Clock));
+        s.add(Input::new(0, "Holding Slide", Kind::Image(3)));
+        for id in [c1, c2] {
+            if let Some(i) = s.input_mut(id) {
+                i.category = Some(0);
+            }
+        }
+        if let Some(i) = s.input_mut(c2) {
+            i.volume = 65.0;
+        }
+        if let Some(i) = s.input_mut(vid) {
+            i.volume = 55.0;
+        }
+        s.output = Some(c1);
+        s.preview = Some(c2);
+        s.overlays[0].input = Some(lt);
+        s.overlays[0].on = true;
+        s.overlays[0].level = FULL;
+        s
+    }
+
+    pub fn add(&mut self, mut i: Input) -> u32 {
+        i.id = self.next_id;
+        self.next_id += 1;
+        let id = i.id;
+        self.inputs.push(i);
+        id
+    }
+
+    pub fn input(&self, id: u32) -> Option<&Input> {
+        self.inputs.iter().find(|i| i.id == id)
+    }
+    pub fn input_mut(&mut self, id: u32) -> Option<&mut Input> {
+        self.inputs.iter_mut().find(|i| i.id == id)
+    }
+    pub fn number_of(&self, id: u32) -> usize {
+        self.inputs.iter().position(|i| i.id == id).map(|p| p + 1).unwrap_or(0)
+    }
+
+    fn notify(&mut self, text: &str) {
+        self.notice = text.to_string();
+        self.notice_until = self.now + 4.0;
+    }
+
+    // ------------------------------------------------------------ transitions
+
+    fn on_transition_start(&mut self, to: u32) {
+        let (play, restart) = (self.play_active, self.restart_active);
+        if let Some(i) = self.input_mut(to) {
+            if i.kind.playable() {
+                if restart {
+                    i.pos = 0.0;
+                    i.restart_req = true;
+                }
+                if play {
+                    i.playing = true;
+                }
+            }
+        }
+    }
+
+    /// End of a transition: ms::u @0x12e840 swaps the buses; ms::w @0x12e904 (direct)
+    /// only replaces Output.
+    fn finish_transition(&mut self, to: u32, direct: bool) {
+        let old = self.output;
+        self.output = Some(to);
+        if !direct {
+            self.preview = old.or(Some(to));
+        }
+        if self.pause_preview {
+            if let Some(p) = old {
+                if p != to && (!direct || Some(p) != self.preview) {
+                    if let Some(i) = self.input_mut(p) {
+                        i.playing = false;
+                    }
+                }
+            }
+        }
+        self.trans = None;
+    }
+
+    /// ms::zzzz @0x131c20: start a transition to `to`.
+    fn begin(&mut self, to: u32, effect: Effect, ms: u32, direct: bool) {
+        if self.trans.is_some() {
+            return;
+        }
+        let ms = sanitize_ms(ms);
+        // Effect 100 (Cut) runs with step 255: it lands on the next output frame.
+        let step = if effect == Effect::Cut { FULL } else { step_for(ms) };
+        self.on_transition_start(to);
+        self.trans = Some(Trans { from: self.output, to, effect, progress: 0.0, step, manual: false, direct });
+    }
+
+    pub fn start_transition(&mut self, effect: Effect, ms: u32) {
+        let Some(to) = self.preview else { return };
+        self.begin(to, effect, ms, false);
+    }
+
+    /// Per-input Quick Play: that input goes to Output with the Quick Play effect; Preview kept.
+    pub fn quick_play_input(&mut self, id: u32) {
+        let (e, ms) = (self.quickplay_effect, self.quickplay_ms);
+        self.begin(id, e, ms, true);
+    }
+
+    /// Per-input Cut: straight to Output (effect 100), Preview kept.
+    pub fn cut_direct(&mut self, id: u32) {
+        self.begin(id, Effect::Cut, 0, true);
+    }
+
+    /// A given input straight to Output with an effect and duration (shortcut functions with an
+    /// input number, e.g. "Fade" input 1 1000 ms in the Default Keyboard template).
+    pub fn transition_input(&mut self, id: u32, effect: Effect, ms: u32) {
+        self.begin(id, effect, ms, true);
+    }
+
+    /// Shortcut functions PreviewInputNext / PreviewInputPrevious.
+    pub fn preview_step(&mut self, delta: i32) {
+        if self.inputs.is_empty() {
+            return;
+        }
+        let n = self.inputs.len() as i32;
+        let cur = self.preview.map(|p| self.number_of(p) as i32 - 1).unwrap_or(-1);
+        let next = (cur + delta).rem_euclid(n) as usize;
+        self.preview = Some(self.inputs[next].id);
+    }
+
+    /// T-bar position as 0..1 for drawing.
+    pub fn tbar_value(&self) -> f32 {
+        self.tbar / FULL
+    }
+
+    /// ms::zzzzzze @0x133cc0 + hm::set_s @0x8ad04. `v` is the bar position 0..1.
+    pub fn set_tbar(&mut self, v: f32) {
+        if matches!(&self.trans, Some(t) if !t.manual) {
+            return;
+        }
+        let value = (v * FULL).round().clamp(0.0, FULL);
+        self.tbar = value;
+        let progress = if self.tbar_rest_bottom { value } else { FULL - value };
+        if self.trans.is_none() {
+            if progress <= 0.0 {
+                return;
+            }
+            let Some(to) = self.preview else { return };
+            self.on_transition_start(to);
+            // hm::set_s uses the effect of transition 1 (ii::get_a).
+            let e = self.transitions[0].effect;
+            self.trans = Some(Trans { from: self.output, to, effect: if e == Effect::Cut { Effect::Fade } else { e }, progress, step: 0.0, manual: true, direct: false });
+        }
+        if let Some(t) = &mut self.trans {
+            t.progress = progress;
+            if progress >= FULL {
+                let to = t.to;
+                self.finish_transition(to, false);
+                self.tbar_rest_bottom = !self.tbar_rest_bottom;
+            } else if progress <= 0.0 {
+                self.trans = None;
+            }
+        }
+    }
+
+    /// ms::zzv @0x130464: same input again fades out; another input replaces it and fades in.
+    pub fn toggle_overlay(&mut self, c: usize, id: u32, on_preview: bool) {
+        let ch = &mut self.overlays[c];
+        if ch.input == Some(id) && ch.on && ch.on_preview == on_preview {
+            ch.on = false;
+        } else {
+            ch.input = Some(id);
+            ch.level = if ch.effect == Effect::Cut { FULL } else { 0.0 };
+            ch.on = true;
+            ch.on_preview = on_preview;
+        }
+    }
+
+    /// Centre overlay buttons 1–4 — frmmain::zzzze (0x06005b17 @0x251180): when the channel is
+    /// on it goes off (ms::zzn with its current input); when off, the input last used on it
+    /// (rs::get_a, found with ms::zzzzf) is brought back on; with none, nothing happens.
+    /// Returns false when no input has been used on that channel yet.
+    pub fn toggle_overlay_channel(&mut self, c: usize) -> bool {
+        let ch = &mut self.overlays[c];
+        if ch.input.is_none() {
+            return false;
+        }
+        if ch.on {
+            ch.on = false;
+        } else {
+            ch.level = if ch.effect == Effect::Cut { FULL } else { 0.0 };
+            ch.on = true;
+        }
+        true
+    }
+
+    /// MultiView `mv` (0 or 1) resolved: each box with the source it shows (None = empty).
+    /// Automatic boxes take the inputs in list order.
+    pub fn mv_resolve(&self, mv: usize) -> Vec<([f32; 4], Option<u32>)> {
+        let mv = mv.min(1);
+        let custom = &self.cfg.mv_boxes[mv];
+        let mut next = self.inputs.iter();
+        mv_layout_boxes(self.cfg.mv_layout[mv])
+            .into_iter()
+            .enumerate()
+            .map(|(k, (r, def))| {
+                let v = custom.get(k).copied().unwrap_or(def);
+                let src = if v == MV_AUTO {
+                    next.next().map(|i| i.id + 1)
+                } else if v == SRC_OUTPUT || v == SRC_PREVIEW || self.input(v.wrapping_sub(1)).is_some() {
+                    Some(v)
+                } else {
+                    None
+                };
+                (r, src)
+            })
+            .collect()
+    }
+
+    /// The input the PlayList goes to next: the next ticked input after the one on Output, in
+    /// list order. After the last one it starts again when Loop is on, otherwise it ends (None).
+    pub fn playlist_next(&self) -> Option<u32> {
+        let items: Vec<u32> = self.inputs.iter().map(|i| i.id).filter(|id| !self.playlist_off.contains(id)).collect();
+        if items.is_empty() {
+            return None;
+        }
+        let cur = self.output.and_then(|o| self.inputs.iter().position(|i| i.id == o));
+        let after = cur.and_then(|c| self.inputs[c + 1..].iter().map(|i| i.id).find(|id| items.contains(id)));
+        match (cur, after) {
+            (_, Some(n)) => Some(n),
+            (None, None) => Some(items[0]),
+            (Some(_), None) if self.cfg.playlist_loop => Some(items[0]),
+            _ => None,
+        }
+    }
+
+    /// Drag and drop of an input onto another (ms::zzzzzb @0x1324bc → ms::zzzzzc @0x132560):
+    /// the dragged input takes the place (list index) of the input it was dropped on, the
+    /// others shift along. Input numbers follow the new order.
+    pub fn move_input(&mut self, from: u32, onto: u32) {
+        if from == onto {
+            return;
+        }
+        let (Some(a), Some(b)) = (self.inputs.iter().position(|i| i.id == from), self.inputs.iter().position(|i| i.id == onto)) else { return };
+        let inp = self.inputs.remove(a);
+        self.inputs.insert(b, inp);
+    }
+
+    pub fn remove_input(&mut self, id: u32) {
+        self.inputs.retain(|i| i.id != id);
+        for mv in &mut self.cfg.mv_boxes {
+            for b in mv.iter_mut().filter(|b| **b == id + 1) {
+                *b = MV_AUTO;
+            }
+        }
+        for src in [&mut self.cfg.ext_source, &mut self.cfg.fs_source] {
+            if *src == id + 1 {
+                *src = SRC_OUTPUT;
+            }
+        }
+        for i in &mut self.inputs {
+            for l in i.layers.iter_mut().filter(|l| l.input == Some(id)) {
+                *l = Layer::default();
+            }
+        }
+        if self.preview == Some(id) {
+            self.preview = None;
+        }
+        if self.output == Some(id) {
+            self.output = None;
+        }
+        if matches!(&self.trans, Some(t) if t.to == id || t.from == Some(id)) {
+            self.trans = None;
+        }
+        for ch in &mut self.overlays {
+            if ch.input == Some(id) {
+                ch.input = None;
+                ch.on = false;
+                ch.level = 0.0;
+            }
+        }
+        self.confirm_close = None;
+    }
+
+    // ------------------------------------------------------------ time
+
+    /// One output frame: hm::r @0x8b760 (transition) and rs::t @0x1b0890 (layers).
+    fn output_frame(&mut self) {
+        let mut done = None;
+        if let Some(tr) = &mut self.trans {
+            if !tr.manual {
+                tr.progress += tr.step;
+                if tr.progress >= FULL {
+                    done = Some((tr.to, tr.direct));
+                }
+            }
+        }
+        if let Some((to, direct)) = done {
+            self.finish_transition(to, direct);
+        }
+        // Fade To Black: a black colour layer faded with the FTB duration (me::.ctor @0x11edbc).
+        let ftb_step = step_for(sanitize_ms(self.ftb_ms));
+        self.ftb_level = if self.ftb_on { (self.ftb_level + ftb_step).min(FULL) } else { (self.ftb_level - ftb_step).max(0.0) };
+        for ch in &mut self.overlays {
+            let step = if ch.effect == Effect::Cut { FULL } else { step_for(sanitize_ms(ch.ms)) };
+            if ch.on {
+                ch.level = (ch.level + step).min(FULL);
+            } else {
+                ch.level = (ch.level - step).max(0.0);
+                if ch.level <= 0.0 {
+                    ch.input = None;
+                }
+            }
+        }
+    }
+
+    pub fn tick(&mut self, t: f64, dt: f32) {
+        self.now = t;
+        if !self.notice.is_empty() && t > self.notice_until {
+            self.notice.clear();
+        }
+        // Advance on the output frame clock.
+        self.frame_acc += dt.min(0.5);
+        let frame = 1.0 / output_fps();
+        while self.frame_acc >= frame {
+            self.frame_acc -= frame;
+            self.output_frame();
+        }
+        // playback
+        for i in &mut self.inputs {
+            if i.playing && matches!(i.kind, Kind::Video { .. }) {
+                i.pos += dt;
+                if i.pos >= i.duration {
+                    if i.loop_on {
+                        i.pos = 0.0;
+                    } else {
+                        i.pos = i.duration;
+                        i.playing = false;
+                    }
+                }
+            }
+        }
+        // playlist: every few seconds, take the next input to Output with transition 1
+        if let Some(last) = self.playlist {
+            if t - last >= self.playlist_secs as f64 && self.trans.is_none() {
+                match self.playlist_next() {
+                    Some(next) => {
+                        self.preview = Some(next);
+                        let tb = self.transitions[0];
+                        self.start_transition(tb.effect, tb.ms);
+                        self.playlist = Some(t);
+                    }
+                    None => self.playlist = None,
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ audio
+
+    pub fn input_level(&self, id: u32, t: f64) -> f32 {
+        let Some(i) = self.input(id) else { return 0.0 };
+        if !i.audio_on || !i.kind.has_audio() || (i.kind.playable() && !i.playing) {
+            return 0.0;
+        }
+        let k = id as f64;
+        let base = 0.55 + 0.3 * (t * 6.1 + k * 1.3).sin() * (t * 1.7 + k).sin() + 0.1 * (t * 23.0 + k * 5.0).sin();
+        let mut l = base as f32 * i.volume / 100.0;
+        if self.ftb_audio {
+            // me::a @0x11ee48: master audio follows the FTB layer level.
+            l *= 1.0 - self.ftb_level / FULL;
+        }
+        l.clamp(0.0, 1.0)
+    }
+
+    pub fn master_level(&self, t: f64) -> f32 {
+        if !self.master_on {
+            return 0.0;
+        }
+        let m = self.inputs.iter().filter(|i| i.bus_m).map(|i| self.input_level(i.id, t)).fold(0.0f32, f32::max);
+        (m * self.master_volume / 100.0 * 1.1).clamp(0.0, 1.0)
+    }
+
+    // ------------------------------------------------------------ add input
+
+    /// Devices offered for the selected kind (Blackmagic tab shows only Blackmagic devices).
+    pub fn dialog_devices(&self) -> Vec<DeviceChoice> {
+        let d = &self.add_dialog;
+        d.devices.iter().filter(|x| d.kind != AddKind::Blackmagic || x.blackmagic).cloned().collect()
+    }
+
+    /// Adds the input described by the Add Input dialog. Returns an error to show, if any.
+    pub fn add_from_dialog(&mut self) -> Result<(), String> {
+        let devices = self.dialog_devices();
+        let d = &self.add_dialog;
+        let n = self.inputs.len() + 1;
+        let seed = self.next_id;
+        let file_name = std::path::Path::new(d.path.trim()).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let (kind, default_name) = match d.kind {
+            AddKind::Camera | AddKind::Blackmagic => {
+                let Some(dev) = devices.get(d.device) else {
+                    return Err(if d.kind == AddKind::Blackmagic {
+                        "No Blackmagic device found. Connect it and install Blackmagic Desktop Video, then press Refresh.".into()
+                    } else {
+                        "No camera or capture device found. Connect one and press Refresh.".into()
+                    });
+                };
+                (Kind::Device { link: dev.link.clone(), blackmagic: dev.blackmagic }, dev.name.clone())
+            }
+            AddKind::VideoFile | AddKind::ImageFile => {
+                let p = d.path.trim().to_string();
+                if p.is_empty() || !std::path::Path::new(&p).exists() {
+                    return Err("Choose a file first (Browse…).".into());
+                }
+                if d.kind == AddKind::VideoFile {
+                    (Kind::VideoFile { path: p }, file_name)
+                } else {
+                    (Kind::ImageFile { path: p }, file_name)
+                }
+            }
+            AddKind::List => {
+                let paths: Vec<String> = d.list.iter().filter(|p| std::path::Path::new(p).exists()).cloned().collect();
+                if paths.is_empty() {
+                    return Err("Add one or more video files to the list first (Add…).".into());
+                }
+                (Kind::VideoList { paths, idx: 0 }, "List".into())
+            }
+            AddKind::Desktop => (Kind::Desktop, "Desktop Capture".into()),
+            AddKind::ImageSequence | AddKind::Photos => {
+                let f = d.folder.trim().to_string();
+                if f.is_empty() || !std::path::Path::new(&f).is_dir() {
+                    return Err("Choose a folder with pictures first (Browse…).".into());
+                }
+                let fname = std::path::Path::new(&f).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                if d.kind == AddKind::Photos {
+                    (Kind::Photos { folder: f }, fname)
+                } else {
+                    (Kind::ImageSequence { folder: f }, fname)
+                }
+            }
+            AddKind::TestVideo => (Kind::Video { hue: (seed as f32 * 0.17) % 1.0 }, "Test Video".into()),
+            AddKind::TestCamera => (Kind::Camera(seed), format!("Test Camera {n}")),
+            AddKind::TestImage => (Kind::Image(seed), "Test Image".into()),
+            AddKind::Colour => match d.colour_mode {
+                1 => (Kind::Blank, "Transparent".into()),
+                2 => (Kind::Bars, "Colour Bars".into()),
+                _ => (Kind::Colour(d.colour), "Colour".into()),
+            },
+            AddKind::Title => (Kind::Title { text: d.text.clone(), sub: d.text2.clone() }, d.text.clone()),
+            AddKind::Clock => (Kind::Clock, "Production Clock".into()),
+            k => return Err(format!("{} is not available in this version yet.", k.label())),
+        };
+        let name = if d.name.trim().is_empty() { default_name } else { d.name.trim().to_string() };
+        let mut i = Input::new(0, &name, kind);
+        if d.kind == AddKind::TestVideo {
+            i.duration = d.length;
+        }
+        if matches!(d.kind, AddKind::VideoFile | AddKind::List | AddKind::ImageSequence | AddKind::Photos) {
+            i.duration = 0.0;
+        }
+        if matches!(d.kind, AddKind::ImageSequence | AddKind::Photos) {
+            i.loop_on = true;
+        }
+        let id = self.add(i);
+        if self.preview.is_none() {
+            self.preview = Some(id);
+        }
+        self.add_dialog.name.clear();
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ presets
+
+    fn preset_path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("livemix_preset.txt")
+    }
+
+    pub fn save_preset(&mut self) {
+        let mut out = String::from("livemix-preset 1\n");
+        for i in &self.inputs {
+            let (code, a, b) = match &i.kind {
+                Kind::Colour(c) => ("colour", format!("{},{},{}", c.r(), c.g(), c.b()), String::new()),
+                Kind::Bars => ("bars", String::new(), String::new()),
+                Kind::Title { text, sub } => ("title", text.clone(), sub.clone()),
+                Kind::Blank => ("blank", String::new(), String::new()),
+                Kind::Clock => ("clock", String::new(), String::new()),
+                Kind::Camera(s) => ("camera", s.to_string(), String::new()),
+                Kind::Video { hue } => ("video", hue.to_string(), String::new()),
+                Kind::Image(s) => ("image", s.to_string(), String::new()),
+                Kind::Device { link, blackmagic } => ("device", link.clone(), (*blackmagic as u8).to_string()),
+                Kind::VideoFile { path } => ("videofile", path.clone(), String::new()),
+                Kind::ImageFile { path } => ("imagefile", path.clone(), String::new()),
+                Kind::VideoList { paths, .. } => ("list", paths.join("|"), String::new()),
+                Kind::Desktop => ("desktop", String::new(), String::new()),
+                Kind::ImageSequence { folder } => ("imagesequence", folder.clone(), String::new()),
+                Kind::Photos { folder } => ("photos", folder.clone(), String::new()),
+            };
+            let cat = i.category.map(|c| c.to_string()).unwrap_or_default();
+            let k = i.key;
+            out.push_str(&format!(
+                "input\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{}\t{}\n",
+                code,
+                clean(&i.title),
+                clean(&a),
+                clean(&b),
+                i.duration,
+                i.volume,
+                cat,
+                i.loop_on as u8,
+                k.on as u8,
+                k.colour[0],
+                k.colour[1],
+                k.colour[2],
+                k.tolerance
+            ));
+        }
+        let num = |o: Option<u32>| o.map(|i| self.number_of(i)).unwrap_or(0);
+        out.push_str(&format!("preview\t{}\noutput\t{}\n", num(self.preview), num(self.output)));
+        // Position and layers of each input (by input number).
+        let fmt_pos = |p: &Position| format!("{},{},{},{},{},{},{}", p.zoom, p.pan_x, p.pan_y, p.crop[0], p.crop[1], p.crop[2], p.crop[3]);
+        for (n, i) in self.inputs.iter().enumerate() {
+            if i.place != Position::default() {
+                out.push_str(&format!("place\t{}\t{}\n", n + 1, fmt_pos(&i.place)));
+            }
+            if let Some(m) = &i.cam_mode {
+                out.push_str(&format!("cammode\t{}\t{}\n", n + 1, m.code()));
+            }
+            for (k, l) in i.layers.iter().enumerate() {
+                if l.input.is_some() {
+                    out.push_str(&format!("layer\t{}\t{}\t{}\t{}\t{}\n", n + 1, k, l.on as u8, num(l.input), fmt_pos(&l.place)));
+                }
+            }
+        }
+        for (k, tb) in self.transitions.iter().enumerate() {
+            out.push_str(&format!("transition\t{}\t{}\t{}\n", k, tb.effect.code(), tb.ms));
+        }
+        match std::fs::write(Self::preset_path(), out) {
+            Ok(_) => {
+                self.preset_name = "livemix_preset".into();
+                self.notify("Preset saved");
+            }
+            Err(e) => self.notify(&format!("Could not save preset: {e}")),
+        }
+    }
+
+    pub fn load_preset(&mut self) {
+        let Ok(text) = std::fs::read_to_string(Self::preset_path()) else {
+            self.notify("No saved preset yet — use Save first");
+            return;
+        };
+        let mut s = Self::empty();
+        let mut ids = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.first().copied() {
+                Some("input") if f.len() >= 9 => {
+                    let kind = match f[1] {
+                        "colour" => {
+                            let c: Vec<u8> = f[3].split(',').filter_map(|x| x.parse().ok()).collect();
+                            Kind::Colour(if c.len() == 3 { Color32::from_rgb(c[0], c[1], c[2]) } else { Color32::BLACK })
+                        }
+                        "bars" => Kind::Bars,
+                        "title" => Kind::Title { text: f[3].into(), sub: f[4].into() },
+                        "clock" => Kind::Clock,
+                        "camera" => Kind::Camera(f[3].parse().unwrap_or(1)),
+                        "video" => Kind::Video { hue: f[3].parse().unwrap_or(0.5) },
+                        "image" => Kind::Image(f[3].parse().unwrap_or(1)),
+                        "device" => Kind::Device { link: f[3].into(), blackmagic: f[4] == "1" },
+                        "videofile" => Kind::VideoFile { path: f[3].into() },
+                        "imagefile" => Kind::ImageFile { path: f[3].into() },
+                        "list" => Kind::VideoList { paths: f[3].split('|').filter(|p| !p.is_empty()).map(String::from).collect(), idx: 0 },
+                        "desktop" => Kind::Desktop,
+                        "imagesequence" => Kind::ImageSequence { folder: f[3].into() },
+                        "photos" => Kind::Photos { folder: f[3].into() },
+                        _ => Kind::Blank,
+                    };
+                    let mut i = Input::new(0, f[2], kind);
+                    i.duration = f[5].parse().unwrap_or(60.0);
+                    i.volume = f[6].parse().unwrap_or(80.0);
+                    i.category = f[7].parse().ok();
+                    i.loop_on = f[8] == "1";
+                    if f.len() >= 12 {
+                        let c: Vec<u8> = f[10].split(',').filter_map(|x| x.parse().ok()).collect();
+                        i.key = Key {
+                            on: f[9] == "1",
+                            colour: if c.len() == 3 { [c[0], c[1], c[2]] } else { Key::default().colour },
+                            tolerance: f[11].parse().unwrap_or(60),
+                        };
+                    }
+                    ids.push(s.add(i));
+                }
+                Some("cammode") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    if let (Some(id), Some(m)) = (n.checked_sub(1).and_then(|k| ids.get(k)).copied(), crate::media::CamMode::parse(f[2])) {
+                        if let Some(i) = s.input_mut(id) {
+                            i.cam_mode = Some(m);
+                        }
+                    }
+                }
+                Some("place") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    if let (Some(id), Some(p)) = (ids.get(n.wrapping_sub(1)).copied(), parse_pos(f[2])) {
+                        if let Some(i) = s.input_mut(id) {
+                            i.place = p;
+                        }
+                    }
+                }
+                Some("layer") if f.len() >= 6 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    let k: usize = f[2].parse().unwrap_or(LAYERS);
+                    let target: usize = f[4].parse().unwrap_or(0);
+                    if let (Some(id), Some(p)) = (ids.get(n.wrapping_sub(1)).copied(), parse_pos(f[5])) {
+                        let tid = ids.get(target.wrapping_sub(1)).copied();
+                        if let Some(l) = s.input_mut(id).and_then(|i| i.layers.get_mut(k)) {
+                            *l = Layer { on: f[3] == "1", input: tid, place: p };
+                        }
+                    }
+                }
+                Some("preview") if f.len() >= 2 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    s.preview = ids.get(n.wrapping_sub(1)).copied();
+                }
+                Some("output") if f.len() >= 2 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    s.output = ids.get(n.wrapping_sub(1)).copied();
+                }
+                Some("transition") if f.len() >= 4 => {
+                    if let Ok(k) = f[1].parse::<usize>() {
+                        if k < 4 {
+                            s.transitions[k] = TransBtn { effect: Effect::from_code(f[2].parse().unwrap_or(0)), ms: f[3].parse().unwrap_or(DEFAULT_TRANSITION_MS) };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        s.preset_name = "livemix_preset".into();
+        s.show_mixer = self.show_mixer;
+        s.cfg = self.cfg.clone();
+        s.now = self.now;
+        *self = s;
+        self.notify("Preset opened");
+    }
+
+    pub fn new_preset(&mut self) {
+        let mixer = self.show_mixer;
+        let now = self.now;
+        let cfg = self.cfg.clone();
+        *self = Self::empty();
+        self.show_mixer = mixer;
+        self.cfg = cfg;
+        self.now = now;
+        self.notify("New preset");
+    }
+}
+
+fn parse_pos(s: &str) -> Option<Position> {
+    let v: Vec<f32> = s.split(',').filter_map(|x| x.parse().ok()).collect();
+    (v.len() == 7).then(|| Position { zoom: v[0], pan_x: v[1], pan_y: v[2], crop: [v[3], v[4], v[5], v[6]] })
+}
+
+fn clean(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames(s: &mut Switcher, n: usize) {
+        for _ in 0..n {
+            s.output_frame();
+        }
+    }
+
+    #[test]
+    fn defaults_match_ii_ctor() {
+        let s = Switcher::demo();
+        let t: Vec<(Effect, u32)> = s.transitions.iter().map(|b| (b.effect, b.ms)).collect();
+        assert_eq!(t, vec![(Effect::Fade, 500), (Effect::Merge, 1000), (Effect::Wipe, 1000), (Effect::CubeZoom, 1000)]);
+    }
+
+    #[test]
+    fn duration_rule_and_step_formula() {
+        assert_eq!(sanitize_ms(0), 500);
+        assert_eq!(sanitize_ms(10000), 500);
+        assert_eq!(sanitize_ms(9999), 9999);
+        assert!((step_for(500) - 256.0 / 30.0).abs() < 1e-4);
+        assert!((step_for(1000) - 256.0 / 60.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fade_500ms_takes_30_frames_and_swaps() {
+        let mut s = Switcher::demo();
+        let (p, o) = (s.preview, s.output);
+        let tb = s.transitions[0];
+        s.start_transition(tb.effect, tb.ms);
+        frames(&mut s, 29);
+        assert!(s.trans.is_some());
+        frames(&mut s, 1);
+        assert!(s.trans.is_none());
+        assert_eq!(s.output, p);
+        assert_eq!(s.preview, o);
+    }
+
+    #[test]
+    fn cut_lands_next_frame_and_tbar_completes_at_255() {
+        let mut s = Switcher::demo();
+        let p = s.preview;
+        s.start_transition(Effect::Cut, 0);
+        frames(&mut s, 1);
+        assert_eq!(s.output, p);
+        let p2 = s.preview;
+        s.set_tbar(0.5);
+        assert!(s.trans.is_some());
+        s.set_tbar(1.0);
+        assert_eq!(s.output, p2);
+    }
+
+    #[test]
+    fn project_format_names_and_rates() {
+        let mut c = Settings::default();
+        assert_eq!(c.format_label(), "1080i59,94");
+        assert!((c.frame_rate() - 29.97).abs() < 1e-3);
+        c.out_size = 5;
+        c.out_rate = 2;
+        c.interlaced = false;
+        assert_eq!(c.format_label(), "720p25");
+        assert_eq!(c.out_dims(), (1280, 720));
+        assert_eq!(crate::media::rate_fraction(29.97), (30000, 1001));
+        assert_eq!(crate::media::rate_fraction(25.0), (25, 1));
+        let m = crate::media::CamMode { w: 1280, h: 720, fps_n: 30, fps_d: 1, format: "MJPG".into() };
+        assert_eq!(crate::media::CamMode::parse(&m.code()), Some(m.clone()));
+        assert_eq!(m.label(), "1280x720 30 fps MJPG");
+    }
+
+    #[test]
+    fn centre_overlay_buttons_only_switch_the_channel() {
+        let mut s = Switcher::demo();
+        let (a, p) = (s.inputs[4].id, s.preview);
+        s.overlays[1] = Overlay { input: None, on: false, level: 0.0, effect: Effect::Fade, ms: 500, on_preview: false };
+        // Nothing picked for overlay 2 yet: the button does nothing.
+        assert!(!s.toggle_overlay_channel(1));
+        assert!(!s.overlays[1].on);
+        // Picked on an input box, then the centre button turns it off and on again,
+        // keeping that input (the Preview input is not used).
+        s.toggle_overlay(1, a, false);
+        assert!(s.toggle_overlay_channel(1));
+        assert!(!s.overlays[1].on);
+        assert!(s.toggle_overlay_channel(1));
+        assert!(s.overlays[1].on);
+        assert_eq!(s.overlays[1].input, Some(a));
+        assert_eq!(s.preview, p);
+    }
+
+    #[test]
+    fn playlist_skips_unticked_inputs_and_loops() {
+        let mut s = Switcher::demo();
+        let ids: Vec<u32> = s.inputs.iter().map(|i| i.id).collect();
+        s.output = Some(ids[0]);
+        s.playlist_off.insert(ids[1]);
+        assert_eq!(s.playlist_next(), Some(ids[2]));
+        s.output = ids.last().copied();
+        assert_eq!(s.playlist_next(), Some(ids[0]));
+        s.cfg.playlist_loop = false;
+        assert_eq!(s.playlist_next(), None);
+    }
+
+    #[test]
+    fn dropping_an_input_takes_the_targets_place() {
+        let mut s = Switcher::demo();
+        let ids: Vec<u32> = s.inputs.iter().map(|i| i.id).collect();
+        s.move_input(ids[0], ids[2]);
+        let now: Vec<u32> = s.inputs.iter().map(|i| i.id).collect();
+        assert_eq!(&now[..3], &[ids[1], ids[2], ids[0]]);
+        s.move_input(ids[0], ids[1]);
+        assert_eq!(s.inputs[0].id, ids[0]);
+    }
+
+    #[test]
+    fn multiview_sizes_follow_qu_b() {
+        // Pro at 1920x1080: pictures 436x245, title strips 33, columns 452 apart from x 56,
+        // big boxes 872x490 from x 55, 905 apart.
+        assert_eq!(mv_sizes(3, 4), ((436, 245), 33, 452, 56, 905, 55));
+        // Sixteen: 4x4 boxes; One: a single 1856x1044 picture with a 36 px strip.
+        assert_eq!(mv_sizes(1, 1).0, (1856, 1044));
+        assert_eq!(mv_sizes(1, 1).1, 36);
+        let pro = mv_layout_boxes(0);
+        assert_eq!(pro.len(), 10);
+        // Everything fits in the frame, names included.
+        let th = mv_title_height(0);
+        for (r, _) in &pro {
+            assert!(r[0] >= 0.0 && r[0] + r[2] <= 1.0 && r[1] + r[3] + th <= 1.0 + 1e-6, "{r:?}");
+        }
+        assert_eq!(mv_layout_boxes(2).iter().map(|b| b.1).collect::<Vec<_>>(), vec![SRC_PREVIEW, SRC_OUTPUT, MV_AUTO, MV_AUTO]);
+        assert_eq!(mv_layout_boxes(3).len(), 16);
+        assert_eq!(mv_layout_boxes(4).len(), 1);
+    }
+
+    #[test]
+    fn multiview_pro_has_preview_output_and_eight_inputs() {
+        let mut s = Switcher::demo();
+        let boxes = s.mv_resolve(0);
+        assert_eq!(boxes.len(), 10);
+        assert_eq!(boxes[0].1, Some(SRC_PREVIEW));
+        assert_eq!(boxes[1].1, Some(SRC_OUTPUT));
+        assert_eq!(boxes[2].1, Some(s.inputs[0].id + 1));
+        // A customised box shows its own choice; the automatic ones keep the list order.
+        s.cfg.mv_boxes[0] = vec![SRC_PREVIEW, SRC_OUTPUT, s.inputs[3].id + 1];
+        let boxes = s.mv_resolve(0);
+        assert_eq!(boxes[2].1, Some(s.inputs[3].id + 1));
+        assert_eq!(boxes[3].1, Some(s.inputs[0].id + 1));
+        s.cfg.mv_layout[0] = 3;
+        assert_eq!(s.mv_resolve(0).len(), 16);
+    }
+
+    #[test]
+    fn per_input_quick_play_keeps_preview() {
+        let mut s = Switcher::demo();
+        let p = s.preview;
+        s.quick_play_input(1);
+        frames(&mut s, 30);
+        assert_eq!(s.output, Some(1));
+        assert_eq!(s.preview, p);
+    }
+
+    #[test]
+    fn overlay_and_ftb_reach_full_after_30_frames() {
+        let mut s = Switcher::demo();
+        s.toggle_overlay(1, 1, false);
+        s.ftb_on = true;
+        frames(&mut s, 15);
+        assert!(s.overlays[1].level > 100.0 && s.overlays[1].level < 130.0);
+        frames(&mut s, 15);
+        assert_eq!(s.overlays[1].level, FULL);
+        assert_eq!(s.ftb_level, FULL);
+        s.toggle_overlay(1, 1, false);
+        frames(&mut s, 30);
+        assert_eq!(s.overlays[1].input, None);
+    }
+}
