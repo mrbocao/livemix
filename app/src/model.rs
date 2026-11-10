@@ -631,7 +631,7 @@ impl AddKind {
             AddKind::Dvd => "DVD",
             AddKind::List => "List",
             AddKind::Camera => "Camera",
-            AddKind::Desktop => "NDI / Desktop Capture",
+            AddKind::Desktop => "NDI / OMT / Desktop Capture",
             AddKind::StreamSrt => "Stream / SRT",
             AddKind::Replay => "Instant Replay",
             AddKind::ImageSequence => "Image Sequence / Stinger",
@@ -660,7 +660,6 @@ impl AddKind {
         !matches!(
             self,
             AddKind::Dvd
-                | AddKind::StreamSrt
                 | AddKind::Replay
                 | AddKind::VideoDelay
                 | AddKind::PowerPoint
@@ -678,7 +677,7 @@ impl AddKind {
             AddKind::VideoFile => "A video file (MP4, MOV, WMV, AVI, MKV…). Plays, pauses, restarts and loops.",
             AddKind::List => "Several video files played one after another. Loop repeats the whole list.",
             AddKind::Camera => "A webcam, USB camera, HDMI/SDI capture card, Blackmagic device or NDI Webcam on this computer.",
-            AddKind::Desktop => "Captures this computer's desktop (main screen). NDI sources appear under Camera through NDI Webcam.",
+            AddKind::Desktop => "Choose an NDI or OMT source or capture this computer's main screen.",
             AddKind::ImageSequence => "A folder of numbered pictures (PNG with transparency works as a stinger) played as a clip at the output frame rate.",
             AddKind::ImageFile => "A picture file (PNG, JPG, BMP). PNG transparency is kept, so logos work as Overlays.",
             AddKind::Photos => "A slideshow of every picture in a folder (JPG, PNG, BMP, TIF, GIF); while playing it moves to the next picture every 2 seconds.",
@@ -690,7 +689,7 @@ impl AddKind {
             AddKind::TestVideo => "A drawn stand-in clip with a play position.",
             AddKind::TestImage => "A drawn stand-in still picture.",
             AddKind::Dvd => "Play a DVD disc — not available in this version.",
-            AddKind::StreamSrt => "Receive an RTMP/RTSP/SRT stream — not available in this version.",
+            AddKind::StreamSrt => "Receive H.264 or HEVC video from an SRT source.",
             AddKind::Replay => "Instant Replay with slow motion — not available in this version.",
             AddKind::VideoDelay => "A delayed copy of another input — not available in this version.",
             AddKind::PowerPoint => "PowerPoint slides — not available in this version (export the slides as pictures and use Photos).",
@@ -737,6 +736,13 @@ pub struct AddDialog {
     pub devices: Vec<DeviceChoice>,
     pub devices_loaded: bool,
     pub device: usize,
+    pub ndi_source: Option<String>,
+    pub ndi_sources: Vec<String>,
+    pub ndi_scan: bool,
+    pub ndi_status: String,
+    pub omt_sources: Vec<String>,
+    pub omt_status: String,
+    pub srt: crate::srt::Connection,
     pub path: String,
     /// Colour type options of the original (frmInput rColour / rTransparent / rColourBars):
     /// 0 = Colour, 1 = Transparent, 2 = Colour Bars.
@@ -751,6 +757,7 @@ pub struct Switcher {
     pub inputs: Vec<Input>,
     next_id: u32,
     pub preview: Option<u32>,
+    pub input_preview: Option<u32>,
     pub output: Option<u32>,
     pub trans: Option<Trans>,
     pub transitions: [TransBtn; 4],
@@ -771,6 +778,9 @@ pub struct Switcher {
     /// (frmmain cmdRecSetup, cmdStreamingSetup, cmdMultiCorderSetup, cmdPlayListSetup).
     pub rec_setup: bool,
     pub stream_setup: bool,
+    pub stream_slot: usize,
+    pub stream_active: [bool; crate::stream::COUNT],
+    pub stream_status: [String; crate::stream::COUNT],
     pub mc_setup: bool,
     pub playlist_setup: bool,
     /// Inputs left out of the MultiCorder / the PlayList (ticked off in their setup windows).
@@ -819,6 +829,11 @@ pub struct Switcher {
     pub external: [ExternalWindow; OUTPUT_COUNT],
     pub decklink_active: [bool; OUTPUT_COUNT],
     pub decklink_status: [String; OUTPUT_COUNT],
+    pub ndi_status: [String; OUTPUT_COUNT],
+    pub omt_status: [String; OUTPUT_COUNT],
+    pub srt_active: [bool; OUTPUT_COUNT],
+    pub srt_status: [String; OUTPUT_COUNT],
+    pub srt_setup: Option<usize>,
     /// Input whose settings window (name, green-screen key) is open.
     pub settings_input: Option<u32>,
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
@@ -1013,6 +1028,10 @@ pub struct Settings {
     /// SRC_MV1 / SRC_MV2 (MultiView 1 / 2) or an input id + 1.
     pub outputs: [OutputRoute; OUTPUT_COUNT],
     pub decklink_outputs: [DeckLinkRoute; OUTPUT_COUNT],
+    pub ndi_outputs: [bool; OUTPUT_COUNT],
+    pub omt_outputs: [bool; OUTPUT_COUNT],
+    pub omt_quality: [u8; OUTPUT_COUNT],
+    pub srt_outputs: [crate::srt::Settings; OUTPUT_COUNT],
     /// Fullscreen display source (config OutputsFullscreen, empty = Output), same codes.
     pub fs_source: u32,
     pub fs_overlays: bool,
@@ -1049,10 +1068,7 @@ pub struct Settings {
     pub mc_codec: crate::media::RecordFormat,
     pub mc_outputs: [bool; OUTPUT_COUNT],
     /// Streaming Settings (frmStreaming): destination, URL, stream name or key, quality.
-    pub stream_dest: u8,
-    pub stream_url: String,
-    pub stream_key: String,
-    pub stream_quality: u8,
+    pub streams: [crate::stream::Destination; crate::stream::COUNT],
     /// PlayList (frmPlaylist chkLoop): start again after the last input.
     pub playlist_loop: bool,
     /// Project format (Settings → Display "Output Size", "Master Frame Rate", interlaced):
@@ -1108,6 +1124,10 @@ impl Default for Settings {
             start_maximised: true,
             outputs: [OutputRoute::default(); OUTPUT_COUNT],
             decklink_outputs: [DeckLinkRoute::default(); OUTPUT_COUNT],
+            ndi_outputs: [false; OUTPUT_COUNT],
+            omt_outputs: [false; OUTPUT_COUNT],
+            omt_quality: [0; OUTPUT_COUNT],
+            srt_outputs: Default::default(),
             fs_source: SRC_OUTPUT,
             fs_overlays: true,
             fs_display: 1,
@@ -1131,10 +1151,7 @@ impl Default for Settings {
             mc_split_min: 0,
             mc_codec: Default::default(),
             mc_outputs: [false; OUTPUT_COUNT],
-            stream_dest: 0,
-            stream_url: String::new(),
-            stream_key: String::new(),
-            stream_quality: 1,
+            streams: Default::default(),
             playlist_loop: false,
             out_size: 6,
             out_rate: 6,
@@ -1203,6 +1220,10 @@ impl Switcher {
             format!("start_external={}", b(c.start_external)),
             format!("start_maximised={}", b(c.start_maximised)),
             format!("ext_source={}", c.outputs[0].source),
+            format!("ndi_outputs={}", c.ndi_outputs.iter().map(|on| if *on { '1' } else { '0' }).collect::<String>()),
+            format!("omt_outputs={}", c.omt_outputs.iter().map(|on| if *on { '1' } else { '0' }).collect::<String>()),
+            format!("omt_quality={}", serde_json::to_string(&c.omt_quality).unwrap_or_default()),
+            format!("srt_outputs={}", serde_json::to_string(&c.srt_outputs).unwrap_or_default()),
             format!("decklink_outputs={}", c.decklink_outputs.iter().map(|route| {
                 format!("{},{},{}", route.device.map_or(-1, |n| n as i64), route.port, route.mode)
             }).collect::<Vec<_>>().join(";")),
@@ -1233,10 +1254,9 @@ impl Switcher {
             format!("mc_split_min={}", c.mc_split_min),
             format!("mc_codec={}", c.mc_codec.key()),
             format!("mc_outputs={}", c.mc_outputs.iter().map(|on| if *on { '1' } else { '0' }).collect::<String>()),
-            format!("stream_dest={}", c.stream_dest),
-            format!("stream_url={}", c.stream_url),
-            format!("stream_key={}", c.stream_key),
-            format!("stream_quality={}", c.stream_quality),
+            format!("streams={}", serde_json::Value::Array(c.streams.iter().map(|d|
+                serde_json::json!({"provider": d.provider, "url": d.url, "key": d.key,
+                    "quality": d.quality, "source": d.source, "hardware": d.hardware})).collect())),
             format!("playlist_loop={}", b(c.playlist_loop)),
             format!("out_size={}", c.out_size),
             format!("out_rate={}", c.out_rate),
@@ -1292,6 +1312,18 @@ impl Switcher {
                 "start_external" => c.start_external = on,
                 "start_maximised" => c.start_maximised = on,
                 "ext_source" => c.outputs[0].source = v.parse().unwrap_or(SRC_OUTPUT),
+                "ndi_outputs" => {
+                    for (enabled, value) in c.ndi_outputs.iter_mut().zip(v.bytes()) {
+                        *enabled = value == b'1';
+                    }
+                }
+                "omt_outputs" => {
+                    for (enabled, value) in c.omt_outputs.iter_mut().zip(v.bytes()) {
+                        *enabled = value == b'1';
+                    }
+                }
+                "omt_quality" => c.omt_quality = serde_json::from_str(v).unwrap_or_default(),
+                "srt_outputs" => c.srt_outputs = serde_json::from_str(v).unwrap_or_default(),
                 "decklink_outputs" => {
                     for (route, entry) in c.decklink_outputs.iter_mut().zip(v.split(';')) {
                         let fields: Vec<_> = entry.split(',').collect();
@@ -1341,10 +1373,22 @@ impl Switcher {
                         *enabled = value == b'1';
                     }
                 }
-                "stream_dest" => c.stream_dest = v.parse().unwrap_or(0),
-                "stream_url" => c.stream_url = v.to_string(),
-                "stream_key" => c.stream_key = v.to_string(),
-                "stream_quality" => c.stream_quality = v.parse().unwrap_or(1),
+                "stream_dest" => c.streams[0].provider = v.parse().unwrap_or(0),
+                "stream_url" => c.streams[0].url = v.to_string(),
+                "stream_key" => c.streams[0].key = v.to_string(),
+                "stream_quality" => c.streams[0].quality = v.parse().unwrap_or(1),
+                "streams" => {
+                    if let Ok(streams) = serde_json::from_str::<Vec<serde_json::Value>>(v) {
+                        for (destination, stream) in c.streams.iter_mut().zip(streams) {
+                            destination.provider = stream["provider"].as_u64().unwrap_or(0).min(3) as u8;
+                            destination.url = stream["url"].as_str().unwrap_or("").into();
+                            destination.key = stream["key"].as_str().unwrap_or("").into();
+                            destination.quality = stream["quality"].as_u64().unwrap_or(1).min(2) as u8;
+                            destination.source = stream["source"].as_u64().unwrap_or(0).min((OUTPUT_COUNT - 1) as u64) as usize;
+                            destination.hardware = stream["hardware"].as_bool().unwrap_or(false);
+                        }
+                    }
+                }
                 "playlist_loop" => c.playlist_loop = on,
                 "out_size" => c.out_size = v.parse::<u8>().unwrap_or(6).min(OUTPUT_SIZES.len() as u8 - 1),
                 "out_rate" => c.out_rate = v.parse::<u8>().unwrap_or(6).min(FRAME_RATES.len() as u8 - 1),
@@ -1404,6 +1448,7 @@ impl Switcher {
             inputs: Vec::new(),
             next_id: 1,
             preview: None,
+            input_preview: None,
             output: None,
             trans: None,
             transitions: DEFAULT_TRANSITIONS,
@@ -1421,6 +1466,9 @@ impl Switcher {
             fullscreen: false,
             rec_setup: false,
             stream_setup: false,
+            stream_slot: 0,
+            stream_active: Default::default(),
+            stream_status: Default::default(),
             mc_setup: false,
             playlist_setup: false,
             mc_off: Default::default(),
@@ -1440,6 +1488,13 @@ impl Switcher {
                 devices: Vec::new(),
                 devices_loaded: false,
                 device: 0,
+                ndi_source: None,
+                ndi_sources: Vec::new(),
+                ndi_scan: true,
+                ndi_status: String::new(),
+                omt_sources: Vec::new(),
+                omt_status: String::new(),
+                srt: crate::srt::Settings::default().connection,
                 path: String::new(),
                 colour_mode: 0,
                 list: Vec::new(),
@@ -1473,6 +1528,11 @@ impl Switcher {
             external: [ExternalWindow::default(); OUTPUT_COUNT],
             decklink_active: [false; OUTPUT_COUNT],
             decklink_status: Default::default(),
+            ndi_status: Default::default(),
+            omt_status: Default::default(),
+            srt_active: Default::default(),
+            srt_status: Default::default(),
+            srt_setup: None,
             settings_input: None,
             confirm_stop: None,
             position_clipboard: None,
@@ -1701,25 +1761,43 @@ impl Switcher {
         }
     }
 
+    /// An input button selects and activates its source, or clears it on a second click.
+    pub fn press_input_overlay(&mut self, channel: usize, id: u32, on_preview: bool) {
+        let Some(ch) = self.overlays.get_mut(channel) else { return };
+        if ch.assigned.is_some_and(|source| source.input == id) {
+            ch.assigned = None;
+            if ch.input == Some(id) {
+                ch.on = false;
+            }
+            return;
+        }
+        if self.input(id).is_none() { return; }
+        self.assign_overlay(channel, id, on_preview);
+        self.activate_overlay(channel);
+    }
+
     /// Centre overlay buttons. Turning a channel off leaves its assignment ready for the next use.
     pub fn toggle_overlay_channel(&mut self, c: usize) -> bool {
-        let authored_in = self.overlays.get(c).and_then(|ch| ch.assigned)
-            .and_then(|source| self.input(source.input))
-            .and_then(|inp| inp.kind.gt_seconds(false)).is_some();
         let Some(ch) = self.overlays.get_mut(c) else { return false };
         if ch.on {
             ch.on = false;
-        } else {
-            let Some(source) = ch.assigned else { return false };
-            if ch.effect == Effect::Cut && !authored_in {
-                ch.level = FULL;
-            } else if ch.input != Some(source.input) || ch.on_preview != source.on_preview {
-                ch.level = 0.0;
-            }
-            ch.input = Some(source.input);
-            ch.on_preview = source.on_preview;
-            ch.on = true;
+            return true;
         }
+        self.activate_overlay(c)
+    }
+
+    fn activate_overlay(&mut self, channel: usize) -> bool {
+        let Some(source) = self.overlays[channel].assigned else { return false };
+        let authored_in = self.input(source.input).and_then(|inp| inp.kind.gt_seconds(false)).is_some();
+        let ch = &mut self.overlays[channel];
+        if ch.effect == Effect::Cut && !authored_in {
+            ch.level = FULL;
+        } else if ch.input != Some(source.input) || ch.on_preview != source.on_preview {
+            ch.level = 0.0;
+        }
+        ch.input = Some(source.input);
+        ch.on_preview = source.on_preview;
+        ch.on = true;
         true
     }
 
@@ -1813,6 +1891,9 @@ impl Switcher {
         }
         if self.preview == Some(id) {
             self.preview = None;
+        }
+        if self.input_preview == Some(id) {
+            self.input_preview = None;
         }
         if self.output == Some(id) {
             self.output = None;
@@ -2000,7 +2081,15 @@ impl Switcher {
                 }
                 (Kind::VideoList { paths, idx: 0 }, "List".into())
             }
-            AddKind::Desktop => (Kind::Desktop, "Desktop Capture".into()),
+            AddKind::Desktop => match &d.ndi_source {
+                Some(link) => (Kind::Device { link: link.clone(), blackmagic: false }, link[4..].to_owned()),
+                None => (Kind::Desktop, "Desktop Capture".into()),
+            },
+            AddKind::StreamSrt => {
+                d.srt.url()?;
+                let link = format!("srt:{}", serde_json::to_string(&d.srt).map_err(|e| e.to_string())?);
+                (Kind::Device { link, blackmagic: false }, d.srt.label())
+            }
             AddKind::ImageSequence | AddKind::Photos => {
                 let f = d.folder.trim().to_string();
                 if f.is_empty() || !std::path::Path::new(&f).is_dir() {
@@ -2127,6 +2216,8 @@ impl Switcher {
     /// new or opened preset then (frmmain::zzr @0x24ffe8, error 11004 "ClosePresets").
     pub fn outputs_busy(&self) -> bool {
         self.rec.is_some() || self.multicorder.is_some() || self.external_active()
+            || self.stream_active.contains(&true)
+            || self.srt_active.contains(&true)
     }
 
     pub fn external_active(&self) -> bool {

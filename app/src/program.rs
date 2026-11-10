@@ -14,6 +14,8 @@ pub struct Target {
     size: [u32; 2],
     readbacks: VecDeque<Readback>,
     free_buffers: Vec<PackBuffer>,
+    cpu_frames: Vec<Arc<Vec<u8>>>,
+    ndi_pack: Option<Result<NdiPack, String>>,
 }
 
 struct PackBuffer {
@@ -27,13 +29,111 @@ struct Readback {
     size: [u32; 2],
     captured_at: Instant,
     destinations: Destinations,
+    uyvy: bool,
 }
 
 #[derive(Clone, Default)]
 pub struct Destinations {
     pub recorders: Vec<Arc<crate::media::Recorder>>,
     pub decklinks: Vec<crate::decklink::OutputSink>,
+    pub streams: Vec<crate::stream::Output>,
+    pub ndi: Vec<crate::ndi::Sender>,
+    pub omt: Vec<crate::omt::Sender>,
     pub scope: Option<(ScopeKey, ScopeMailbox)>,
+}
+
+impl Destinations {
+    fn only_ndi(&self) -> bool {
+        !self.ndi.is_empty() && self.recorders.is_empty() && self.decklinks.is_empty()
+            && self.streams.is_empty() && self.omt.is_empty() && self.scope.is_none()
+    }
+}
+
+struct NdiPack {
+    framebuffer: glow::Framebuffer,
+    texture: glow::Texture,
+    shader: glow::Program,
+    coefficients: Option<glow::UniformLocation>,
+    size: [u32; 2],
+}
+
+const PACK_VERTEX: &str = r#"
+#version 330 core
+void main() {
+    vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+
+// Two source pixels are packed into the four channels of one half-width texel.
+const PACK_FRAGMENT: &str = r#"
+#version 330 core
+uniform sampler2D picture;
+uniform vec3 luma_weights;
+out vec4 packed_frame;
+void main() {
+    ivec2 origin = ivec2(gl_FragCoord.xy);
+    origin.x *= 2;
+    vec3 first = texelFetch(picture, origin, 0).rgb;
+    vec3 second = texelFetch(picture, origin + ivec2(1, 0), 0).rgb;
+    float ya = dot(first, luma_weights);
+    float yb = dot(second, luma_weights);
+    vec3 average = (first + second) * 0.5;
+    float y = (ya + yb) * 0.5;
+    float u = 128.0 + 224.0 * (average.b - y) / (2.0 * (1.0 - luma_weights.b));
+    float v = 128.0 + 224.0 * (average.r - y) / (2.0 * (1.0 - luma_weights.r));
+    // The readback uses the driver's native BGRA transfer order.
+    packed_frame = vec4(v, 16.0 + 219.0 * ya, u, 16.0 + 219.0 * yb) / 255.0;
+}
+"#;
+
+impl NdiPack {
+    unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
+        let shader = link(gl, PACK_VERTEX, PACK_FRAGMENT)?;
+        let framebuffer = gl.create_framebuffer().map_err(|e| { gl.delete_program(shader); e })?;
+        let texture = gl.create_texture().map_err(|e| {
+            gl.delete_framebuffer(framebuffer);
+            gl.delete_program(shader);
+            e
+        })?;
+        let coefficients = gl.get_uniform_location(shader, "luma_weights");
+        Ok(Self { framebuffer, texture, shader, coefficients, size: [0, 0] })
+    }
+
+    unsafe fn pack(&mut self, gl: &glow::Context, source: glow::Texture, [w, h]: [u32; 2]) -> bool {
+        let size = [w / 2, h];
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+        if size != self.size {
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, size[0] as i32, h as i32,
+                0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.texture), 0);
+            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                return false;
+            }
+            self.size = size;
+        }
+        gl.viewport(0, 0, size[0] as i32, h as i32);
+        gl.disable(glow::SCISSOR_TEST);
+        // The alpha channel is the second pixel's luma, so it must not blend.
+        let blending = gl.is_enabled(glow::BLEND);
+        gl.disable(glow::BLEND);
+        gl.use_program(Some(self.shader));
+        let [r, g, b] = if h >= 720 { [0.2126, 0.7152, 0.0722] } else { [0.299, 0.587, 0.114] };
+        gl.uniform_3_f32(self.coefficients.as_ref(), r, g, b);
+        gl.bind_texture(glow::TEXTURE_2D, Some(source));
+        gl.draw_arrays(glow::TRIANGLES, 0, 3);
+        if blending { gl.enable(glow::BLEND); }
+        gl.enable(glow::SCISSOR_TEST);
+        true
+    }
+}
+
+#[derive(Clone)]
+pub struct NetworkFrame {
+    pub pixels: Arc<Vec<u8>>,
+    pub width: usize,
+    pub height: usize,
 }
 
 pub type ScopeKey = (Option<u32>, u8, bool);
@@ -94,19 +194,21 @@ unsafe fn compile(gl: &glow::Context, shader: glow::Program, kind: u32, source: 
     result
 }
 
+unsafe fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
+    let shader = gl.create_program()?;
+    let result = (|| {
+        compile(gl, shader, glow::VERTEX_SHADER, vertex)?;
+        compile(gl, shader, glow::FRAGMENT_SHADER, fragment)?;
+        gl.link_program(shader);
+        if gl.get_program_link_status(shader) { Ok(shader) } else { Err(gl.get_program_info_log(shader)) }
+    })();
+    if result.is_err() { gl.delete_program(shader); }
+    result
+}
+
 impl Target {
     pub unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
-        let shader = gl.create_program()?;
-        let link = (|| {
-            compile(gl, shader, glow::VERTEX_SHADER, VERTEX)?;
-            compile(gl, shader, glow::FRAGMENT_SHADER, FRAGMENT)?;
-            gl.link_program(shader);
-            if gl.get_program_link_status(shader) { Ok(()) } else { Err(gl.get_program_info_log(shader)) }
-        })();
-        if let Err(error) = link {
-            gl.delete_program(shader);
-            return Err(error);
-        }
+        let shader = link(gl, VERTEX, FRAGMENT)?;
 
         let framebuffer = gl.create_framebuffer()?;
         let color = gl.create_texture()?;
@@ -116,7 +218,7 @@ impl Target {
         let size_uniform = gl.get_uniform_location(shader, "size");
         Ok(Self {
             framebuffer, color, shader, vao, vertices, indices, size_uniform, size: [0, 0],
-            readbacks: VecDeque::new(), free_buffers: Vec::new(),
+            readbacks: VecDeque::new(), free_buffers: Vec::new(), cpu_frames: Vec::new(), ndi_pack: None,
         })
     }
 
@@ -127,6 +229,24 @@ impl Target {
     pub fn transfer_bytes(&self) -> u64 {
         self.free_buffers.iter().chain(self.readbacks.iter().map(|frame| &frame.buffer))
             .map(|buffer| buffer.bytes as u64).sum()
+    }
+
+    fn copy_readback(&mut self, source: &[u8]) -> Arc<Vec<u8>> {
+        // A slot is reusable once the encoder and every sink release the shared frame.
+        if let Some(slot) = self.cpu_frames.iter_mut().find(|slot| {
+            slot.len() == source.len() && Arc::strong_count(slot) == 1
+        }) {
+            if let Some(bytes) = Arc::get_mut(slot) {
+                bytes.copy_from_slice(source);
+                return Arc::clone(slot);
+            }
+        }
+        let frame = Arc::new(source.to_vec());
+        let reserved: usize = self.cpu_frames.iter().map(|bytes| bytes.capacity()).sum();
+        if self.cpu_frames.len() < 4 && reserved + frame.capacity() <= 96 * 1024 * 1024 {
+            self.cpu_frames.push(Arc::clone(&frame));
+        }
+        frame
     }
 
     pub unsafe fn collect(&mut self, gl: &glow::Context) -> Result<(), String> {
@@ -147,7 +267,7 @@ impl Target {
                 break;
             }
             let [w, h] = frame.size.map(|n| n as usize);
-            let len = w * h * 4;
+            let len = w * h * if frame.uyvy { 2 } else { 4 };
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
             let data = gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT);
             if data.is_null() {
@@ -155,10 +275,20 @@ impl Target {
                 result = Err("Could not map the Program readback".into());
                 break;
             }
-            let pixels = Arc::new(std::slice::from_raw_parts(data, len).to_vec());
+            let pixels = self.copy_readback(std::slice::from_raw_parts(data, len));
             gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
             for sink in &frame.destinations.decklinks {
                 sink.submit(Arc::clone(&pixels), w, h);
+            }
+            let network_frame = NetworkFrame { pixels: Arc::clone(&pixels), width: w, height: h };
+            for sink in &frame.destinations.streams {
+                sink.submit(network_frame.clone());
+            }
+            for sink in &frame.destinations.ndi {
+                sink.submit_pixels(network_frame.clone(), frame.uyvy);
+            }
+            for sink in &frame.destinations.omt {
+                sink.submit(network_frame.clone());
             }
             if let Some((key, mailbox)) = frame.destinations.scope {
                 *mailbox.lock().unwrap() = Some(ScopeFrame { key, size: frame.size, pixels: Arc::clone(&pixels) });
@@ -204,7 +334,10 @@ impl Target {
         }
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
         if size != self.size {
+            self.cpu_frames.clear();
             gl.bind_texture(glow::TEXTURE_2D, Some(self.color));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, width, height, 0,
                 glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.color), 0);
@@ -251,12 +384,16 @@ impl Target {
             None => PackBuffer { id: gl.create_buffer()?, bytes: 0 },
         };
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer.id));
-        let len = width * height * 4;
+        let uyvy = width % 2 == 0 && destinations.only_ndi() && self.ndi_pack
+            .get_or_insert_with(|| NdiPack::new(gl)).as_mut().is_ok_and(|target| target.pack(gl, self.color, size));
+        if !uyvy { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer)); }
+        let read_width = if uyvy { width / 2 } else { width };
+        let len = read_width * height * 4;
         if buffer.bytes != len {
             gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, len, glow::STREAM_READ);
             buffer.bytes = len;
         }
-        gl.read_pixels(0, 0, width, height, glow::BGRA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
+        gl.read_pixels(0, 0, read_width, height, glow::BGRA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
         if gl.get_error() != glow::NO_ERROR {
             gl.delete_buffer(buffer.id);
             return Err("OpenGL could not read the Program framebuffer".into());
@@ -268,7 +405,7 @@ impl Target {
                 return Err(error);
             }
         };
-        self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone() });
+        self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone(), uyvy });
         gl.flush();
         Ok(())
     }
@@ -284,6 +421,11 @@ impl Target {
         }
         for buffer in self.free_buffers {
             gl.delete_buffer(buffer.id);
+        }
+        if let Some(Ok(pack)) = self.ndi_pack {
+            gl.delete_framebuffer(pack.framebuffer);
+            gl.delete_texture(pack.texture);
+            gl.delete_program(pack.shader);
         }
         gl.delete_buffer(self.vertices);
         gl.delete_buffer(self.indices);

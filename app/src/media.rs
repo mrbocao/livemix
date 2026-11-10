@@ -213,6 +213,9 @@ pub enum Source {
     /// Camera: symbolic link and the chosen mode (None = Auto: best up to 1920x1080).
     Device(String, Option<CamMode>),
     DeckLink(crate::decklink::CaptureConfig),
+    Ndi(String),
+    Omt(String),
+    Srt(crate::srt::Connection),
     File(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
@@ -227,6 +230,9 @@ pub fn start(src: Source) -> Arc<Shared> {
     let s2 = sh.clone();
     std::thread::spawn(move || match src {
         Source::DeckLink(config) => crate::decklink::run_capture(s2, config),
+        Source::Ndi(name) => crate::ndi::run_capture(s2, &name),
+        Source::Omt(address) => crate::omt::run_capture(s2, &address),
+        Source::Srt(config) => crate::srt::run_capture(s2, config),
         Source::Desktop => run_desktop(s2),
         Source::Sequence(folder, fps) => run_pictures(s2, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(s2, folder, false, 0.0, secs),

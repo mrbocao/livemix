@@ -421,6 +421,9 @@ mod tests {
         ] {
             let document = crate::gt::Document::load(&installed.join(name)).unwrap();
             assert!(document.unsupported.is_empty(), "{name}: {:?}", document.unsupported);
+            if name.contains("The Extreme") {
+                assert_eq!(document.fields.get("Clock").map(String::as_str), Some("{0:4:00PM|mm:ss}"));
+            }
             if name.contains("Lineup 12") {
                 assert!(document.fields.len() >= 27);
             }

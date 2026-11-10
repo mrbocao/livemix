@@ -519,6 +519,13 @@ impl Document {
                 }
                 ObjectKind::Text(text) => {
                     let value = texts.get(&obj.name).unwrap_or(&text.value);
+                    let clock = value.starts_with("{0:").then(|| {
+                        let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+                        let ms = ((u32::from(now.wHour) * 60 + u32::from(now.wMinute)) * 60
+                            + u32::from(now.wSecond)) * 1000 + u32::from(now.wMilliseconds);
+                        clock_text(value, ms)
+                    }).flatten();
+                    let value = clock.as_deref().unwrap_or(value);
                     draw_text(&p, view, text, value, view.bounds.height() / obj.size.y);
                 }
             }
@@ -634,6 +641,71 @@ impl Document {
             p.add(egui::Shape::closed_line(polygon, stroke));
         }
     }
+}
+
+fn clock_text(value: &str, now_ms: u32) -> Option<String> {
+    let pattern = value.strip_prefix("{0:")?.strip_suffix('}')?;
+    let (ms, pattern, countdown) = match pattern.split_once('|') {
+        Some((target, pattern)) => (clock_target(target)?.saturating_sub(now_ms), pattern, true),
+        None => (now_ms, pattern, false),
+    };
+    let hours = ms / 3_600_000;
+    let minutes = ms / 60_000;
+    let seconds = (ms / 1000) % 60;
+    let twelve_hour = (hours + 11) % 12 + 1;
+    let has_hours = pattern.contains(['H', 'h']);
+    let minutes = if countdown && !has_hours { minutes } else { minutes % 60 };
+    let mut result = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut count = 1;
+        while chars.next_if_eq(&c).is_some() { count += 1; }
+        let number = match c {
+            'H' => hours,
+            'h' => if countdown { hours } else { twelve_hour },
+            'm' => minutes,
+            's' => seconds,
+            'f' if count <= 3 => (ms % 1000) / 10_u32.pow(3 - count as u32),
+            't' if !countdown && count <= 2 => {
+                let suffix = if hours < 12 { "AM" } else { "PM" };
+                result.push_str(&suffix[..count]);
+                continue;
+            }
+            ':' | '.' | ' ' => {
+                result.extend(std::iter::repeat_n(c, count));
+                continue;
+            }
+            _ => return None,
+        };
+        result.push_str(&format!("{number:0count$}"));
+    }
+    (!result.is_empty()).then_some(result)
+}
+
+fn clock_target(value: &str) -> Option<u32> {
+    let upper = value.trim().to_ascii_uppercase();
+    let meridiem = upper.strip_suffix("AM").map(|time| (time, 0))
+        .or_else(|| upper.strip_suffix("PM").map(|time| (time, 12)));
+    let mut parts = meridiem.map_or(upper.as_str(), |(time, _)| time.trim()).split(':');
+    let mut hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    let second: u32 = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+    if let Some((_, offset)) = meridiem {
+        if !(1..=12).contains(&hour) { return None; }
+        hour = hour % 12 + offset;
+    }
+    if hour > 23 || minute > 59 || second > 59 || parts.next().is_some() { return None; }
+    Some(((hour * 60 + minute) * 60 + second) * 1000)
+}
+
+#[test]
+fn gt_scoreboard_clock_counts_down_to_local_deadline() {
+    let value = "{0:4:00PM|mm:ss}";
+    let deadline = 16 * 3_600_000;
+    assert_eq!(clock_text(value, deadline - 90_000).as_deref(), Some("01:30"));
+    assert_eq!(clock_text(value, deadline - 89_000).as_deref(), Some("01:29"));
+    assert_eq!(clock_text(value, deadline + 1000).as_deref(), Some("00:00"));
+    assert_eq!(clock_text("{0:HH:mm:ss}", deadline).as_deref(), Some("16:00:00"));
 }
 
 fn has_cube(objects: &[Object], target: &str) -> bool {

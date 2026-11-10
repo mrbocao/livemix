@@ -14,6 +14,73 @@ const DEFAULT_TRANSFER_BUDGET: u64 = 250 * MIB;
 const LARGE_BAR_FALLBACK: u64 = 1000 * MIB;
 
 #[derive(Default)]
+pub struct VideoClock {
+    rate: f64,
+    origin: f64,
+    next_slot: u64,
+    sample_slots: u64,
+    sample_frames: u64,
+    pub picture_time: f64,
+    pub fps: Option<f64>,
+}
+
+impl VideoClock {
+    pub fn advance(&mut self, now: f64, rate: f64) -> bool {
+        if self.rate != rate {
+            *self = Self { rate, origin: now, ..Self::default() };
+        }
+        let slot = (((now - self.origin) * rate + 1e-9).floor()) as u64;
+        if slot < self.next_slot { return false; }
+
+        // Missed slots lower the measured rate. They never trigger a burst of frames.
+        self.sample_slots += slot - self.next_slot + 1;
+        self.sample_frames += 1;
+        self.next_slot = slot + 1;
+        self.picture_time = now;
+        if self.sample_slots as f64 >= rate {
+            self.fps = Some(rate * (self.sample_frames as f64 / self.sample_slots as f64));
+            self.sample_slots = 0;
+            self.sample_frames = 0;
+        }
+        true
+    }
+
+    pub fn next_deadline(&self) -> f64 {
+        self.origin + self.next_slot as f64 / self.rate
+    }
+}
+
+#[cfg(test)]
+mod video_clock_tests {
+    use super::VideoClock;
+
+    #[test]
+    fn extra_repaints_do_not_create_video_frames() {
+        for rate in [25.0, 29.97, 59.94, 60.0] {
+            let mut clock = VideoClock::default();
+            let frames = (0..2000).filter(|i| clock.advance(f64::from(*i) / 200.0, rate)).count();
+            assert_eq!(frames, (10.0_f64 * rate).ceil() as usize);
+            assert_eq!(clock.fps, Some(rate));
+        }
+    }
+
+    #[test]
+    fn missed_frames_are_measured_and_not_replayed() {
+        let mut clock = VideoClock::default();
+        for i in 0..50 {
+            assert!(clock.advance(f64::from(i) / 25.0, 60.0));
+        }
+        assert!((clock.fps.unwrap() - 25.0).abs() < 1.0);
+        assert!(!clock.advance(49.0 / 25.0, 60.0));
+        assert!(clock.next_deadline() > 49.0 / 25.0);
+
+        assert!(clock.advance(2.0, 30.0));
+        assert_eq!(clock.fps, None);
+        assert!(!clock.advance(2.001, 30.0));
+    }
+}
+
+#[derive(Default)]
 pub struct Status {
     pub process_cpu: Option<u32>,
     pub total_cpu: Option<u32>,
