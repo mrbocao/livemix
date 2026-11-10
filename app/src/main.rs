@@ -3847,35 +3847,39 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
         let mut done = false;
         egui::Window::new("Input Select").open(&mut open).collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(650.0).show(ctx, |ui| {
+            let body_height = (ctx.screen_rect().height() - 145.0).clamp(240.0, 510.0);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     // The original's input list (frmInput.tMenu), then this app's extras.
                     ui.set_width(170.0);
-                    for (n, k) in ADD_KINDS.into_iter().enumerate() {
-                        if n == ORIGINAL_ADD_KINDS {
-                            ui.separator();
-                            ui.label(RichText::new("Extras").size(10.0).color(TEXT_DIM));
-                        }
-                        let label = if k.available() {
-                            RichText::new(k.label())
-                        } else {
-                            RichText::new(k.label()).color(TEXT_DIM.gamma_multiply(0.7)).italics()
-                        };
-                        let active = s.add_dialog.kind == k;
-                        if ui.add_sized([156.0, 19.0], egui::Button::new(label)
-                            .fill(if active { OUTPUT } else { BTN_DARK })).clicked()
-                        {
-                            if !s.add_dialog.kind.uses_device() || !k.uses_device() {
-                                s.add_dialog.device = 0;
+                    egui::ScrollArea::vertical().id_salt("input-select-types").max_height(body_height).show(ui, |ui| {
+                        for (n, k) in ADD_KINDS.into_iter().enumerate() {
+                            if n == ORIGINAL_ADD_KINDS {
+                                ui.separator();
+                                ui.label(RichText::new("Extras").size(10.0).color(TEXT_DIM));
                             }
-                            s.add_dialog.kind = k;
-                            s.dialog_error.clear();
+                            let label = if k.available() {
+                                RichText::new(k.label())
+                            } else {
+                                RichText::new(k.label()).color(TEXT_DIM.gamma_multiply(0.7)).italics()
+                            };
+                            let active = s.add_dialog.kind == k;
+                            if ui.add_sized([156.0, 19.0], egui::Button::new(label)
+                                .fill(if active { OUTPUT } else { BTN_DARK })).clicked()
+                            {
+                                if !s.add_dialog.kind.uses_device() || !k.uses_device() {
+                                    s.add_dialog.device = 0;
+                                }
+                                s.add_dialog.kind = k;
+                                s.dialog_error.clear();
+                            }
                         }
-                    }
+                    });
                 });
                 ui.separator();
                 ui.vertical(|ui| {
                     ui.set_width(440.0);
+                    ui.set_min_height(body_height);
                     ui.label(RichText::new(s.add_dialog.kind.label()).strong());
                     ui.label(RichText::new(s.add_dialog.kind.help()).color(TEXT_DIM).size(11.0));
                     ui.add_space(6.0);
@@ -4021,17 +4025,17 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                     if !s.dialog_error.is_empty() {
                         ui.label(RichText::new(&s.dialog_error).size(11.0).color(Color32::from_rgb(0xff, 0x9a, 0x9a)));
                     }
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(s.add_dialog.kind.available(), egui::Button::new("  OK  ")).clicked() {
-                            done = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            s.add_dialog.open = false;
-                            s.dialog_error.clear();
-                        }
-                    });
                 });
+            });
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    s.add_dialog.open = false;
+                    s.dialog_error.clear();
+                }
+                if ui.add_enabled(s.add_dialog.kind.available(), egui::Button::new("  OK  ")).clicked() {
+                    done = true;
+                }
             });
         });
         if done {
