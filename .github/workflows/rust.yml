@@ -55,7 +55,7 @@ jobs:
         cp packaging/macos/Info.plist dist/LiveMix.app/Contents/Info.plist
         install -m 755 target/release/livemix dist/LiveMix.app/Contents/MacOS/livemix
         plutil -lint dist/LiveMix.app/Contents/Info.plist
-        lipo -verify_arch arm64 dist/LiveMix.app/Contents/MacOS/livemix
+        lipo dist/LiveMix.app/Contents/MacOS/livemix -verify_arch arm64
         codesign --force --sign - dist/LiveMix.app
         codesign --verify --strict dist/LiveMix.app
         ditto -c -k --keepParent dist/LiveMix.app dist/LiveMix-macOS-arm64.zip
