@@ -662,14 +662,18 @@ impl Recorder {
     }
     /// Starts a recording with the project's size and frame rate and the encoder choice.
     pub fn start_opts(path: String, opts: RecOpts) -> Recorder {
+        Self::spawn_writer(path, opts).0
+    }
+
+    fn spawn_writer(path: String, opts: RecOpts) -> (Recorder, std::thread::JoinHandle<()>) {
         // Keep the UI responsive and bound memory if the encoder falls behind.
         let (tx, rx) = sync_channel(3);
         let error = Arc::new(Mutex::new(String::new()));
         let encoder = Arc::new(Mutex::new("Waiting for first frame".into()));
         let (p2, e2) = (path.clone(), error.clone());
         let encoder_status = Arc::clone(&encoder);
-        std::thread::spawn(move || record_thread(p2, rx, e2, encoder_status, opts));
-        Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0) }
+        let worker = std::thread::spawn(move || record_thread(p2, rx, e2, encoder_status, opts));
+        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0) }, worker)
     }
     pub fn push(&self, rgba: Vec<u8>, w: usize, h: usize) {
         self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at: Instant::now(), bgra: false });
@@ -931,8 +935,11 @@ fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, 
         }
     }
     if let Some((wr, ..)) = writer {
-        unsafe {
-            let _ = wr.Finalize();
+        if let Err(error) = unsafe { wr.Finalize() } {
+            let mut status = err.lock().unwrap();
+            if status.is_empty() {
+                *status = format!("Could not finalize recording: {}", error.message());
+            }
         }
     }
 }
@@ -1267,8 +1274,10 @@ mod tests {
         let dir = std::env::current_dir().unwrap().join("target").join("media-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("test-{}.mp4", std::process::id())).to_string_lossy().to_string();
+        let (rec, worker) = Recorder::spawn_writer(path.clone(), RecOpts { hw: false, ..RecOpts::default() });
+        let error = Arc::clone(&rec.error);
+        let first_capture = Instant::now();
         {
-            let rec = Recorder::start(path.clone());
             for f in 0..45u32 {
                 let (w, h) = (320usize, 180usize);
                 let mut px = vec![0u8; w * h * 4];
@@ -1281,13 +1290,33 @@ mod tests {
                         px[d + 3] = 255;
                     }
                 }
-                rec.push(px, w, h);
-                std::thread::sleep(Duration::from_millis(33));
+                let mut frame = RecFrame {
+                    pixels: Arc::new(px), w, h, bgra: false,
+                    captured_at: first_capture + Duration::from_millis(33 * u64::from(f)),
+                };
+                loop {
+                    match rec.tx.try_send(frame) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                            assert!(first_capture.elapsed() < Duration::from_secs(30), "The encoder stopped consuming frames");
+                            frame = pending;
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            panic!("Recorder stopped: {}", error.lock().unwrap());
+                        }
+                    }
+                }
             }
-            std::thread::sleep(Duration::from_millis(300));
-            assert_eq!(rec.error.lock().unwrap().as_str(), "");
         }
-        std::thread::sleep(Duration::from_millis(1500));
+        drop(rec);
+        let wait = Instant::now();
+        while !worker.is_finished() && wait.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(worker.is_finished(), "The MP4 writer did not finalize");
+        worker.join().unwrap();
+        assert_eq!(error.lock().unwrap().as_str(), "");
         let meta = std::fs::metadata(&path).expect("mp4 written");
         println!("mp4 size {}", meta.len());
         assert!(meta.len() > 1000);
