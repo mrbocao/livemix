@@ -19,7 +19,7 @@ Some media tests exercise Windows Media Foundation, the desktop, and an availabl
 ## Where help is needed
 
 - Profile CPU use, GPU use, and frame drops with multiple cameras and video files while recording.
-- Render the program output into its own texture. Recording currently reads back the interface framebuffer and crops it to the program view.
+- Profile the dedicated program compositor and its GPU readback under simultaneous recordings.
 - Reduce CPU copies between Media Foundation, the compositor, and the encoder. File playback can use Direct3D 11 with a software fallback.
 - Reproduce bugs in transitions, capture device negotiation, and recording.
 

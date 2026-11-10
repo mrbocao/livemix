@@ -4,6 +4,13 @@
 mod model;
 mod render;
 mod media;
+mod program;
+mod performance;
+mod gt;
+
+use eframe::glow::HasContext;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
 use model::*;
@@ -37,7 +44,12 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             apply_style(&cc.egui_ctx);
-            Ok(Box::new(App::new(screenshot)))
+            let mut app = App::new(screenshot);
+            if let Some(gl) = &cc.gl {
+                app.graphics_adapter = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+                app.performance.set_adapter(&app.graphics_adapter);
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -95,12 +107,19 @@ struct App {
     screenshot: Option<String>,
     shot_pending: bool,
     shot_recording: Option<f64>,
+    shot_wave: bool,
     next_record_frame: f64,
+    record_format: ([u32; 2], f64),
+    program: Arc<Mutex<ProgramCapture>>,
+    graphics_adapter: String,
+    performance: performance::Monitor,
     last_time: f64,
     fps: f32,
     media: std::collections::HashMap<u32, Feed>,
-    /// Recording of the Output (Record button).
-    rec: Option<media::Recorder>,
+    /// Recording slots 1 and 2 start and stop with Record.
+    recordings: [Option<ComposedRecording>; 2],
+    multi_outputs: [Option<ComposedRecording>; OUTPUT_COUNT],
+    multi_output_failed: [bool; OUTPUT_COUNT],
     /// One recording per camera (MultiCorder).
     multi: std::collections::HashMap<u32, media::Recorder>,
     browse_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
@@ -111,40 +130,95 @@ struct App {
     /// PhotoExportFilterIndex (config default 0 = PNG).
     photo_filter: u32,
     /// When the current Output recording file / each MultiCorder file was started.
-    rec_started: f64,
     multi_started: std::collections::HashMap<u32, f64>,
     /// Preview waveform picture and when to refresh it.
-    waveform: Option<egui::TextureHandle>,
+    scopes: std::collections::HashMap<u8, egui::TextureHandle>,
     next_wave: f64,
 }
 
-/// Waveform of a picture: for every column (256 across) how many pixels have each brightness
-/// (128 levels, 0 % at the bottom, 100 % at the top), drawn green-white.
-fn waveform_image(px: &[u8], w: usize, h: usize) -> egui::ColorImage {
-    const W: usize = 256;
-    const H: usize = 128;
-    let mut counts = vec![0u32; W * H];
+#[derive(Default)]
+struct ProgramCapture {
+    target: Option<program::Target>,
+    error: Option<String>,
+}
+
+struct ComposedRecording {
+    recorder: Arc<media::Recorder>,
+    channel: usize,
+    started: f64,
+}
+
+impl ComposedRecording {
+    fn new(folder: &str, name: &str, channel: usize, started: f64, opts: media::RecOpts) -> Self {
+        let path = rec_dir(folder).join(format!("{}.{}", media::recording_name(name), opts.format.extension()));
+        let recorder = Arc::new(media::Recorder::start_opts(path.to_string_lossy().into_owned(), opts));
+        Self { recorder, channel, started }
+    }
+}
+
+/// Scope picture of a picture for the Waveform Monitor: SCOPE_RGB — red, green and blue levels
+/// of every column laid over each other; SCOPE_Y — brightness (BT.709); SCOPE_PARADE — red,
+/// green and blue side by side; SCOPE_VECTOR — colour (Cb across, Cr up) round the centre of a
+/// square picture, twice as large with "Vectorscope 2X Zoom". Levels run 0 % at the bottom to
+/// 100 % at the top.
+#[allow(non_snake_case)]
+fn waveform_image(px: &[u8], w: usize, h: usize, kind: u8, vs_zoom: bool) -> egui::ColorImage {
+    let vector = kind == SCOPE_VECTOR;
+    let (W, H): (usize, usize) = if vector { (128, 128) } else { (256, 128) };
+    // counts[channel][row * W + col]; channel 3 = white (luma / vectorscope).
+    let mut counts = vec![vec![0u32; W * H]; 4];
     let step = ((w * h) / 120_000).max(1);
+    let level_row = |v: f32| H - 1 - ((v / 255.0).clamp(0.0, 1.0) * (H - 1) as f32).round() as usize;
+    let vs_scale = if vs_zoom { 2.0 } else { 1.0 };
     let mut i = 0;
     while i < w * h {
         let (x, p) = (i % w, i * 4);
-        // Leave out the corner where the waveform panel itself is drawn.
-        if x * 100 >= w * 57 && (i / w) * 100 >= h * 61 {
-            i += step;
-            continue;
+        let (r, g, b) = (px[p] as f32, px[p + 1] as f32, px[p + 2] as f32);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let kind = match kind {
+            SCOPE_RGB => 1,
+            SCOPE_PARADE => 3,
+            SCOPE_VECTOR => 4,
+            _ => 2,
+        };
+        match kind {
+            1 => {
+                let col = x * W / w;
+                for (c, v) in [r, g, b].into_iter().enumerate() {
+                    counts[c][level_row(v) * W + col] += 1;
+                }
+            }
+            3 => {
+                // Three thirds: red, green, blue.
+                let third = W / 3;
+                for (c, v) in [r, g, b].into_iter().enumerate() {
+                    let col = c * third + x * third / w;
+                    counts[c][level_row(v) * W + col] += 1;
+                }
+            }
+            4 => {
+                let cb = (b - luma) / 1.8556;
+                let cr = (r - luma) / 1.5748;
+                let col = (W as f32 / 2.0 + cb / 255.0 * H as f32 * 0.9 * vs_scale).clamp(0.0, W as f32 - 1.0) as usize;
+                let row = (H as f32 / 2.0 - cr / 255.0 * H as f32 * 0.9 * vs_scale).clamp(0.0, H as f32 - 1.0) as usize;
+                counts[3][row * W + col] += 1;
+            }
+            _ => {
+                counts[3][level_row(luma) * W + x * W / w] += 1;
+            }
         }
-        let y = 0.2126 * px[p] as f32 + 0.7152 * px[p + 1] as f32 + 0.0722 * px[p + 2] as f32;
-        let col = x * W / w;
-        let row = H - 1 - ((y / 255.0) * (H - 1) as f32).round() as usize;
-        counts[row * W + col] += 1;
         i += step;
     }
     let per_col = ((w * h / step) as f32 / W as f32).max(1.0);
+    let alpha = |c: u32| ((c as f32 / per_col * 40.0).sqrt().min(1.0) * 255.0) as u8;
     let mut img = egui::ColorImage::new([W, H], Color32::TRANSPARENT);
-    for (k, c) in counts.iter().enumerate() {
-        if *c > 0 {
-            let a = ((*c as f32 / per_col * 40.0).sqrt().min(1.0) * 255.0) as u8;
-            img.pixels[k] = Color32::from_rgba_unmultiplied(170, 255, 170, a.max(60));
+    for k in 0..W * H {
+        let (cr, cg, cb, cw) = (counts[0][k], counts[1][k], counts[2][k], counts[3][k]);
+        if cw > 0 {
+            img.pixels[k] = Color32::from_rgba_unmultiplied(170, 255, 170, alpha(cw).max(60));
+        } else if cr + cg + cb > 0 {
+            let lit = |c: u32| if c > 0 { 255 } else { 40 };
+            img.pixels[k] = Color32::from_rgba_unmultiplied(lit(cr), lit(cg), lit(cb), alpha(cr.max(cg).max(cb)).max(60));
         }
     }
     img
@@ -166,7 +240,7 @@ impl App {
         let mut s = Switcher::demo();
         // Settings window options saved last time (defaults are the original's config defaults).
         s.load_settings();
-        s.output_window = s.cfg.start_external;
+        s.external[0].open = s.cfg.start_external;
         s.fullscreen = s.cfg.start_fullscreen;
         // Testing aid: LIVEMIX_EXTRA_INPUTS=N adds N test cameras (to check the input grid).
         let extra: usize = std::env::var("LIVEMIX_EXTRA_INPUTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -201,10 +275,21 @@ impl App {
                     s.cfg.input_page = 0;
                 }
             }
+            "newpreset" => {
+                // The New button pressed (External off): "save changes?" first, as the demo has
+                // inputs; LIVEMIX_OPEN=newformat goes on to the New Preset window.
+                s.external[0].open = false;
+                s.press_new();
+            }
+            "newformat" => {
+                s.external[0].open = false;
+                s.press_new();
+                s.new_step = NewStep::Format;
+            }
             "tools" => {
                 // Preview safe areas and waveform on.
-                s.cfg.show_safe = true;
-                s.cfg.show_waveform = true;
+                s.cfg.safe_type = 20;
+                s.cfg.wave_type = 60;
             }
             "perf" => {
                 s.settings_open = true;
@@ -253,20 +338,26 @@ impl App {
             screenshot,
             shot_pending: false,
             shot_recording: None,
+            shot_wave: false,
             next_record_frame: 0.0,
+            record_format: ([1920, 1080], 30.0),
+            program: Arc::default(),
+            graphics_adapter: "OpenGL renderer unavailable".into(),
+            performance: performance::Monitor::new(),
             last_time: 0.0,
             fps: 30.0,
             media: Default::default(),
-            rec: None,
+            recordings: Default::default(),
+            multi_outputs: Default::default(),
+            multi_output_failed: [false; OUTPUT_COUNT],
             multi: Default::default(),
             browse_rx: None,
             browse_kind: media::PickKind::Video,
             snap_pending: None,
             snap_rx: None,
             photo_filter: 0,
-            rec_started: 0.0,
             multi_started: Default::default(),
-            waveform: None,
+            scopes: Default::default(),
             next_wave: 0.0,
         }
     }
@@ -275,6 +366,11 @@ impl App {
     fn update_media(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering::Relaxed;
         let now = ctx.input(|i| i.time);
+        let display_sources: Vec<_> = self.s.cfg.outputs.iter().zip(&self.s.external)
+            .filter(|(_, window)| window.open).map(|(route, _)| route.source)
+            .chain(self.s.fullscreen.then_some(self.s.cfg.fs_source))
+            .chain(self.composed_recordings().map(|r| self.s.cfg.outputs[r.channel].source))
+            .collect();
         let App { s, media: feeds, multi, multi_started, .. } = self;
         let ids: std::collections::HashSet<u32> = s.inputs.iter().map(|i| i.id).collect();
         feeds.retain(|id, _| ids.contains(id));
@@ -288,7 +384,9 @@ impl App {
             // closes a file once it is old enough (a new one starts with the next frame).
             multi.retain(|id, _| ids.contains(id) && !s.mc_off.contains(id) && !(mc_split > 0.0 && now - multi_started.get(id).copied().unwrap_or(now) >= mc_split));
         }
-        let (mc_dir, mc_mbps, mc_fps, mc_hw) = (s.cfg.mc_folder.clone(), s.cfg.mc_mbps, s.cfg.frame_rate(), s.cfg.hw_encoder);
+        let (mc_dir, mc_mbps, mc_fps, mc_hw, mc_format) = (
+            s.cfg.mc_folder.clone(), s.cfg.mc_mbps, s.cfg.frame_rate(), s.cfg.hw_encoder, s.cfg.mc_codec,
+        );
         // Inputs seen big right now (Preview, Output, transitions, overlays and their layers).
         let skip = u64::from(s.cfg.preview_skip.max(1));
         let ui_frame = s.ui_frame;
@@ -298,6 +396,15 @@ impl App {
             live.extend(tr.from);
         }
         live.extend(s.overlays.iter().filter(|c| c.on || c.level > 0.0).filter_map(|c| c.input));
+        for source in display_sources {
+            if source == SRC_MV1 || source == SRC_MV2 {
+                live.extend(s.mv_resolve(usize::from(source == SRC_MV2)).into_iter()
+                    .filter_map(|(_, code)| code.and_then(|code| code.checked_sub(1)))
+                    .filter(|id| s.input(*id).is_some()));
+            } else if let Some(id) = source.checked_sub(1).filter(|id| s.input(*id).is_some()) {
+                live.insert(id);
+            }
+        }
         let tops: Vec<u32> = live.iter().copied().collect();
         for id in tops {
             if let Some(i) = s.input(id) {
@@ -341,13 +448,21 @@ impl App {
                             if let Kind::VideoList { idx, .. } = &mut inp.kind {
                                 *idx = 0;
                             }
-                            sh.restart.store(true, Relaxed);
+                            if matches!(inp.kind, Kind::VideoFile { .. }) {
+                                inp.seek_ms = Some(0);
+                            } else {
+                                sh.restart.store(true, Relaxed);
+                            }
                             inp.restart_req = false;
+                        }
+                        let seeking = inp.seek_ms.take();
+                        if let Some(ms) = seeking {
+                            sh.seek_ms.store(ms + 1, Relaxed);
                         }
                         inp.pos = sh.pos_ms.load(Relaxed) as f32 / 1000.0;
                         let d = sh.dur_ms.load(Relaxed) as f32 / 1000.0;
                         inp.duration = if d > 0.0 { d } else { inp.duration.max(inp.pos) };
-                        if sh.ended.load(Relaxed) {
+                        if seeking.is_none() && sh.seek_ms.load(Relaxed) == 0 && sh.ended.load(Relaxed) {
                             let loop_on = inp.loop_on;
                             if let Kind::VideoList { paths, idx } = &mut inp.kind {
                                 // List: next file; at the end start over when Loop is on.
@@ -363,7 +478,6 @@ impl App {
                             }
                         }
                     }
-                    let is_file = is_file && !is_device;
                     let k = inp.key;
                     let key = if k.on { (1u64 << 40) | ((k.tolerance as u64) << 24) | ((k.colour[0] as u64) << 16) | ((k.colour[1] as u64) << 8) | k.colour[2] as u64 } else { 0 };
                     sh.key.store(key, Relaxed);
@@ -380,19 +494,19 @@ impl App {
                     let seq = sh.seq.load(Relaxed);
                     // Preview Skip: an input that isn't on screen big gets its new picture only
                     // every Nth interface frame (MultiCorder still records every frame).
-                    let recording_this = multicorder && !is_file && !s.mc_off.contains(&inp.id);
+                    let recording_this = multicorder && is_device && !s.mc_off.contains(&inp.id);
                     let skip_now = skip > 1 && !live.contains(&inp.id) && !recording_this && ui_frame % skip != 0;
                     if seq != feed.seen && !skip_now {
                         feed.seen = seq;
                         let fr = sh.frame.lock().ok().and_then(|mut f| f.take());
                         if let Some(fr) = fr {
-                            if multicorder && !is_file && !s.mc_off.contains(&inp.id) {
+                            if recording_this {
                                 let title = safe_name(&inp.title);
                                 let rec = multi.entry(inp.id).or_insert_with(|| {
                                     multi_started.insert(inp.id, now);
-                                    let p = rec_dir(&mc_dir).join(format!("{}.mp4", media::recording_name(&title)));
+                                    let p = rec_dir(&mc_dir).join(format!("{}.{}", media::recording_name(&title), mc_format.extension()));
                                     // Each camera keeps its own picture size.
-                                    media::Recorder::start_opts(p.to_string_lossy().to_string(), media::RecOpts { mbps: mc_mbps, size: None, fps: mc_fps, hw: mc_hw })
+                                    media::Recorder::start_opts(p.to_string_lossy().to_string(), media::RecOpts { mbps: mc_mbps, size: None, fps: mc_fps, hw: mc_hw, format: mc_format })
                                 });
                                 rec.push(fr.rgba.clone(), fr.w, fr.h);
                             }
@@ -442,46 +556,177 @@ impl App {
         }
     }
 
-    /// Record button: start/stop the Output recording (Recording Setup: folder, name, bit rate,
-    /// and a new file every N minutes).
+    fn composed_recordings(&self) -> impl Iterator<Item = &ComposedRecording> {
+        self.recordings.iter().chain(&self.multi_outputs).filter_map(Option::as_ref)
+    }
+
+    fn recording_error(&self, recording: &ComposedRecording) -> Option<String> {
+        let error = recording.recorder.error.lock().unwrap();
+        if !error.is_empty() {
+            return Some(error.clone());
+        }
+        if self.program.lock().unwrap().error.is_some() && !self.can_capture_from_window(recording) {
+            return Some(format!("Output {} requires offscreen capture", recording.channel + 1));
+        }
+        None
+    }
+
+    fn can_capture_from_window(&self, recording: &ComposedRecording) -> bool {
+        self.s.cfg.outputs[recording.channel] == OutputRoute::default()
+    }
+
     fn update_recording(&mut self, now: f64) {
-        let split = self.s.cfg.rec_split_min as f64 * 60.0;
-        if self.rec.is_some() && self.s.rec.is_some() && split > 0.0 && now - self.rec_started >= split {
-            // "New File Every": close this file and carry on in a new one.
-            self.rec = None;
-        }
-        if self.s.rec.is_some() && self.rec.is_none() {
-            let p = rec_dir(&self.s.cfg.rec_folder).join(format!("{}.mp4", media::recording_name(&safe_name(&self.s.cfg.rec_name))));
-            let path = p.to_string_lossy().to_string();
-            self.s.notice(&format!("Recording to {path}"));
-            // The file has the project's Output Size and frame rate.
-            let c = &self.s.cfg;
-            let opts = media::RecOpts { mbps: c.rec_mbps, size: Some(c.out_dims()), fps: c.frame_rate(), hw: c.hw_encoder };
-            self.rec = Some(media::Recorder::start_opts(path, opts));
-            self.rec_started = now;
+        if self.composed_recordings().next().is_none() {
+            let (w, h) = self.s.cfg.out_dims();
+            self.record_format = ([w, h], f64::from(self.s.cfg.frame_rate()));
             self.next_record_frame = now;
-        } else if self.s.rec.is_none() {
-            if let Some(r) = self.rec.take() {
-                let msg = format!("Recording saved: {}", r.path);
-                drop(r);
-                self.s.notice(&msg);
-            }
         }
-        if let Some(r) = &self.rec {
-            let e = r.error.lock().map(|e| e.clone()).unwrap_or_default();
-            if !e.is_empty() {
-                self.s.notice(&e);
+        let ([w, h], fps) = self.record_format;
+        let options = |mbps, format, hw| media::RecOpts { mbps, size: Some((w, h)), fps: fps as f32, hw, format };
+
+        if self.s.rec.is_none() {
+            if let Some(primary) = self.recordings[0].take() {
+                self.s.notice(&format!("Recording stopped: {}", primary.recorder.path));
+            }
+            self.recordings[1] = None;
+        } else {
+            let c = &self.s.cfg;
+            let split = f64::from(c.rec_split_min) * 60.0;
+            if self.recordings[0].as_ref().is_some_and(|r| split > 0.0 && now - r.started >= split) {
+                self.recordings = Default::default();
+            }
+            if self.recordings[0].is_none() {
+                let name = safe_name(&c.rec_name);
+                self.recordings[0] = Some(ComposedRecording::new(&c.rec_folder, &name, c.rec_source, now,
+                    options(c.rec_mbps, c.rec_codec, c.hw_encoder)));
+                if c.rec_second {
+                    self.recordings[1] = Some(ComposedRecording::new(&c.rec_folder, &format!("{name} - 2"), c.rec_second_source, now,
+                        options(c.rec_second_mbps, c.rec_second_codec, c.hw_encoder)));
+                }
+                let path = &self.recordings[0].as_ref().unwrap().recorder.path;
+                self.s.notice(&format!("Recording to {path}"));
+            }
+            if let Some(error) = self.recordings[0].as_ref().and_then(|r| self.recording_error(r)) {
                 self.s.rec = None;
-                self.rec = None;
+                self.recordings = Default::default();
+                self.s.notice(&error);
+            } else if let Some(error) = self.recordings[1].as_ref().and_then(|r| self.recording_error(r)) {
+                self.recordings[1] = None;
+                self.s.notice(&format!("Recording 2: {error}"));
             }
         }
-        if self.s.multicorder.is_some() && !self.s.inputs.iter().any(|i| matches!(i.kind, Kind::Device { .. })) {
+
+        let selected_camera = self.s.inputs.iter().any(|i| matches!(i.kind, Kind::Device { .. }) && !self.s.mc_off.contains(&i.id));
+        if self.s.multicorder.is_some() && !selected_camera && !self.s.cfg.mc_outputs.contains(&true) {
             self.s.multicorder = None;
-            self.s.notice("MultiCorder records each camera separately — add a camera first");
+            self.s.notice("Select a camera or Output 1–4 in MultiCorder");
+        }
+        let split = f64::from(self.s.cfg.mc_split_min) * 60.0;
+        for channel in 0..OUTPUT_COUNT {
+            if self.s.multicorder.is_none() || !self.s.cfg.mc_outputs[channel] {
+                self.multi_outputs[channel] = None;
+                self.multi_output_failed[channel] = false;
+                continue;
+            }
+            if self.multi_output_failed[channel] {
+                continue;
+            }
+            if self.multi_outputs[channel].as_ref().is_some_and(|r| split > 0.0 && now - r.started >= split) {
+                self.multi_outputs[channel] = None;
+            }
+            if self.multi_outputs[channel].is_none() {
+                let c = &self.s.cfg;
+                self.multi_outputs[channel] = Some(ComposedRecording::new(&c.mc_folder, &format!("MultiCorder Output {}", channel + 1), channel, now,
+                    options(c.mc_mbps, c.mc_codec, c.hw_encoder)));
+            }
+            if let Some(error) = self.multi_outputs[channel].as_ref().and_then(|r| self.recording_error(r)) {
+                self.multi_outputs[channel] = None;
+                self.multi_output_failed[channel] = true;
+                self.s.notice(&format!("MultiCorder Output {}: {error}", channel + 1));
+            }
+        }
+        for (id, recorder) in &self.multi {
+            let error = std::mem::take(&mut *recorder.error.lock().unwrap());
+            if !error.is_empty() {
+                self.s.notice(&format!("MultiCorder Input {}: {error}", self.s.number_of(*id)));
+            }
         }
     }
 
-    /// Window pictures: --screenshot check, Snapshot button and Output recording.
+    fn advance_record_clock(&mut self, now: f64) {
+        let fps = self.record_format.1;
+        let elapsed = ((now - self.next_record_frame) * fps).floor() as u64;
+        self.next_record_frame += (elapsed + 1) as f64 / fps;
+        for recording in self.composed_recordings() {
+            recording.recorder.note_dropped_frames(elapsed);
+        }
+    }
+
+    /// Capture the Program when due and record the elapsed time at the end of drawing.
+    fn finish_frame(&mut self, ctx: &egui::Context, now: f64, started: Instant) {
+        let (available, pending) = {
+            let state = self.program.lock().unwrap();
+            (state.error.is_none(), state.target.as_ref().is_some_and(program::Target::has_pending))
+        };
+        let mut frames = Vec::new();
+        if available && now >= self.next_record_frame && self.composed_recordings().next().is_some() {
+            self.advance_record_clock(now);
+            let size = self.record_format.0;
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("program-offscreen"));
+            let mut groups: Vec<(OutputRoute, Vec<Arc<media::Recorder>>)> = Vec::new();
+            for recording in self.composed_recordings() {
+                let route = self.s.cfg.outputs[recording.channel];
+                if let Some((_, recorders)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                    recorders.push(Arc::clone(&recording.recorder));
+                } else {
+                    groups.push((route, vec![Arc::clone(&recording.recorder)]));
+                }
+            }
+            let captured_at = Instant::now();
+            for (route, recorders) in groups {
+                draw_src(&egui::Painter::new(ctx.clone(), layer, rect), rect, &self.s, now, route.source, route.overlays);
+                let shapes = ctx.graphics_mut(|graphics| {
+                    std::mem::take(graphics.entry(layer)).all_entries().cloned().collect()
+                });
+                frames.push((size, ctx.tessellate(shapes, 1.0), captured_at, recorders));
+            }
+        }
+        let program = Arc::clone(&self.program);
+        let peak = Arc::clone(&self.performance.render_peak);
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::new("program-capture")))
+            .add(egui::PaintCallback {
+                rect: ctx.screen_rect(),
+                callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_, painter| {
+                    if pending || !frames.is_empty() {
+                        let mut state = program.lock().unwrap();
+                        let result = unsafe {
+                            (|| {
+                                if let Some(target) = state.target.as_mut() {
+                                    target.collect(painter.gl())?;
+                                }
+                                for (size, meshes, captured_at, recorders) in &frames {
+                                    if state.target.is_none() {
+                                        state.target = Some(program::Target::new(painter.gl())?);
+                                    }
+                                    state.target.as_mut().unwrap().capture(painter, *size, meshes, *captured_at, recorders)?;
+                                }
+                                Ok::<(), String>(())
+                            })()
+                        };
+                        if let Err(error) = result {
+                            state.error = Some(error);
+                            for (_, _, _, recorders) in &frames {
+                                for recorder in recorders { recorder.note_dropped_frames(1); }
+                            }
+                        }
+                    }
+                    peak.fetch_max(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                })),
+            });
+    }
+
+    /// Window pictures for screenshots, scopes, snapshots and recording fallback.
     fn handle_screenshots(&mut self, ctx: &egui::Context, now: f64) {
         let check_due = self.screenshot.is_some() && self.frame >= 120;
         let mut got = None;
@@ -492,27 +737,30 @@ impl App {
                 }
             }
         });
-        let record = if got.is_some() {
+        let recorders: Vec<_> = if got.is_some() {
             self.shot_pending = false;
-            self.shot_recording.take() == Some(self.rec_started) && self.rec.is_some()
+            let shot_at = self.shot_recording.take();
+            self.composed_recordings()
+                .filter(|r| shot_at.is_some_and(|at| r.started <= at) && self.can_capture_from_window(r))
+                .map(|r| Arc::clone(&r.recorder)).collect()
         } else {
-            false
+            Vec::new()
         };
-        let record_due = self.rec.is_some() && now >= self.next_record_frame;
+        let sample_wave = got.is_some() && std::mem::take(&mut self.shot_wave);
+        let record_due = self.composed_recordings().any(|r| self.can_capture_from_window(r)) && now >= self.next_record_frame
+            && self.program.lock().unwrap().error.is_some();
         // Waveform: a fresh look at the Preview five times a second.
-        let wave_due = self.s.cfg.show_waveform && now >= self.next_wave;
+        let wave_due = self.s.cfg.wave_type != 0 && now >= self.next_wave;
         let want = record_due || (got.is_none() && (check_due || self.s.snapshot_req || wave_due));
         if want && !self.shot_pending {
             self.shot_pending = true;
-            self.shot_recording = record_due.then_some(self.rec_started);
+            self.shot_recording = record_due.then_some(now);
+            self.shot_wave = wave_due;
             if wave_due {
                 self.next_wave = now + 0.2;
             }
             if record_due {
-                // Frames are taken at the project's frame rate.
-                let fps = f64::from(self.s.cfg.frame_rate());
-                let intervals = ((now - self.next_record_frame) * fps).floor() + 1.0;
-                self.next_record_frame += intervals / fps;
+                self.advance_record_clock(now);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
@@ -535,19 +783,22 @@ impl App {
             (out, w, h)
         };
         let pv = self.s.preview_rect;
-        if self.s.cfg.show_waveform && pv.is_positive() {
+        if sample_wave && self.s.cfg.wave_type != 0 && pv.is_positive() {
             let (px, w, h) = crop(pv);
             if w > 0 && h > 0 {
-                let img = waveform_image(&px, w, h);
-                match &mut self.waveform {
-                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                    None => self.waveform = Some(ctx.load_texture("preview-waveform", img, egui::TextureOptions::LINEAR)),
+                // One picture per scope the chosen layout shows.
+                let mut ids = Vec::new();
+                for (kind, _) in scope_layout(self.s.cfg.wave_type).1 {
+                    let img = waveform_image(&px, w, h, kind, self.s.cfg.vs_zoom);
+                    let tex = self.scopes.entry(kind).or_insert_with(|| ctx.load_texture(format!("preview-scope-{kind}"), egui::ColorImage::new([1, 1], Color32::TRANSPARENT), egui::TextureOptions::LINEAR));
+                    tex.set(img, egui::TextureOptions::LINEAR);
+                    ids.push((kind, tex.id()));
                 }
-                self.s.waveform_tex = self.waveform.as_ref().map(|t| t.id());
+                self.s.scope_tex = ids;
             }
         }
         let out_rect = self.s.output_rect;
-        if out_rect.is_positive() && (self.s.snapshot_req || record) {
+        if out_rect.is_positive() && (self.s.snapshot_req || !recorders.is_empty()) {
             let (px, w, h) = crop(out_rect);
             if self.s.snapshot_req && w > 0 && h > 0 && self.snap_rx.is_none() {
                 // Like the original (kb::c @0xe3850): a Save dialog with PNG/JPEG/BMP and the
@@ -556,8 +807,8 @@ impl App {
                 self.snap_pending = Some((px.clone(), w, h));
                 self.snap_rx = Some(media::save_picture_dialog(media::snapshot_name("LiveMix Capture "), self.photo_filter));
             }
-            if let Some(r) = self.rec.as_ref().filter(|_| record && w > 0 && h > 0) {
-                r.push(px, w, h);
+            if !recorders.is_empty() && w > 0 && h > 0 {
+                media::Recorder::push_group(&recorders, px, w, h, Instant::now(), false);
             }
         }
         if check_due {
@@ -719,6 +970,11 @@ fn shortcuts(ctx: &egui::Context, s: &mut Switcher) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        self.performance.update(now, || {
+            self.program.lock().unwrap().target.as_ref().map_or(0, program::Target::transfer_bytes)
+        });
+        let render_started = Instant::now();
         let t = ctx.input(|i| i.time);
         let dt = if self.frame == 0 { 1.0 / 60.0 } else { (t - self.last_time).max(0.0) as f32 };
         self.last_time = t;
@@ -737,27 +993,42 @@ impl eframe::App for App {
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.s.fullscreen = false;
-            self.s.ext_full = false;
+            for window in &mut self.s.external {
+                window.fullscreen = false;
+            }
         }
         shortcuts(ctx, &mut self.s);
 
         top_bar(ctx, &mut self.s, self.fps);
-        status_bar(ctx, &self.s, self.fps);
+        status_bar(ctx, &self.s, self.fps, &self.performance.status);
         bottom_bar(ctx, &mut self.s, t);
         monitors(ctx, &mut self.s, t);
         if self.s.show_mixer {
             mixer_panel(ctx, &mut self.s, t);
         }
+        // Filled in again by the Preview input's box when it is drawn.
+        self.s.preview_tile_rect = egui::Rect::NOTHING;
         inputs_panel(ctx, &mut self.s, t);
-        dialogs(ctx, &mut self.s);
-        if self.s.output_window {
-            output_window(ctx, &mut self.s, t);
+        let encoder = if self.recordings.iter().all(Option::is_none) {
+            "Start recording to identify the encoder".into()
+        } else {
+            self.recordings.iter().enumerate().filter_map(|(index, recording)| recording.as_ref()
+                .map(|r| format!("{}: {}", index + 1, r.recorder.diagnostics()))).collect::<Vec<_>>().join("\n")
+        };
+        let program_path = self.program.lock().unwrap().error.as_ref()
+            .map_or_else(|| "Dedicated OpenGL texture".into(), |e| format!("Window capture fallback ({e})"));
+        dialogs(ctx, &mut self.s, &self.graphics_adapter, &encoder, &program_path);
+        for channel in 0..OUTPUT_COUNT {
+            if self.s.external[channel].open {
+                output_window(ctx, &mut self.s, t, channel);
+            }
         }
         if self.s.fullscreen {
             fullscreen_window(ctx, &mut self.s, t);
         }
 
         self.handle_screenshots(ctx, t);
+        self.finish_frame(ctx, t, render_started);
         if self.s.cfg.lock_refresh {
             // Synchronize Output with Refresh Rate: draw at the screen's refresh rate.
             ctx.request_repaint();
@@ -765,6 +1036,12 @@ impl eframe::App for App {
             // egui subtracts its predicted frame time from delayed repaint requests.
             let predicted_dt = ctx.input(|i| i.predicted_dt);
             ctx.request_repaint_after_secs(1.0 / output_fps() + predicted_dt);
+        }
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(gl), Some(target)) = (gl, self.program.lock().unwrap().target.take()) {
+            unsafe { target.destroy(gl) };
         }
     }
 }
@@ -782,11 +1059,15 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 ui.add_sized([80.0, 24.0], egui::Label::new(RichText::new("Preset").strong().color(Color32::WHITE)));
-                if bar_btn(ui, "New", false).on_hover_text("Close all inputs and start a new preset").clicked() {
-                    s.new_preset();
+                if bar_btn(ui, "New", s.new_step != NewStep::Idle).on_hover_text("Start a new blank preset with a video format you choose").clicked() {
+                    s.press_new();
                 }
                 if bar_btn(ui, "Open", false).on_hover_text("Open the saved preset").clicked() {
-                    s.load_preset();
+                    if s.outputs_busy() {
+                        s.notice(STOP_OUTPUTS_MSG);
+                    } else {
+                        s.load_preset();
+                    }
                 }
                 if bar_btn(ui, "Save", false).on_hover_text("Save changes to currently open Preset file (Ctrl+S)").clicked() {
                     s.save_preset();
@@ -795,7 +1076,11 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
                     s.save_preset();
                 }
                 if bar_btn(ui, "Last", false).on_hover_text("Open the last preset").clicked() {
-                    s.load_preset();
+                    if s.outputs_busy() {
+                        s.notice(STOP_OUTPUTS_MSG);
+                    } else {
+                        s.load_preset();
+                    }
                 }
                 let screen_w = ctx.screen_rect().width();
                 let fs_x = (screen_w - 150.0) / 2.0;
@@ -815,14 +1100,11 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
                 }
                 // External Output indicator beside Fullscreen (lit while the External window is on).
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::click());
-                let on = s.output_window;
+                let on = s.external[0].open;
                 ui.painter().rect_filled(r, 2.0, if on { ACTIVE_RED } else { BTN_DARK });
                 ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "EXT", egui::FontId::proportional(12.0), if on { Color32::WHITE } else { TEXT_DIM });
                 if resp.on_hover_text(if on { "External Output is on — click to turn it off" } else { "External Output is off — click to turn it on" }).clicked() {
-                    s.output_window = !s.output_window;
-                    if !s.output_window {
-                        s.ext_full = false;
-                    }
+                    s.toggle_external(0);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
@@ -845,7 +1127,7 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
 }
 
 /// Status line at the very bottom (format, FPS, render time, recording state, messages).
-fn status_bar(ctx: &egui::Context, s: &Switcher, fps: f32) {
+fn status_bar(ctx: &egui::Context, s: &Switcher, fps: f32, stats: &performance::Status) {
     egui::TopBottomPanel::bottom("status")
         .exact_height(22.0)
         .show_separator_line(false)
@@ -861,13 +1143,24 @@ fn status_bar(ctx: &egui::Context, s: &Switcher, fps: f32) {
                     ui.label(RichText::new(" FADE TO BLACK ").strong().size(12.0).color(Color32::WHITE).background_color(ACTIVE_RED));
                 }
                 ui.add_space(8.0);
-                if s.output_window {
+                if s.external_active() {
                     ui.label(RichText::new("EX").size(12.0).color(TEXT));
                 }
                 ui.label(RichText::new("FPS:").strong().size(12.0).color(TEXT));
                 ui.label(RichText::new(format!("{:.0}", fps.min(999.0))).size(12.0).color(TEXT));
                 ui.label(RichText::new("Render Time:").strong().size(12.0).color(TEXT));
-                ui.label(RichText::new(format!("{:.0} ms", (1000.0 / fps.max(1.0) * 0.12).max(1.0))).size(12.0).color(TEXT));
+                let render = stats.render_ms.map_or_else(|| "–".into(), |ms| format!("{ms} ms"));
+                ui.label(RichText::new(render).size(12.0).color(TEXT))
+                    .on_hover_text("Peak elapsed time from frame preparation through OpenGL draw submission, sampled once per second.");
+                ui.label(RichText::new("GPU Mem:").strong().size(12.0).color(TEXT));
+                ui.label(RichText::new(format!("{}%", stats.transfer_percent)).size(12.0).color(TEXT))
+                    .on_hover_text(format!("Program transfer buffers: {:.1} MiB / {:.0} MiB budget",
+                        stats.transfer_bytes as f64 / 1048576.0, stats.transfer_budget as f64 / 1048576.0));
+                for (label, percent) in [("CPU LiveMix:", stats.process_cpu), ("Total:", stats.total_cpu)] {
+                    ui.label(RichText::new(label).strong().size(12.0).color(TEXT));
+                    let value = percent.map_or_else(|| "–".into(), |value| format!("{value}%"));
+                    ui.label(RichText::new(value).size(12.0).color(TEXT));
+                }
                 for (on, tag) in [(s.rec.is_some(), "REC"), (s.multicorder.is_some(), "MULTICORDER")] {
                     if on {
                         ui.add_space(8.0);
@@ -916,47 +1209,57 @@ fn monitors(ctx: &egui::Context, s: &mut Switcher, t: f64) {
         });
 }
 
-/// Safe area share of the picture: title safe 90 % and action safe 93 % (SMPTE RP 2046-1;
-/// the original's own percentages were not found — estimated).
-const TITLE_SAFE: f32 = 0.90;
-const ACTION_SAFE: f32 = 0.93;
-
-/// Safe area guides over the Preview: action safe, title safe and a centre cross.
-fn draw_safe_areas(p: &egui::Painter, r: egui::Rect) {
+/// Safe area guides over the Preview, drawn from the original's rules (model::safe_area_guides,
+/// kzzzzzj::d @0xf6d78) on the picture's own size.
+fn draw_safe_areas(p: &egui::Painter, r: egui::Rect, kind: u16) {
     let line = Stroke::new(1.0_f32, Color32::from_white_alpha(170));
-    for (k, share) in [ACTION_SAFE, TITLE_SAFE].into_iter().enumerate() {
-        let a = egui::Rect::from_center_size(r.center(), r.size() * share);
-        p.rect_stroke(a, 0.0, if k == 0 { line } else { Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 220, 80, 190)) }, egui::StrokeKind::Inside);
-        // Action safe named top left, title safe top right, so the names don't overlap.
-        let (pos, align) = if k == 0 { (a.left_top() + Vec2::new(4.0, 2.0), egui::Align2::LEFT_TOP) } else { (a.right_top() + Vec2::new(-4.0, 2.0), egui::Align2::RIGHT_TOP) };
-        p.text(pos, align, if k == 0 { "Action safe" } else { "Title safe" }, egui::FontId::proportional(10.0), Color32::from_white_alpha(170));
+    for g in safe_area_guides(kind, r.width(), r.height()) {
+        p.line_segment([r.min + Vec2::new(g[0], g[1]), r.min + Vec2::new(g[2], g[3])], line);
     }
-    let c = r.center();
-    let arm = r.height() * 0.03;
-    p.line_segment([c - Vec2::new(arm, 0.0), c + Vec2::new(arm, 0.0)], line);
-    p.line_segment([c - Vec2::new(0.0, arm), c + Vec2::new(0.0, arm)], line);
 }
 
-/// Waveform panel in the lower right of the Preview: brightness (0–100 %) of every column of
-/// the picture, with lines at 0, 25, 50, 75 and 100 %.
-fn draw_waveform(p: &egui::Painter, r: egui::Rect, tex: Option<egui::TextureId>) {
-    let size = Vec2::new(r.width() * 0.42, r.height() * 0.38);
-    let panel = egui::Rect::from_min_size(r.right_bottom() - size - Vec2::new(8.0, 8.0), size);
-    p.rect_filled(panel, 2.0, Color32::from_black_alpha(200));
-    let plot = panel.shrink2(Vec2::new(26.0, 6.0));
-    let plot = egui::Rect::from_min_max(plot.min, egui::pos2(plot.max.x + 20.0, plot.max.y));
-    for k in 0..=4 {
-        let y = plot.bottom() - plot.height() * k as f32 / 4.0;
-        p.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], Stroke::new(1.0_f32, Color32::from_white_alpha(40)));
-        p.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, format!("{}", k * 25), egui::FontId::proportional(9.0), Color32::from_white_alpha(150));
-    }
-    match tex {
-        Some(t) => {
+/// One scope in its place: black behind it (or the picture showing through when it lies over
+/// the whole Preview), lines at 0/25/50/75/100 % for the waveforms (parade split in thirds), a
+/// circle and cross for the vectorscope.
+fn draw_scope(p: &egui::Painter, r: egui::Rect, tex: Option<egui::TextureId>, kind: u8, over: bool) {
+    let p = p.with_clip_rect(r);
+    p.rect_filled(r, 0.0, if over { Color32::from_black_alpha(110) } else { Color32::BLACK });
+    let faint = Stroke::new(1.0_f32, Color32::from_white_alpha(45));
+    let plot = r.shrink2(Vec2::new(4.0, 6.0));
+    if kind == SCOPE_VECTOR {
+        let sq = egui::Rect::from_center_size(plot.center(), Vec2::splat(plot.width().min(plot.height())));
+        p.circle_stroke(sq.center(), sq.width() / 2.0 * 0.9, faint);
+        p.line_segment([sq.center_top(), sq.center_bottom()], faint);
+        p.line_segment([sq.left_center(), sq.right_center()], faint);
+        if let Some(t) = tex {
+            p.image(t, sq, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+    } else {
+        let plot = egui::Rect::from_min_max(plot.min + Vec2::new(22.0, 0.0), plot.max);
+        for k in 0..=4 {
+            let y = plot.bottom() - plot.height() * k as f32 / 4.0;
+            p.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], faint);
+            p.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, format!("{}", k * 25), egui::FontId::proportional(9.0), Color32::from_white_alpha(150));
+        }
+        if kind == SCOPE_PARADE {
+            for k in 1..3 {
+                let x = plot.left() + plot.width() * k as f32 / 3.0;
+                p.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], faint);
+            }
+        }
+        if let Some(t) = tex {
             p.image(t, plot, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
-        None => {
-            p.text(plot.center(), egui::Align2::CENTER_CENTER, "…", egui::FontId::proportional(14.0), Color32::from_white_alpha(150));
-        }
+    }
+    let name = match kind {
+        SCOPE_RGB => "Waveform RGB",
+        SCOPE_Y => "Waveform Y",
+        SCOPE_PARADE => "Parade RGB",
+        _ => "Vectorscope",
+    };
+    p.text(r.right_top() + Vec2::new(-6.0, 4.0), egui::Align2::RIGHT_TOP, name, egui::FontId::proportional(10.0), Color32::from_white_alpha(150));
+    if tex.is_none() {
+        p.text(r.center(), egui::Align2::CENTER_CENTER, "…", egui::FontId::proportional(14.0), Color32::from_white_alpha(150));
     }
 }
 
@@ -980,7 +1283,7 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
                 let r = egui::Rect::from_min_size(egui::pos2(x - 24.0, bar.top() + 3.0), Vec2::new(24.0, 20.0));
                 x = r.left() - 4.0;
                 let resp = ui.interact(r, egui::Id::new(("preview-tool", tool)), Sense::click());
-                let on = if tool == 0 { s.cfg.show_safe } else { s.cfg.show_waveform };
+                let on = if tool == 0 { s.cfg.safe_type != 0 } else { s.cfg.wave_type != 0 };
                 let p = ui.painter();
                 p.rect_filled(r, 2.0, if on { Color32::from_black_alpha(140) } else if resp.hovered() { Color32::from_black_alpha(70) } else { Color32::TRANSPARENT });
                 if tool == 0 {
@@ -995,13 +1298,35 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
                         p.rect_filled(b, 0.0, *c);
                     }
                 }
-                let tip = if tool == 0 { "Show or hide the safe areas (title safe 90 %, action safe 93 %)" } else { "Show or hide the waveform (brightness of the Preview picture, 0–100 %)" };
-                if resp.on_hover_text(tip).clicked() {
+                // Click: the original's menus (frmmain::ShowSafeAreaMenu @0x250c70 drops the
+                // "Safe Area" menu below the button; the waveform has its own list).
+                let tip = if tool == 0 { "Safe Area: SMPTE/EBU, 90% / 80%, grids, Square, Vertical" } else { "Waveform Monitor: Waveform RGB, Waveform Y, Parade RGB, Vectorscope, alone or with the Preview" };
+                let resp = resp.on_hover_text(tip);
+                let pid = egui::Id::new(("preview-tool-menu", tool));
+                if resp.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(pid));
+                }
+                let mut changed = false;
+                egui::popup_below_widget(ui, pid, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    ui.set_min_width(170.0);
                     if tool == 0 {
-                        s.cfg.show_safe = !s.cfg.show_safe;
+                        ui.label(RichText::new("Safe Area").strong());
+                        ui.separator();
+                        for (name, v) in SAFE_AREAS {
+                            changed |= ui.selectable_value(&mut s.cfg.safe_type, v, name).changed();
+                        }
                     } else {
-                        s.cfg.show_waveform = !s.cfg.show_waveform;
+                        // hd::k @0x87cb4: "Waveform Monitor", the layouts, then the 2X zoom switch.
+                        ui.label(RichText::new("Waveform Monitor").strong());
+                        ui.separator();
+                        for (name, v) in WAVEFORMS {
+                            changed |= ui.selectable_value(&mut s.cfg.wave_type, v, name).changed();
+                        }
+                        ui.separator();
+                        changed |= ui.checkbox(&mut s.cfg.vs_zoom, "Vectorscope 2X Zoom").changed();
                     }
+                });
+                if changed {
                     s.save_settings();
                 }
             }
@@ -1033,29 +1358,39 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
             s.output_rect = rect;
             draw_output(&painter, rect, s, t);
         } else {
-            if let Some(inp) = s.preview.and_then(|i| s.input(i)) {
-                draw_source(&painter, rect, inp, 1.0, t, &s.inputs);
-            }
-            // Overlays show on Preview as well (InputRenderFlags: overlays are only left out with
-            // ExcludePreviewOverlays), so picking another input never hides them; right-click
-            // overlays (ms::zzo @0x1301ac) show on Preview only.
-            for ch in s.overlays.iter() {
-                if let Some(inp) = ch.input.and_then(|i| s.input(i)) {
-                    if ch.level > 0.0 {
-                        draw_overlay(&painter, rect, inp, ch.effect, ch.level / FULL, t, &s.inputs);
-                    }
+            // Waveform Monitor layout (hc::a): where the picture and the scopes go.
+            let (pic, scopes) = scope_layout(s.cfg.wave_type);
+            let place = |f: [f32; 4]| egui::Rect::from_min_size(rect.min + Vec2::new(f[0] * rect.width(), f[1] * rect.height()), Vec2::new(f[2] * rect.width(), f[3] * rect.height()));
+            if let Some(f) = pic {
+                let pr = place(f);
+                let pp = ui.painter_at(pr);
+                if let Some(inp) = s.preview.and_then(|i| s.input(i)) {
+                    draw_source(&pp, pr, inp, 1.0, t, &s.inputs);
+                }
+                // Overlays show on Preview as well (InputRenderFlags: overlays are only left out
+                // with ExcludePreviewOverlays), so picking another input never hides them;
+                // right-click overlays (ms::zzo @0x1301ac) show on Preview only.
+                draw_overlay_channels(&pp, pr, s, t, true);
+                if s.cfg.safe_type != 0 {
+                    draw_safe_areas(&pp, pr, s.cfg.safe_type);
                 }
             }
-            s.preview_rect = rect;
-            if s.cfg.show_safe {
-                draw_safe_areas(&painter, rect);
-            }
-            if s.cfg.show_waveform {
-                draw_waveform(&painter, rect, s.waveform_tex);
+            // The scopes measure the picture itself when nothing covers it (the "+ Preview"
+            // layouts), otherwise the Preview input's own box picture.
+            s.preview_rect = match pic {
+                Some(f) if f != [0.0, 0.0, 1.0, 1.0] => place(f),
+                Some(_) if scopes.is_empty() => rect,
+                _ => s.preview_tile_rect,
+            };
+            for (kind, f) in &scopes {
+                // Alone over the picture the scope keeps it visible underneath.
+                let over = pic == Some([0.0, 0.0, 1.0, 1.0]);
+                let tex = s.scope_tex.iter().find(|(k, _)| k == kind).map(|(_, t)| *t);
+                draw_scope(&painter, place(*f), tex, *kind, over);
             }
         }
         if resp.double_clicked() && is_output {
-            s.output_window = true;
+            s.external[0].open = true;
         }
         // PreviewClick (default False): clicking the Preview window runs Quick Play.
         if !is_output && s.cfg.preview_click && resp.clicked() {
@@ -1064,57 +1399,88 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
         }
         // transport row
         ui.horizontal(|ui| {
-            ui.set_height(24.0);
-            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-            ui.add_space(6.0);
-            if let Some(id) = id {
-                let (playing, pos, dur, playable, is_file) = s
-                    .input(id)
-                    .map(|i| (i.playing, i.pos, i.duration, i.kind.playable(), matches!(i.kind, Kind::VideoFile { .. })))
-                    .unwrap_or((false, 0.0, 1.0, false, false));
-                if playable {
-                    if small_btn(ui, "Restart", false).clicked() {
-                        if let Some(i) = s.input_mut(id) {
-                            i.pos = 0.0;
-                            i.restart_req = true;
-                        }
-                    }
-                    if small_btn(ui, if playing { "|| Pause" } else { "▶ Play" }, playing).clicked() {
-                        if let Some(i) = s.input_mut(id) {
-                            i.playing = !i.playing;
-                        }
-                    }
-                    if is_file {
-                        let k = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) } else { 0.0 };
-                        ui.add(egui::ProgressBar::new(k).desired_width((w * 0.35).max(80.0)).desired_height(8.0));
-                    } else {
-                        let mut p = pos;
-                        let sl = ui.add(egui::Slider::new(&mut p, 0.0..=dur).show_value(false));
-                        if sl.changed() {
-                            if let Some(i) = s.input_mut(id) {
-                                i.pos = p;
-                            }
-                        }
-                    }
-                    let dur_txt = if dur > 0.0 { clock(dur as f64) } else { "--:--:--".into() };
-                    ui.label(RichText::new(format!("{} / {}", clock(pos as f64), dur_txt)).size(11.0).color(TEXT_DIM));
-                } else {
-                    ui.label(RichText::new("Live").size(11.0).color(TEXT_DIM));
-                }
+            ui.set_height(30.0);
+            if let Some(inp) = id.and_then(|id| s.input_mut(id)).filter(|i| i.kind.playable()) {
+                video_transport(ui, inp, w, area);
             }
         });
     });
 }
 
+fn video_transport(ui: &mut egui::Ui, inp: &mut Input, width: f32, picture: egui::Rect) {
+    // ms::zzzo → mz::Restart → SetPosition, and ms::zzzl → StartVideo/PauseVideo.
+    let file = matches!(inp.kind, Kind::VideoFile { .. } | Kind::VideoList { .. });
+    let can_seek = inp.duration > 0.0 && (!inp.kind.streamed() || file);
+    ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+    ui.add_space(5.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new((width - 108.0).max(1.0), 26.0), Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    let track = rect.shrink2(Vec2::new(6.0_f32.min(rect.width() * 0.25), 0.0));
+    let y = rect.center().y;
+    if can_seek {
+        let pointer = response.interact_pointer_pos()
+            .filter(|_| response.clicked() || response.drag_started() || response.dragged());
+        if let Some(pos) = pointer {
+            let k = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            inp.pos = inp.duration * k;
+            if file {
+                inp.seek_ms = Some((inp.pos as f64 * 1000.0).round() as u64);
+            }
+        }
+        let fraction = (inp.pos / inp.duration).clamp(0.0, 1.0);
+        for k in 0..=4 {
+            let x = track.left() + track.width() * k as f32 / 4.0;
+            p.line_segment([egui::pos2(x, y - 10.0), egui::pos2(x, y - 8.0)], Stroke::new(1.0_f32, TEXT_DIM));
+        }
+        p.line_segment([egui::pos2(track.left(), y), egui::pos2(track.right(), y)], Stroke::new(2.0_f32, BTN));
+        let thumb = egui::Rect::from_center_size(egui::pos2(track.left() + fraction * track.width(), y), Vec2::new(8.0, 16.0));
+        p.rect(thumb, 0.0, if response.hovered() { BTN_HOVER } else { BTN }, Stroke::new(1.0_f32, TEXT), egui::StrokeKind::Inside);
+        let time = format!("{}  /  {}  /  {}", clock(inp.pos as f64), clock(inp.duration as f64),
+            clock((inp.duration - inp.pos).max(0.0) as f64));
+        let pos = picture.center_bottom() - Vec2::new(0.0, 4.0);
+        let p = ui.painter_at(picture);
+        let text = p.layout_no_wrap(time, egui::FontId::monospace(14.0), Color32::WHITE);
+        let origin = pos - Vec2::new(text.size().x / 2.0, text.size().y);
+        p.rect_filled(egui::Rect::from_min_size(origin, text.size()).expand2(Vec2::new(5.0, 2.0)), 0.0, Color32::from_black_alpha(180));
+        p.galley(origin, text, Color32::WHITE);
+        response.on_hover_text("Seek to a position in this input");
+    }
+    if ui.add_sized([48.0, 25.0], egui::Button::new(RichText::new("Restart").size(11.0)).fill(BTN))
+        .on_hover_text("Return to the beginning").clicked()
+    {
+        inp.pos = 0.0;
+        inp.seek_ms = None;
+        inp.restart_req = true;
+    }
+    let (button, response) = ui.allocate_exact_size(Vec2::new(27.0, 25.0), Sense::click());
+    let p = ui.painter();
+    p.rect(button, 0.0, if response.hovered() { BTN_HOVER } else { BTN }, Stroke::new(1.0_f32, EDGE), egui::StrokeKind::Inside);
+    let c = button.center();
+    if inp.playing {
+        for x in [-2.5, 2.5] {
+            p.rect_filled(egui::Rect::from_center_size(c + Vec2::new(x, 0.0), Vec2::new(2.5, 10.0)), 0.0, TEXT);
+        }
+    } else {
+        p.add(egui::Shape::convex_polygon(vec![c + Vec2::new(-3.0, -5.0), c + Vec2::new(5.0, 0.0), c + Vec2::new(-3.0, 5.0)], TEXT, Stroke::NONE));
+    }
+    if response.on_hover_text(if inp.playing { "Pause" } else { "Play" }).clicked() {
+        if !inp.playing && inp.duration > 0.0 && inp.pos + 0.05 >= inp.duration {
+            inp.restart_req = true;
+        }
+        inp.playing = !inp.playing;
+    }
+}
+
 /// The transition column of the original: Quick Play, Cut, four transition buttons with a
-/// drop-down (effect + duration), FTB, overlay 1–4 for the Preview input, and the T-bar.
+/// drop-down (effect + duration), FTB, eight overlay channels, and the T-bar.
 fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32) {
     ui.allocate_ui_with_layout(Vec2::new(w, h), egui::Layout::top_down(egui::Align::Center), |ui| {
         ui.set_width(w);
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
         ui.add_space(6.0);
         let bw = w - 28.0;
-        let bh = ((h - 6.0 - 7.0 * 6.0 - 26.0 - 70.0) / 7.0).clamp(24.0, 40.0);
+        let overlay_space = if s.cfg.show_overlays { 52.0 } else { 0.0 };
+        let bh = ((h - 6.0 - 7.0 * 6.0 - overlay_space - 70.0) / 7.0).clamp(24.0, 40.0);
         let busy = s.trans.is_some();
         if s.cfg.show_quickplay && ui
             .add_sized([bw, bh], egui::Button::new(RichText::new("Quick Play").strong()).fill(if busy { HOVER } else { BTN }))
@@ -1172,31 +1538,37 @@ fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32) {
         {
             s.ftb_on = !s.ftb_on;
         }
-        // Overlay 1–4: only switch that overlay on or off (on = cyan). Which input it shows is
-        // chosen with the 1–4 buttons on the input boxes.
-        if s.cfg.show_overlays { ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.add_space(13.0);
-            for c in 0..4 {
-                let on = s.overlays[c].on && s.overlays[c].input.is_some();
-                let name = s.overlays[c].input.and_then(|i| s.input(i)).map(|i| format!("{} {}", s.number_of(i.id), i.title));
-                let tip = match &name {
-                    Some(n) => format!("Overlay {} on/off — shows {n} (pick another input with button {} on its box)", c + 1, c + 1),
-                    None => format!("Overlay {} on/off — first pick its input with button {} on an input box", c + 1, c + 1),
-                };
-                let b = egui::Button::new(RichText::new(format!("{}", c + 1)).strong().color(if on { Color32::BLACK } else { TEXT })).fill(if on { CYAN } else { BTN }).min_size(Vec2::new((bw - 6.0) / 4.0, 24.0));
-                // frmmain::zzzze @0x251180: on → off; off → back on with the input last used on
-                // this overlay; no input yet → nothing happens (no message).
-                if ui.add(b).on_hover_text(tip).clicked() {
-                    s.toggle_overlay_channel(c);
-                }
+        if s.cfg.show_overlays {
+            for row in (0..OVERLAY_CHANNELS).step_by(4) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_space(13.0);
+                    for c in row..row + 4 {
+                        let ch = &s.overlays[c];
+                        let on = ch.on;
+                        let tip = if on {
+                            let name = ch.input.and_then(|id| s.input(id)).map_or("", |i| i.title.as_str());
+                            format!("Turn Overlay {} off ({name})", c + 1)
+                        } else if let Some((source, input)) = ch.assigned.and_then(|a| s.input(a.input).map(|i| (a, i))) {
+                            let target = if source.on_preview { "Preview" } else { "Output" };
+                            format!("Turn Overlay {} on: {} → {target}", c + 1, input.title)
+                        } else {
+                            format!("Overlay {}: assign a source on an input box first", c + 1)
+                        };
+                        let label = RichText::new((c + 1).to_string()).strong().color(if on { Color32::BLACK } else { TEXT });
+                        let button = egui::Button::new(label).fill(if on { CYAN } else { BTN });
+                        if ui.add_sized([(bw - 6.0) / 4.0, 20.0], button).on_hover_text(tip).clicked() {
+                            s.toggle_overlay_channel(c);
+                        }
+                    }
+                });
             }
-        }); }
+        }
         if s.cfg.show_tbar {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(13.0);
-                let th = (ui.available_height() - 6.0).clamp(40.0, 72.0);
+                let th = (ui.available_height() - 6.0).clamp(24.0, 72.0);
                 tbar(ui, s, bw, th);
             });
         }
@@ -1233,12 +1605,11 @@ fn draw_output(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64) 
     draw_output_opts(painter, rect, s, t, true);
 }
 
-/// Output overlay channels 1–4 (right-click "Preview only" overlays left out).
-fn draw_overlay_channels(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64) {
-    for ch in s.overlays.iter().filter(|c| !c.on_preview) {
+fn draw_overlay_channels(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64, preview: bool) {
+    for ch in s.overlays.iter().filter(|c| preview || !c.on_preview) {
         if let Some(inp) = ch.input.and_then(|i| s.input(i)) {
             if ch.level > 0.0 {
-                draw_overlay(painter, rect, inp, ch.effect, ch.level / FULL, t, &s.inputs);
+                draw_overlay(painter, rect, inp, ch, t, &s.inputs);
             }
         }
     }
@@ -1258,7 +1629,7 @@ fn draw_output_opts(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: 
         }
     }
     if overlays {
-        draw_overlay_channels(painter, rect, s, t);
+        draw_overlay_channels(painter, rect, s, t, false);
     }
     if s.ftb_level > 0.0 {
         painter.rect_filled(rect, 0.0, Color32::from_black_alpha(s.ftb_level.clamp(0.0, FULL) as u8));
@@ -1304,7 +1675,7 @@ fn draw_src(p: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64, src: u32,
                 draw_source(p, rect, inp, 1.0, t, &s.inputs);
             }
             if overlays {
-                draw_overlay_channels(p, rect, s, t);
+                draw_overlay_channels(p, rect, s, t, src == SRC_PREVIEW);
             }
         }
     }
@@ -1361,11 +1732,6 @@ fn draw_multiview(p: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64, mv:
         let fs = (title_h * 0.62).max(5.0);
         sp.text(strip.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(fs), Color32::WHITE);
     }
-}
-
-/// What the External window shows (Settings → Outputs: Source and Overlays).
-fn draw_external(p: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64) {
-    draw_src(p, rect, s, t, s.cfg.ext_source, s.cfg.ext_overlays);
 }
 
 /// Screens of this computer as (left, top, width, height) in pixels, main screen first.
@@ -1448,24 +1814,28 @@ fn fit_16_9(r: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(r.center(), Vec2::new(w, h))
 }
 
-fn output_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
-    let id = egui::ViewportId::from_hash_of("livemix-output");
+fn output_window(ctx: &egui::Context, s: &mut Switcher, t: f64, channel: usize) {
+    let id = egui::ViewportId::from_hash_of(("livemix-output", channel));
+    let route = s.cfg.outputs[channel];
+    let fullscreen = s.external[channel].fullscreen;
     let size = EXT_SIZES[s.cfg.ext_size.min(2) as usize].1;
     let builder = egui::ViewportBuilder::default()
-        .with_title("LiveMix External")
+        .with_title(format!("LiveMix External · Output {}", channel + 1))
         .with_inner_size(size)
-        .with_fullscreen(s.ext_full)
+        .with_fullscreen(fullscreen)
         .with_window_level(if s.cfg.ext_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
-    let (hide_cursor, last_size) = (s.cfg.ext_hide_cursor, ctx.data(|d| d.get_temp::<u8>(egui::Id::new("ext-size-last"))));
+    let size_id = egui::Id::new(("ext-size-last", channel));
+    let top_id = egui::Id::new(("ext-top-last", channel));
+    let (hide_cursor, last_size) = (s.cfg.ext_hide_cursor, ctx.data(|d| d.get_temp::<u8>(size_id)));
     if last_size != Some(s.cfg.ext_size) {
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("ext-size-last"), s.cfg.ext_size));
+        ctx.data_mut(|d| d.insert_temp(size_id, s.cfg.ext_size));
         if last_size.is_some() {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::InnerSize(Vec2::new(size[0], size[1])));
         }
     }
-    let last_top = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("ext-top-last")));
+    let last_top = ctx.data(|d| d.get_temp::<bool>(top_id));
     if last_top != Some(s.cfg.ext_on_top) {
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("ext-top-last"), s.cfg.ext_on_top));
+        ctx.data_mut(|d| d.insert_temp(top_id, s.cfg.ext_on_top));
         if last_top.is_some() {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::WindowLevel(if s.cfg.ext_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal }));
         }
@@ -1476,24 +1846,23 @@ fn output_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
             let resp = ui.interact(r, egui::Id::new("output-window-area"), Sense::click());
             let out = fit_16_9(r);
             let p = ui.painter_at(out);
-            draw_external(&p, out, s, t);
+            draw_src(&p, out, s, t, route.source, route.overlays);
             // OutputHideCursor (default False).
             if hide_cursor && resp.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
             if resp.double_clicked() {
-                s.ext_full = !s.ext_full;
+                s.external[channel].fullscreen = !fullscreen;
             }
-            if resp.hovered() && !s.ext_full {
+            if resp.hovered() && !fullscreen {
                 ui.painter().text(r.right_top() + Vec2::new(-8.0, 8.0), egui::Align2::RIGHT_TOP, "Double-click: fullscreen", egui::FontId::proportional(12.0), Color32::from_white_alpha(110));
             }
         });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            s.ext_full = false;
+            s.external[channel].fullscreen = false;
         }
         if ctx.input(|i| i.viewport().close_requested()) {
-            s.output_window = false;
-            s.ext_full = false;
+            s.external[channel] = ExternalWindow::default();
         }
     });
 }
@@ -1617,22 +1986,18 @@ fn inputs_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
 }
 
 // Input tile layout of the original (ms::.cctor @0x12e000, ms::get_f @0x12e654):
-// title bar j = 26, picture = InputSize (208x156), two button rows k = 20.
+// Title bar j = 26, picture = InputSize (208x156), button row k = 20.
 const TILE_HEADER: f32 = 26.0;
 const TILE_ROW: f32 = 20.0;
-// Button widths m..u from ms::.cctor: Close 42, Quick Play 67, Cut 33, Loop 38,
-// overlay numbers 23, Audio 65, small icon buttons 24.
 const BW_CLOSE: f32 = 42.0;
-const BW_QUICKPLAY: f32 = 67.0;
 const BW_CUT: f32 = 33.0;
 const BW_LOOP: f32 = 38.0;
-const BW_OVERLAY: f32 = 23.0;
 const BW_AUDIO: f32 = 65.0;
 const BW_ICON: f32 = 24.0;
 
 /// (width, height) of one input tile from the InputSize setting.
 fn tile_size(s: &Switcher) -> (f32, f32) {
-    (s.cfg.input_w, TILE_HEADER + s.cfg.input_h + TILE_ROW * 2.0)
+    (s.cfg.input_w, TILE_HEADER + s.cfg.input_h + TILE_ROW * 3.0)
 }
 
 /// A flat tile button of a fixed width (the original's button widths).
@@ -1676,6 +2041,13 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
         // Dragging the title bar carries the input (dropped on another input in inputs_panel).
         header.dnd_set_drag_payload(id);
         let hcol = if is_out { OUTPUT } else if is_prev { PREVIEW } else { BTN };
+        let close_rect = egui::Rect::from_min_size(
+            if shrunk { egui::pos2(hr.left(), hr.bottom() - TILE_HEADER) }
+            else { egui::pos2(hr.right() - TILE_HEADER, hr.top()) },
+            Vec2::splat(TILE_HEADER),
+        );
+        let close = ui.interact(close_rect, ui.id().with(("input-close", id)), Sense::click())
+            .on_hover_text("Close this Input");
         let p = ui.painter();
         p.rect_filled(hr, 0.0, hcol);
         if shrunk {
@@ -1690,7 +2062,7 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
                 y += 8.0;
             }
             // Title written top to bottom, cut to the strip's height.
-            let room = (hr.bottom() - y - 6.0).max(0.0);
+            let room = (close_rect.top() - y - 6.0).max(0.0);
             let mut txt = title.clone();
             let mut g = p.layout_no_wrap(txt.clone(), egui::FontId::proportional(13.0), Color32::WHITE);
             while g.size().x > room && !txt.is_empty() {
@@ -1706,9 +2078,8 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
             if show_numbers {
                 p.text(hr.left_center() + Vec2::new(10.0, 0.0), egui::Align2::LEFT_CENTER, number.to_string(), egui::FontId::proportional(13.0), Color32::WHITE);
             }
-            p.text(hr.left_center() + Vec2::new(if show_numbers { 32.0 } else { 10.0 }, 0.0), egui::Align2::LEFT_CENTER, &title, egui::FontId::proportional(13.0), Color32::WHITE);
         }
-        let mut bx = hr.right() - 4.0;
+        let mut bx = close_rect.left() - 4.0;
         let mut badge = |txt: &str, col: Color32| {
             let g = p.layout_no_wrap(txt.into(), egui::FontId::proportional(9.0), Color32::BLACK);
             let r = egui::Rect::from_min_size(egui::pos2(bx - g.size().x - 6.0, hr.top() + 5.0), Vec2::new(g.size().x + 6.0, hr.height() - 10.0));
@@ -1723,6 +2094,27 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
             if s.input(id).map(|i| i.key.on).unwrap_or(false) {
                 badge("KEY", Color32::from_rgb(0x50, 0xe0, 0x70));
             }
+            let clip = egui::Rect::from_min_max(hr.min, egui::pos2(bx, hr.bottom()));
+            p.with_clip_rect(clip).text(hr.left_center() + Vec2::new(if show_numbers { 32.0 } else { 10.0 }, 0.0), egui::Align2::LEFT_CENTER, &title, egui::FontId::proportional(13.0), Color32::WHITE);
+        }
+        if close.hovered() {
+            p.rect_filled(close_rect, 0.0, Color32::from_rgb(0xc4, 0x35, 0x35));
+        }
+        let centre = close_rect.center();
+        for slope in [-1.0, 1.0] {
+            let d = Vec2::new(4.0, 4.0 * slope);
+            p.line_segment([centre - d, centre + d], Stroke::new(1.5_f32, Color32::WHITE));
+        }
+        if close.clicked() {
+            if close_confirm {
+                s.confirm_close = Some(id);
+                if let Some(i) = s.input_mut(id) {
+                    i.collapsed = false;
+                }
+            } else {
+                s.remove_input(id);
+            }
+            return;
         }
         // Title bar: click → Preview (ms::zx / ms::zy), double-click → shrink the tile to a
         // narrow upright strip (and back), right-click → menu. Double-click on the picture still
@@ -1741,6 +2133,13 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
             "Click: send to Preview · Double-click: shrink to a narrow strip · Drag onto another input: move it there · Right-click: menu"
         });
         header.context_menu(|ui| {
+            if s.input(id).is_some_and(|i| matches!(i.kind, Kind::GtTitle { .. })) &&
+                ui.button("Title Editor…").clicked()
+            {
+                s.cfg.input_page = 0;
+                s.settings_input = Some(id);
+                ui.close_menu();
+            }
             if ui.button("Input Settings…").clicked() {
                 s.settings_input = Some(id);
                 ui.close_menu();
@@ -1776,6 +2175,10 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
         let tw = pic_w;
         let th = pic_h;
         let (r, resp) = ui.allocate_exact_size(Vec2::new(tw, th), Sense::click());
+        if s.preview == Some(id) {
+            // The scopes measure this picture when the Preview monitor is covered by them.
+            s.preview_tile_rect = r;
+        }
         let painter = ui.painter_at(r);
         if let Some(inp) = s.input(id) {
             if inp.kind.transparent() {
@@ -1803,7 +2206,7 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
         }
         resp.on_hover_text("Click: send to Preview · Double-click: Input Settings");
 
-        // button rows (the original's two 20 px rows)
+        // Playback, overlay assignment and audio controls use separate rows.
         if s.confirm_close == Some(id) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
@@ -1818,21 +2221,18 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
         } else {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
-                if tile_btn(ui, "Close", BW_CLOSE, false, true, BTN).on_hover_text("Close this Input").clicked() {
-                    // InputCloseConfirm (default False): ask only when switched on in Settings.
-                    if close_confirm {
-                        s.confirm_close = Some(id);
-                    } else {
-                        s.remove_input(id);
-                    }
+                ui.spacing_mut().button_padding.x = 1.0;
+                let scale = ((tile_w - 3.0) / 153.0).min(1.0);
+                if tile_btn(ui, "Preview", 48.0 * scale, is_prev, true, PREVIEW).on_hover_text("Send this Input to Preview").clicked() {
+                    s.preview = Some(id);
                 }
-                if tile_btn(ui, "Quick Play", BW_QUICKPLAY, false, true, BTN).on_hover_text("Transition this Input directly to Output using the QuickPlay effect").clicked() {
+                if tile_btn(ui, "GO", 34.0 * scale, false, true, BTN).on_hover_text("Transition this Input directly to Output using the Quick Play effect").clicked() {
                     s.quick_play_input(id);
                 }
-                if tile_btn(ui, "Cut", BW_CUT, false, true, BTN).on_hover_text("Switch this Input directly to Output").clicked() {
+                if tile_btn(ui, "Cut", BW_CUT * scale, false, true, BTN).on_hover_text("Switch this Input directly to Output").clicked() {
                     s.cut_direct(id);
                 }
-                if tile_btn(ui, "Loop", BW_LOOP, loop_on, playable, Color32::from_rgb(0x50, 0x9a, 0xe0))
+                if tile_btn(ui, "Loop", BW_LOOP * scale, loop_on, playable, Color32::from_rgb(0x50, 0x9a, 0xe0))
                     .on_hover_text("Enable looping of this Input when it has finished playing")
                     .clicked()
                 {
@@ -1843,16 +2243,26 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
             });
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
-                for c in 0..4 {
-                    let on = s.overlays[c].input == Some(id) && s.overlays[c].on;
-                    let r = tile_btn(ui, &format!("{}", c + 1), BW_OVERLAY, on, true, CYAN)
-                        .on_hover_text(format!("Turn on or off this Input as an Overlay using the Overlay{} transition effect (right-click: on Preview)", c + 1));
+                ui.spacing_mut().button_padding.x = 2.0;
+                let width = (tile_w - (OVERLAY_CHANNELS - 1) as f32) / OVERLAY_CHANNELS as f32;
+                for c in 0..OVERLAY_CHANNELS {
+                    let assigned = s.overlays[c].assigned.filter(|source| source.input == id);
+                    let target = if assigned.is_some_and(|source| source.on_preview) { "Preview" } else { "Output" };
+                    let tip = if assigned.is_some() {
+                        format!("Assigned to Overlay {} ({target}). Use the centre button to turn it on or off.", c + 1)
+                    } else {
+                        format!("Assign this input to Overlay {} (right-click assigns to Preview)", c + 1)
+                    };
+                    let r = tile_btn(ui, &(c + 1).to_string(), width, assigned.is_some(), true, CYAN).on_hover_text(tip);
                     if r.secondary_clicked() {
-                        s.toggle_overlay(c, id, true);
+                        s.assign_overlay(c, id, true);
                     } else if r.clicked() {
-                        s.toggle_overlay(c, id, false);
+                        s.assign_overlay(c, id, false);
                     }
                 }
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 1.0;
                 if tile_btn(ui, "Audio", BW_AUDIO - 8.0, audio_on && has_audio, has_audio, Color32::from_rgb(0x4c, 0xc0, 0x50))
                     .on_hover_text("Turn on or off the audio on this Input")
                     .clicked()
@@ -1985,22 +2395,9 @@ fn bottom_bar(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                     }
                 }
                 ui.add_space(14.0);
-                let ext_open = s.settings_open && s.cfg.page == 6;
-                if gear_btn(ui, ext_open, "Configure External Output source").clicked() {
-                    // Settings → External Output (Source, Overlays, size, On Top, Hide Cursor).
-                    if ext_open {
-                        s.settings_open = false;
-                        s.save_settings();
-                    } else {
-                        s.settings_open = true;
-                        s.cfg.page = 6;
-                    }
-                }
-                if big_btn(ui, "External", s.output_window, Some(red)).on_hover_text("Start or stop External Output").clicked() {
-                    s.output_window = !s.output_window;
-                    if !s.output_window {
-                        s.ext_full = false;
-                    }
+                external_menu(ui, s);
+                if big_btn(ui, "External", s.external[0].open, Some(red)).on_hover_text("Start or stop External Output 1").clicked() {
+                    s.toggle_external(0);
                 }
                 ui.add_space(14.0);
                 if gear_btn(ui, s.stream_setup, "Configure Streaming settings").clicked() {
@@ -2180,6 +2577,7 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input) {
             Kind::Bars => "Colour Bars",
             Kind::Blank => "Transparent",
             Kind::Title { .. } => "Title",
+            Kind::GtTitle { .. } => "GT Title",
             Kind::Clock => "Production Clock",
             Kind::Camera(_) => "Test Camera",
             Kind::Video { .. } => "Test Video",
@@ -2188,7 +2586,7 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input) {
         ui.label(kind);
         ui.end_row();
         let file = match &inp.kind {
-            Kind::VideoFile { path } | Kind::ImageFile { path } => Some(path.clone()),
+            Kind::VideoFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. } => Some(path.clone()),
             Kind::Photos { folder } | Kind::ImageSequence { folder } => Some(folder.clone()),
             _ => None,
         };
@@ -2215,6 +2613,34 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input) {
         }
     });
     ui.add_space(4.0);
+    if let Kind::GtTitle { document, texts, .. } = &mut inp.kind {
+        if let Some(document) = document {
+            ui.heading("Title Editor");
+            for (field, default) in &document.fields {
+                ui.label(format!("{field}.Text"));
+                let mut value = texts.get(field).unwrap_or(default).clone();
+                if ui.add(egui::TextEdit::multiline(&mut value).desired_rows(1)).changed() {
+                    if &value == default {
+                        texts.remove(field);
+                    } else {
+                        texts.insert(field.clone(), value);
+                    }
+                }
+            }
+            if !document.unsupported.is_empty() {
+                ui.label("This template uses unsupported GT features")
+                    .on_hover_text(document.unsupported.iter().cloned().collect::<Vec<_>>().join(", "));
+            }
+        }
+        if !inp.status.is_empty() {
+            ui.colored_label(Color32::LIGHT_RED, &inp.status);
+        }
+        if ui.button("Reload GT Title").clicked() {
+            if let Err(error) = inp.reload_gt() {
+                inp.status = error;
+            }
+        }
+    }
     if inp.kind.playable() {
         ui.checkbox(&mut inp.loop_on, "Loop");
     }
@@ -2273,7 +2699,7 @@ fn input_colour_key(ui: &mut egui::Ui, inp: &mut Input) {
             }
         }
     });
-    ui.label(RichText::new("Tip: put the keyed input on an Overlay (1–4) or a Layer over a background.").size(11.0).color(TEXT_DIM));
+    ui.label(RichText::new("Tip: assign the keyed input to an Overlay (1–8) or a Layer over a background.").size(11.0).color(TEXT_DIM));
 }
 
 /// Zoom, Pan X/Y and Crop X1/Y1/X2/Y2 with Reset buttons (frmInputSettings Position page).
@@ -2376,6 +2802,84 @@ const SETTINGS_PAGES: [&str; 16] = [
 /// Sections built in this version (indexes into SETTINGS_PAGES).
 const SETTINGS_BUILT: [usize; 10] = [0, 1, 2, 3, 5, 6, 7, 11, 14, 15];
 
+/// Settings table for the same routes exposed by the External cog.
+fn output_routes(ui: &mut egui::Ui, s: &mut Switcher) {
+    let choices = src_choices(s, true);
+    egui::Grid::new("output-routes").spacing([9.0, 6.0]).show(ui, |ui| {
+        for label in ["Output", "Source", "Overlays", "NDI", "SRT", "Local window"] {
+            ui.strong(label);
+        }
+        ui.end_row();
+        for channel in 0..OUTPUT_COUNT {
+            ui.label(format!("Output {}", channel + 1));
+            let source = s.cfg.outputs[channel].source;
+            let title = src_name(s, source);
+            let route = &mut s.cfg.outputs[channel];
+            egui::ComboBox::from_id_salt(("output-route", channel)).width(160.0)
+                .selected_text(title).show_ui(ui, |ui| {
+                    for (value, name) in &choices {
+                        ui.selectable_value(&mut route.source, *value, name);
+                    }
+                });
+            ui.checkbox(&mut route.overlays, "");
+            for protocol in ["NDI", "SRT"] {
+                ui.add_enabled(false, egui::Button::new("Off"))
+                    .on_disabled_hover_text(format!("{protocol} transmission is unavailable in this build"));
+            }
+            if ui.button(if s.external[channel].open { "Close" } else { "Open" }).clicked() {
+                s.toggle_external(channel);
+            }
+            ui.end_row();
+        }
+    });
+}
+
+fn external_menu(ui: &mut egui::Ui, s: &mut Switcher) {
+    let button = egui::Button::new("").fill(BTN_DARK).min_size(Vec2::new(38.0, 30.0));
+    let menu = egui::menu::menu_custom_button(ui, button, |ui| external_menu_items(ui, s));
+    gear_icon(ui.painter(), menu.response.rect.center(), 8.0, Color32::WHITE, BTN_DARK);
+    menu.response.on_hover_text("Configure Output 1–4, NDI and SRT")
+        .context_menu(|ui| external_menu_items(ui, s));
+}
+
+fn external_menu_items(ui: &mut egui::Ui, s: &mut Switcher) {
+    let choices = src_choices(s, true);
+    for channel in 0..OUTPUT_COUNT {
+        let name = src_name(s, s.cfg.outputs[channel].source);
+        ui.menu_button(format!("Output {} · {name}", channel + 1), |ui| {
+            if ui.button(if s.external[channel].open { "Close local window" } else { "Open local window" }).clicked() {
+                s.toggle_external(channel);
+                ui.close_menu();
+            }
+            if ui.checkbox(&mut s.cfg.outputs[channel].overlays, "Overlays").changed() {
+                s.save_settings();
+            }
+            for protocol in ["NDI", "SRT"] {
+                ui.add_enabled(false, egui::Button::new(format!("{protocol} Off")))
+                    .on_disabled_hover_text("Network transmission is unavailable in this build");
+            }
+            ui.menu_button("Source", |ui| {
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (value, name) in &choices {
+                        if ui.selectable_value(&mut s.cfg.outputs[channel].source, *value, name).clicked() {
+                            s.save_settings();
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        });
+    }
+    ui.separator();
+    for (page, label) in [(1, "Outputs / NDI / SRT…"), (6, "External Window Settings…")] {
+        if ui.button(label).clicked() {
+            s.settings_open = true;
+            s.cfg.page = page;
+            ui.close_menu();
+        }
+    }
+}
+
 /// MultiView 1 / 2 (frmSettings cmdMultiView1/2, lblMultiViewLayout "MultiView Layout",
 /// cmdMVInputs "Customise Layout"): layout, what each box shows, and a live picture of it.
 fn multiview_settings(ui: &mut egui::Ui, s: &mut Switcher) {
@@ -2445,7 +2949,7 @@ fn multiview_settings(ui: &mut egui::Ui, s: &mut Switcher) {
     ui.label(RichText::new("Show a MultiView by choosing it as the Source of Fullscreen or External.").size(11.0).color(TEXT_DIM));
 }
 
-fn settings_page(ui: &mut egui::Ui, s: &mut Switcher) {
+fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, encoder: &str, program_path: &str) {
     let page = s.cfg.page.min(SETTINGS_PAGES.len() - 1);
     ui.label(RichText::new(SETTINGS_PAGES[page]).strong().size(15.0).color(Color32::WHITE));
     ui.add_space(6.0);
@@ -2606,35 +3110,33 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher) {
             ui.add_space(4.0);
             ui.checkbox(&mut s.cfg.lock_refresh, "Synchronize Output with Refresh Rate (off: the window redraws at the Master Frame Rate)");
             ui.checkbox(&mut s.cfg.no_input_effects, "Disable Effects on Input Previews (input boxes skip position, crop and layers)");
-            ui.checkbox(&mut s.cfg.hw_encoder, "Use Hardware Encoder for recordings (graphics card H.264 when available)");
+            ui.checkbox(&mut s.cfg.hw_encoder, "Use Hardware Encoder for recordings (when available for the selected codec)");
+            ui.separator();
+            ui.label(format!("Graphics adapter: {graphics_adapter}"));
+            ui.label(format!("Program capture: {program_path}"));
+            ui.label(format!("Program encoder: {encoder}"));
             ui.add_space(4.0);
             ui.label(RichText::new("Lower camera modes (Input Settings > General) and a lower Output Size also save work.").size(11.0).color(TEXT_DIM));
         }
         5 => {
-            // Recording
-            ui.label("Recordings are saved as MP4 (H.264) in:");
+            ui.label("Default recording folder:");
             ui.label(RichText::new(media::storage_folder().display().to_string()).color(TEXT_DIM));
-            ui.add_space(4.0);
-            ui.label("File name: capture - dd MMMM yyyy - hh-mm-ss tt.mp4");
-            ui.label("MultiCorder: one MP4 per camera, named after the input.");
-            ui.label(RichText::new("Other formats of the original (AVI, MPEG-2, WMV, FFMPEG) are not available yet.").size(11.0).color(TEXT_DIM));
+            if ui.button("Recording Setup…").clicked() {
+                s.rec_setup = true;
+            }
+            if ui.button("MultiCorder Setup…").clicked() {
+                s.mc_setup = true;
+            }
         }
-        1 | 6 => {
-            // Outputs / External Output: what the External / Fullscreen window shows and how.
-            ui.label("External opens a window with the Source below (Output, Preview, a MultiView or one input).");
-            ui.label("Drag it to a second screen or projector and double-click it to fill that screen; Esc leaves.");
-            ui.label(RichText::new("The Fullscreen button has its own Source and screen in Settings > Display.").size(11.0).color(TEXT_DIM));
+        1 => {
+            output_routes(ui, s);
+            ui.label(RichText::new("Each output can open a separate local window. NDI and SRT transmission are unavailable in this build.").size(11.0).color(TEXT_DIM));
+        }
+        6 => {
+            ui.label("These options apply to all four local External windows.");
+            ui.label("Drag a window to a second screen and double-click to enter fullscreen. Press Esc to leave fullscreen.");
             ui.add_space(6.0);
             egui::Grid::new("set-ext").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Source:");
-                let cur = src_name(s, s.cfg.ext_source);
-                let choices = src_choices(s, true);
-                egui::ComboBox::from_id_salt("ext-src").width(240.0).selected_text(cur).show_ui(ui, |ui| {
-                    for (v, name) in choices {
-                        ui.selectable_value(&mut s.cfg.ext_source, v, name);
-                    }
-                });
-                ui.end_row();
                 ui.label("Window Size:");
                 egui::ComboBox::from_id_salt("ext-size").selected_text(EXT_SIZES[s.cfg.ext_size.min(2) as usize].0).show_ui(ui, |ui| {
                     for (k, (name, _)) in EXT_SIZES.iter().enumerate() {
@@ -2644,20 +3146,12 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher) {
                 ui.end_row();
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut s.cfg.ext_overlays, "Overlays (show overlay channels 1–4 on this output)");
             ui.checkbox(&mut s.cfg.ext_on_top, "On Top");
             ui.checkbox(&mut s.cfg.ext_hide_cursor, "Hide Cursor");
-            ui.checkbox(&mut s.cfg.start_external, "Start External Output");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button(if s.output_window { "Close External window" } else { "Open External window" }).clicked() {
-                    s.output_window = !s.output_window;
-                    if !s.output_window {
-                        s.ext_full = false;
-                    }
-                }
-            });
-            ui.label(RichText::new("Blackmagic / NDI hardware outputs and Outputs 2–4 are not available yet.").size(11.0).color(TEXT_DIM));
+            ui.checkbox(&mut s.cfg.start_external, "Open Output 1 at startup");
+            if ui.button("Configure Output 1–4…").clicked() {
+                s.cfg.page = 1;
+            }
         }
         7 => {
             // Audio
@@ -2732,6 +3226,17 @@ fn new_file_every(ui: &mut egui::Ui, id: &str, v: &mut u32) -> bool {
     *v != before
 }
 
+fn recording_format_picker(ui: &mut egui::Ui, id: &str, format: &mut media::RecordFormat) -> bool {
+    let label = |format: media::RecordFormat| format!("{} ({})", format.extension().to_ascii_uppercase(), format.codec());
+    let before = *format;
+    egui::ComboBox::from_id_salt(id).selected_text(label(*format)).show_ui(ui, |ui| {
+        for choice in media::RecordFormat::ALL {
+            ui.selectable_value(format, choice, label(choice));
+        }
+    });
+    *format != before
+}
+
 /// Setup windows opened by the gear buttons: Recording Setup, Streaming Settings, MultiCorder
 /// and PlayList.
 fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
@@ -2747,6 +3252,19 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
     if s.rec_setup {
         let mut open = true;
         egui::Window::new("Recording Setup").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            let tab_id = ui.id().with("recording-slot");
+            let mut secondary = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut secondary, false, "1");
+                ui.selectable_value(&mut secondary, true, "2");
+                if secondary {
+                    changed |= ui.checkbox(&mut s.cfg.rec_second, "Enabled").changed();
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(tab_id, secondary));
+            let output_names: Vec<_> = s.cfg.outputs.iter().enumerate()
+                .map(|(n, route)| format!("Output {} · {}", n + 1, src_name(s, route.source))).collect();
+            let name = safe_name(&s.cfg.rec_name);
             egui::Grid::new("rec-setup").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Filename:");
                 ui.horizontal(|ui| {
@@ -2764,13 +3282,29 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 changed |= ui.add(egui::TextEdit::singleline(&mut s.cfg.rec_name).desired_width(200.0)).changed();
                 ui.end_row();
                 ui.label("");
-                ui.label(RichText::new(format!("{}.mp4", media::recording_name(&safe_name(&s.cfg.rec_name)))).size(11.0).color(TEXT_DIM));
+                let (source, codec, mbps) = if secondary {
+                    (&mut s.cfg.rec_second_source, &mut s.cfg.rec_second_codec, &mut s.cfg.rec_second_mbps)
+                } else {
+                    (&mut s.cfg.rec_source, &mut s.cfg.rec_codec, &mut s.cfg.rec_mbps)
+                };
+                let filename = if secondary { format!("{name} - 2") } else { name.clone() };
+                ui.label(RichText::new(format!("{}.{}", media::recording_name(&filename), codec.extension())).size(11.0).color(TEXT_DIM));
+                ui.end_row();
+                ui.label("Source:");
+                let before = *source;
+                egui::ComboBox::from_id_salt("rec-source").width(240.0)
+                    .selected_text(&output_names[*source]).show_ui(ui, |ui| {
+                        for (index, name) in output_names.iter().enumerate() {
+                            ui.selectable_value(source, index, name);
+                        }
+                    });
+                changed |= *source != before;
                 ui.end_row();
                 ui.label("Codec:");
-                ui.label("MP4 (H.264)");
+                changed |= recording_format_picker(ui, "rec-format", codec);
                 ui.end_row();
                 ui.label("Bit Rate:");
-                changed |= ui.add(egui::DragValue::new(&mut s.cfg.rec_mbps).range(1..=100).suffix(" Mbps")).changed();
+                changed |= ui.add(egui::DragValue::new(mbps).range(1..=100).suffix(" Mbps")).changed();
                 ui.end_row();
                 ui.label("New File Every:");
                 ui.horizontal(|ui| {
@@ -2780,7 +3314,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 ui.end_row();
             });
             ui.checkbox(&mut s.cfg.recording_confirm, "Ask before stopping (Display confirmation for Record, External, Stream and MultiCorder buttons)");
-            ui.label(RichText::new("Other codecs of the original (AVI, MPEG-2, FFMPEG, audio settings) are not available yet.").size(11.0).color(TEXT_DIM));
+            ui.label(RichText::new("Video only. HEVC requires a compatible Windows encoder. Both slots share the folder and split interval.").size(11.0).color(TEXT_DIM));
             ui.horizontal(|ui| {
                 if ui.button("  OK  ").clicked() {
                     s.rec_setup = false;
@@ -2846,11 +3380,12 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
         let mut open = true;
         let t = ctx.input(|i| i.time);
         egui::Window::new("MultiCorder").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label("Each ticked camera is recorded to its own MP4 file, named after the input:");
+            ui.label("Each selected camera or Output is recorded to its own file.");
             ui.add_space(4.0);
             let cams: Vec<(u32, String)> = s.inputs.iter().filter(|i| matches!(i.kind, Kind::Device { .. })).map(|i| (i.id, format!("{} {}", s.number_of(i.id), i.title))).collect();
-            if cams.is_empty() {
-                ui.label(RichText::new("No camera inputs yet — add a Camera with Add Input.").color(TEXT_DIM));
+            for channel in 0..OUTPUT_COUNT {
+                let source = src_name(s, s.cfg.outputs[channel].source);
+                changed |= ui.checkbox(&mut s.cfg.mc_outputs[channel], format!("Output {} · {source}", channel + 1)).changed();
             }
             for (id, name) in cams {
                 let mut on = !s.mc_off.contains(&id);
@@ -2874,7 +3409,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 });
                 ui.end_row();
                 ui.label("Codec:");
-                ui.label("MP4 (H.264)");
+                changed |= recording_format_picker(ui, "mc-format", &mut s.cfg.mc_codec);
                 ui.end_row();
                 ui.label("Video Bit Rate:");
                 ui.add(egui::DragValue::new(&mut s.cfg.mc_mbps).range(1..=100).suffix(" Mbps"));
@@ -2908,7 +3443,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
         let mut open = true;
         let t = ctx.input(|i| i.time);
         egui::Window::new("PlayList").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label("Ticked inputs go to Output in list order, one after another, with Transition 1:");
+            ui.label("Ticked inputs go to Output in list order with a Cut; a video plays its own length, other inputs the Duration:");
             ui.add_space(4.0);
             let items: Vec<(u32, String)> = s.inputs.iter().map(|i| (i.id, format!("{} {}", s.number_of(i.id), i.title))).collect();
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -2951,7 +3486,98 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
     }
 }
 
-fn dialogs(ctx: &egui::Context, s: &mut Switcher) {
+/// The New button's two windows: "save changes?" (frmCloseConfirm without closing: Save,
+/// Discard changes, Cancel) and "New Preset" (frmNewPreset: Resolution and Frame Rate set to the
+/// current format — frmNewPreset::d @0x259698 — then OK / Cancel).
+fn new_preset_windows(ctx: &egui::Context, s: &mut Switcher) {
+    match s.new_step {
+        NewStep::Idle => {}
+        NewStep::SaveChanges => {
+            let mut next = None;
+            egui::Window::new("LiveMix").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                ui.add_space(4.0);
+                // sr::c passes the preset's name ("Untitled" when never saved) to the question.
+                ui.label(RichText::new(s.preset_name.clone()).strong());
+                ui.label("Do you wish to save changes to the current preset?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("  Save  ").clicked() {
+                        next = Some(1);
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        next = Some(2);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        next = Some(0);
+                    }
+                });
+            });
+            match next {
+                Some(1) => {
+                    // Go on only when the preset was saved (sr::c → sr::zw).
+                    s.new_step = if s.save_preset() { NewStep::Format } else { NewStep::Idle };
+                }
+                Some(2) => s.new_step = NewStep::Format,
+                Some(_) => s.new_step = NewStep::Idle,
+                None => {}
+            }
+        }
+        NewStep::Format => {
+            let mut ok = false;
+            let mut cancel = false;
+            egui::Window::new("New Preset").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label("Create a new blank preset with the following video format");
+                ui.add_space(8.0);
+                let (size, rate, il) = s.new_format;
+                egui::Grid::new("new-preset").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Resolution");
+                    let (w, h) = OUTPUT_SIZES[(size as usize).min(OUTPUT_SIZES.len() - 1)];
+                    egui::ComboBox::from_id_salt("np-res").width(160.0).selected_text(format!("{w} x {h}")).show_ui(ui, |ui| {
+                        // The original's New Preset sizes (ss::e @0x1c9128).
+                        for k in NEW_PRESET_SIZES {
+                            let (w, h) = OUTPUT_SIZES[k as usize];
+                            if ui.selectable_label(k == size, format!("{w} x {h}")).clicked() {
+                                s.new_format.0 = k;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Frame Rate");
+                    let cur = NEW_PRESET_RATES.iter().find(|r| r.1 == rate && r.2 == il).map(|r| r.0).unwrap_or("59.94i");
+                    egui::ComboBox::from_id_salt("np-rate").width(160.0).selected_text(cur).show_ui(ui, |ui| {
+                        for (name, r, i) in NEW_PRESET_RATES {
+                            if ui.selectable_label(r == rate && i == il, name).clicked() {
+                                s.new_format.1 = r;
+                                s.new_format.2 = i;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("   OK   ").clicked() {
+                        ok = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if ok {
+                let (size, rate, il) = s.new_format;
+                s.new_step = NewStep::Idle;
+                s.new_preset_with(size, rate, il);
+            } else if cancel {
+                s.new_step = NewStep::Idle;
+            }
+        }
+    }
+}
+
+fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encoder: &str, program_path: &str) {
+    new_preset_windows(ctx, s);
     setup_windows(ctx, s);
     // RecordingConfirm (config default True): "Stop Recording?" Yes / No (ConfirmRecording @0x250d10).
     if let Some(kind) = s.confirm_stop {
@@ -3011,12 +3637,11 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher) {
                     match s.add_dialog.kind {
                         AddKind::Title => {
                             ui.horizontal(|ui| {
-                                ui.label("Text");
-                                ui.text_edit_singleline(&mut s.add_dialog.text);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Line 2");
-                                ui.text_edit_singleline(&mut s.add_dialog.text2);
+                                ui.label("GT Title");
+                                ui.text_edit_singleline(&mut s.add_dialog.path);
+                                if ui.button("Browse…").clicked() {
+                                    s.browse_req = Some(media::PickKind::Title);
+                                }
                             });
                         }
                         AddKind::Colour => {
@@ -3257,7 +3882,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher) {
                         ui.set_width(520.0);
                         ui.set_min_height(380.0);
                         egui::ScrollArea::vertical().id_salt("settings-page").max_height(620.0).show(ui, |ui| {
-                            settings_page(ui, s);
+                            settings_page(ui, s, graphics_adapter, encoder, program_path);
                         });
                     });
                 });
@@ -3282,9 +3907,9 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher) {
                 ui.label(RichText::new("Number").strong());
                 ui.label(RichText::new("Effect").strong());
                 ui.label(RichText::new("Effect Duration").strong());
-                ui.label(RichText::new("Showing").strong());
+                ui.label(RichText::new("Assigned Input").strong());
                 ui.end_row();
-                for c in 0..4 {
+                for c in 0..OVERLAY_CHANNELS {
                     ui.label(format!("{}", c + 1));
                     egui::ComboBox::from_id_salt(("ovfx", c)).selected_text(s.overlays[c].effect.name()).show_ui(ui, |ui| {
                         for e in OVERLAY_EFFECTS {
@@ -3292,7 +3917,8 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher) {
                         }
                     });
                     ui.add(egui::DragValue::new(&mut s.overlays[c].ms).range(1..=9999).speed(10.0).suffix(" ms"));
-                    let name = s.overlays[c].input.filter(|_| s.overlays[c].on).and_then(|i| s.input(i)).map(|i| i.title.clone()).unwrap_or_else(|| "—".into());
+                    let name = s.overlays[c].assigned.and_then(|source| s.input(source.input))
+                        .map_or("—", |i| i.title.as_str());
                     ui.label(name);
                     ui.end_row();
                 }
@@ -3305,12 +3931,6 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher) {
 }
 
 // ---------------------------------------------------------------- widgets
-
-fn small_btn(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
-    let b = egui::Button::new(RichText::new(text).size(11.0).color(if active { Color32::WHITE } else { TEXT }))
-        .fill(if active { HOVER } else { BTN });
-    ui.add(b)
-}
 
 fn tiny(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
     let b = egui::Button::new(RichText::new(text).size(11.0).color(if active { Color32::BLACK } else { TEXT }))
@@ -3393,12 +4013,16 @@ mod position_tests {
     }
 
     #[test]
-    fn overlay_button_with_another_input_replaces_it() {
+    fn overlay_reassignment_waits_for_the_next_activation() {
         let mut s = Switcher::demo();
         let (a, b) = (s.inputs[0].id, s.inputs[1].id);
-        s.toggle_overlay(1, a, false);
-        s.toggle_overlay(1, b, false);
-        assert_eq!(s.overlays[1].input, Some(b));
+        s.assign_overlay(1, a, false);
+        s.toggle_overlay_channel(1);
+        s.assign_overlay(1, b, false);
+        assert_eq!(s.overlays[1].input, Some(a));
         assert!(s.overlays[1].on);
+        s.toggle_overlay_channel(1);
+        s.toggle_overlay_channel(1);
+        assert_eq!(s.overlays[1].input, Some(b));
     }
 }

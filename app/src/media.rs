@@ -43,6 +43,8 @@ pub struct Shared {
     pub stop: AtomicBool,
     pub paused: AtomicBool,
     pub restart: AtomicBool,
+    /// Latest seek request in milliseconds, encoded as position + 1 (0 means none).
+    pub seek_ms: AtomicU64,
     pub looping: AtomicBool,
     pub ended: AtomicBool,
     pub pos_ms: AtomicU64,
@@ -469,10 +471,12 @@ fn run(sh: Arc<Shared>, src: Source) {
     let mut need_open = true;
     let mut last_frame_ts = None;
     let mut resume_at = None;
+    let mut seek_to = None;
     while !sh.stop.load(Ordering::Relaxed) {
         if sh.restart.swap(false, Ordering::Relaxed) {
             need_open = true;
             resume_at = None;
+            seek_to = None;
             sh.pos_ms.store(0, Ordering::Relaxed);
         }
         if need_open {
@@ -506,10 +510,31 @@ fn run(sh: Arc<Shared>, src: Source) {
             last_frame_ts = None;
         }
         if is_file {
+            if let Some(ms) = sh.seek_ms.swap(0, Ordering::Relaxed).checked_sub(1) {
+                let duration = sh.dur_ms.load(Ordering::Relaxed);
+                let ms = if duration > 0 { ms.min(duration.saturating_sub(50)) } else { ms };
+                let ts = (ms.min(i64::MAX as u64 / 10_000) * 10_000) as i64;
+                if let Some(r) = &reader {
+                    match unsafe { r.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(ts)) } {
+                        Ok(()) => {
+                            seek_to = Some(ts);
+                            resume_at = None;
+                            base_ts = -1;
+                            last_frame_ts = None;
+                            sh.ended.store(false, Ordering::Relaxed);
+                            sh.set_status("");
+                        }
+                        Err(e) => sh.set_status(format!("Unable to seek ({})", e.message())),
+                    }
+                }
+            }
+        }
+        if is_file {
             // Pause / end of file: hold the last frame.
-            while (sh.paused.load(Ordering::Relaxed) || sh.ended.load(Ordering::Relaxed))
+            while seek_to.is_none() && (sh.paused.load(Ordering::Relaxed) || sh.ended.load(Ordering::Relaxed))
                 && !sh.stop.load(Ordering::Relaxed)
                 && !sh.restart.load(Ordering::Relaxed)
+                && sh.seek_ms.load(Ordering::Relaxed) == 0
             {
                 if sh.ended.load(Ordering::Relaxed) && sh.looping.load(Ordering::Relaxed) {
                     break;
@@ -517,6 +542,9 @@ fn run(sh: Arc<Shared>, src: Source) {
                 let a = Instant::now();
                 std::thread::sleep(Duration::from_millis(15));
                 t0 += a.elapsed();
+            }
+            if sh.restart.load(Ordering::Relaxed) || sh.seek_ms.load(Ordering::Relaxed) != 0 {
+                continue;
             }
             if sh.ended.load(Ordering::Relaxed) {
                 if sh.looping.load(Ordering::Relaxed) {
@@ -544,6 +572,7 @@ fn run(sh: Arc<Shared>, src: Source) {
         }
         if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             resume_at = None;
+            seek_to = None;
             if is_file {
                 let pos = sh.pos_ms.load(Ordering::Relaxed);
                 sh.dur_ms.fetch_max(pos, Ordering::Relaxed);
@@ -565,6 +594,9 @@ fn run(sh: Arc<Shared>, src: Source) {
         }
         let Some(s) = sample else { continue };
         if is_file {
+            if seek_to.is_some_and(|target| ts < target) {
+                continue;
+            }
             if resume_at.is_some_and(|last| ts <= last) {
                 continue;
             }
@@ -589,8 +621,9 @@ fn run(sh: Arc<Shared>, src: Source) {
             *sh.frame.lock().unwrap() = Some(Frame { w, h, rgba });
             sh.seq.fetch_add(1, Ordering::Relaxed);
             last_frame_ts = Some(ts);
+            seek_to = None;
         } else if manager.take().is_some() {
-            resume_at = last_frame_ts;
+            resume_at = seek_to.map(|target| target - 1).or(last_frame_ts);
             need_open = true;
         }
     }
@@ -598,18 +631,22 @@ fn run(sh: Arc<Shared>, src: Source) {
 
 // ---------------------------------------------------------------- recording
 
+#[derive(Clone)]
 struct RecFrame {
-    rgba: Vec<u8>,
+    pixels: Arc<Vec<u8>>,
     w: usize,
     h: usize,
     captured_at: Instant,
+    bgra: bool,
 }
 
-/// Writes RGBA frames to an H.264 MP4 file (size fixed by the first frame).
+/// Writes frames to a file on a bounded, independent encoder queue.
 pub struct Recorder {
     tx: SyncSender<RecFrame>,
     pub path: String,
     pub error: Arc<Mutex<String>>,
+    encoder: Arc<Mutex<String>>,
+    dropped: AtomicU64,
 }
 
 impl Recorder {
@@ -626,17 +663,36 @@ impl Recorder {
         // Keep the UI responsive and bound memory if the encoder falls behind.
         let (tx, rx) = sync_channel(3);
         let error = Arc::new(Mutex::new(String::new()));
+        let encoder = Arc::new(Mutex::new("Waiting for first frame".into()));
         let (p2, e2) = (path.clone(), error.clone());
-        std::thread::spawn(move || record_thread(p2, rx, e2, opts));
-        Recorder { tx, path, error }
+        let encoder_status = Arc::clone(&encoder);
+        std::thread::spawn(move || record_thread(p2, rx, e2, encoder_status, opts));
+        Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0) }
     }
     pub fn push(&self, rgba: Vec<u8>, w: usize, h: usize) {
-        let _ = self.tx.try_send(RecFrame {
-            rgba,
-            w,
-            h,
-            captured_at: Instant::now(),
-        });
+        self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at: Instant::now(), bgra: false });
+    }
+
+    pub fn push_group(recorders: &[Arc<Self>], pixels: Vec<u8>, w: usize, h: usize, captured_at: Instant, bgra: bool) {
+        let frame = RecFrame { pixels: Arc::new(pixels), w, h, captured_at, bgra };
+        for recorder in recorders {
+            recorder.enqueue(frame.clone());
+        }
+    }
+
+    fn enqueue(&self, frame: RecFrame) {
+        if matches!(self.tx.try_send(frame), Err(std::sync::mpsc::TrySendError::Full(_))) {
+            self.note_dropped_frames(1);
+        }
+    }
+
+    pub fn note_dropped_frames(&self, count: u64) {
+        self.dropped.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn diagnostics(&self) -> String {
+        let encoder = self.encoder.lock().unwrap();
+        format!("{encoder} | Dropped frames: {}", self.dropped.load(Ordering::Relaxed))
     }
 }
 
@@ -644,6 +700,54 @@ impl Recorder {
 /// key "MPEGBitRate" defaults to 8 Mbps (kh::get_j @0xe4298).
 pub const DEFAULT_MBPS: u32 = 8;
 pub const RECORDING_FPS: u32 = 30;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordFormat {
+    #[default]
+    H264,
+    Hevc,
+    Wmv,
+}
+
+impl RecordFormat {
+    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Wmv];
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "hevc" => Self::Hevc,
+            "wmv" => Self::Wmv,
+            _ => Self::H264,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Wmv => "wmv",
+        }
+    }
+
+    pub fn codec(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Wmv => "WMV9",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        if self == Self::Wmv { "wmv" } else { "mp4" }
+    }
+
+    fn subtype(self) -> GUID {
+        match self {
+            Self::H264 => MFVideoFormat_H264,
+            Self::Hevc => MFVideoFormat_HEVC,
+            Self::Wmv => MFVideoFormat_WMV3,
+        }
+    }
+}
 
 /// How a recording is written.
 #[derive(Clone, Copy, Debug)]
@@ -656,11 +760,12 @@ pub struct RecOpts {
     pub fps: f32,
     /// Use the graphics card's encoder when there is one (recording key "HardwareAcceleration").
     pub hw: bool,
+    pub format: RecordFormat,
 }
 
 impl Default for RecOpts {
     fn default() -> Self {
-        RecOpts { mbps: DEFAULT_MBPS, size: None, fps: RECORDING_FPS as f32, hw: true }
+        RecOpts { mbps: DEFAULT_MBPS, size: None, fps: RECORDING_FPS as f32, hw: true, format: RecordFormat::H264 }
     }
 }
 
@@ -690,7 +795,7 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts) -> Res<(IMFSin
     let par = (1u64 << 32) | 1;
     let out = MFCreateMediaType()?;
     out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-    out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+    out.SetGUID(&MF_MT_SUBTYPE, &opts.format.subtype())?;
     out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
     out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     out.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
@@ -710,7 +815,42 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts) -> Res<(IMFSin
     Ok((wr, idx))
 }
 
-fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, opts: RecOpts) {
+unsafe fn encoder_name(writer: &IMFSinkWriter, stream: u32, format: RecordFormat) -> String {
+    let codec = format.codec();
+    let unknown = format!("{codec} encoder not reported by Windows");
+    let Ok(writer) = writer.cast::<IMFSinkWriterEx>() else { return unknown };
+    for index in 0.. {
+        let mut category = GUID::zeroed();
+        let mut transform = None;
+        if writer.GetTransformForStream(stream, index, Some(&mut category), &mut transform).is_err() {
+            break;
+        }
+        if category != MFT_CATEGORY_VIDEO_ENCODER {
+            continue;
+        }
+        let Some(attrs) = transform.and_then(|mft| mft.GetAttributes().ok()) else { break };
+        let read = |key| {
+            let len = attrs.GetStringLength(key).ok()?;
+            let mut value = vec![0; len as usize + 1];
+            attrs.GetString(key, &mut value, None).ok()?;
+            Some(String::from_utf16_lossy(&value[..len as usize]))
+        };
+        let name = read(&MFT_FRIENDLY_NAME_Attribute);
+        if attrs.GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute).is_ok() {
+            let vendor = read(&MFT_ENUM_HARDWARE_VENDOR_ID_Attribute).unwrap_or_default().to_ascii_uppercase();
+            return match vendor.as_str() {
+                "VEN_10DE" => format!("NVIDIA {codec} (hardware)"),
+                "VEN_8086" => format!("Intel {codec} (hardware)"),
+                "VEN_1002" => format!("AMD {codec} (hardware)"),
+                _ => format!("{} (hardware)", name.as_deref().unwrap_or(codec)),
+            };
+        }
+        return name.unwrap_or_else(|| format!("{codec} (software)"));
+    }
+    unknown
+}
+
+fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, encoder: Arc<Mutex<String>>, opts: RecOpts) {
     if !mf_init() {
         *err.lock().unwrap() = "Media Foundation not available".into();
         return;
@@ -720,25 +860,27 @@ fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, 
     let mut last_t: i64 = -1;
     let (rn, rd) = rate_fraction(opts.fps);
     let frame_dur = (10_000_000u64 * u64::from(rd) / u64::from(rn.max(1))) as i64;
-    while let Ok(RecFrame { mut rgba, w: mut fw, h: mut fh, captured_at }) = rx.recv() {
+    while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, bgra }) = rx.recv() {
         // Scale the picture to the project's Output Size.
         if let Some((tw, th)) = opts.size {
             let (tw, th) = ((tw as usize & !1).max(2), (th as usize & !1).max(2));
             if (fw, fh) != (tw, th) && fw > 0 && fh > 0 {
-                if let Some(img) = image::RgbaImage::from_raw(fw as u32, fh as u32, std::mem::take(&mut rgba)) {
-                    rgba = image::imageops::resize(&img, tw as u32, th as u32, image::imageops::FilterType::Triangle).into_raw();
-                    fw = tw;
-                    fh = th;
-                }
+                let Some(img) = image::RgbaImage::from_raw(fw as u32, fh as u32, Arc::unwrap_or_clone(pixels)) else { continue };
+                pixels = Arc::new(image::imageops::resize(&img, tw as u32, th as u32, image::imageops::FilterType::Triangle).into_raw());
+                fw = tw;
+                fh = th;
             }
         }
         if writer.is_none() {
             let w = (fw & !1).max(2);
             let h = (fh & !1).max(2);
             match unsafe { make_writer(&path, w as u32, h as u32, &opts) } {
-                Ok((wr, idx)) => writer = Some((wr, idx, w, h)),
+                Ok((wr, idx)) => {
+                    *encoder.lock().unwrap() = unsafe { encoder_name(&wr, idx, opts.format) };
+                    writer = Some((wr, idx, w, h));
+                }
                 Err(e) => {
-                    *err.lock().unwrap() = format!("Could not start recording: {}", e.message());
+                    *err.lock().unwrap() = format!("Could not start {} recording: {}", opts.format.codec(), e.message());
                     return;
                 }
             }
@@ -758,17 +900,19 @@ fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, 
                 let mut p: *mut u8 = std::ptr::null_mut();
                 buf.Lock(&mut p, None, None)?;
                 let dst = std::slice::from_raw_parts_mut(p, len);
-                for y in 0..h {
-                    for x in 0..w {
-                        let d = (y * w + x) * 4;
-                        if x < fw && y < fh {
-                            let s = (y * fw + x) * 4;
-                            dst[d] = rgba[s + 2];
-                            dst[d + 1] = rgba[s + 1];
-                            dst[d + 2] = rgba[s];
-                            dst[d + 3] = 255;
-                        } else {
-                            dst[d..d + 4].copy_from_slice(&[0, 0, 0, 255]);
+                if bgra && (fw, fh) == (w, h) {
+                    dst.copy_from_slice(&pixels);
+                } else {
+                    for y in 0..h {
+                        for x in 0..w {
+                            let d = (y * w + x) * 4;
+                            if x < fw && y < fh {
+                                let s = (y * fw + x) * 4;
+                                let (b, r) = if bgra { (s, s + 2) } else { (s + 2, s) };
+                                dst[d..d + 4].copy_from_slice(&[pixels[b], pixels[s + 1], pixels[r], 255]);
+                            } else {
+                                dst[d..d + 4].copy_from_slice(&[0, 0, 0, 255]);
+                            }
                         }
                     }
                 }
@@ -799,6 +943,7 @@ fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, 
 pub enum PickKind {
     Video,
     Image,
+    Title,
     /// Several video files (List input); answer is the paths joined by '\n'.
     VideoMany,
     /// A folder (Image Sequence / Photos).
@@ -822,6 +967,10 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
             match kind {
                 PickKind::Video => d.SetFileTypes(&[video, all])?,
                 PickKind::Image => d.SetFileTypes(&[image, all])?,
+                PickKind::Title => d.SetFileTypes(&[
+                    COMDLG_FILTERSPEC { pszName: windows::core::w!("GT Designer titles"), pszSpec: windows::core::w!("*.gtzip") },
+                    all,
+                ])?,
                 PickKind::VideoMany => {
                     d.SetFileTypes(&[video, all])?;
                     d.SetOptions(d.GetOptions()? | FOS_ALLOWMULTISELECT)?;
@@ -1144,10 +1293,31 @@ mod tests {
             println!("blue at top {top}, at bottom {bottom}");
             assert!(top < 80 && bottom > 170, "picture must not be upside down");
         }
-        sh.stop.store(true, Ordering::Relaxed);
         println!("frames read {frames}, size {:?}", size);
         assert!(frames >= 5);
         assert_eq!(size, (320, 180));
+
+        sh.paused.store(true, Ordering::Relaxed);
+        let seek = |ms| {
+            let previous = sh.seq.load(Ordering::Relaxed);
+            sh.seek_ms.store(ms + 1, Ordering::Relaxed);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                if sh.seq.load(Ordering::Relaxed) > previous {
+                    let pos = sh.pos_ms.load(Ordering::Relaxed);
+                    if (ms..=ms + 100).contains(&pos) {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let seeks_while_paused = seek(850);
+        let restarts_while_paused = seek(0);
+        sh.stop.store(true, Ordering::Relaxed);
+        assert!(seeks_while_paused, "seek must decode a new frame while paused");
+        assert!(restarts_while_paused, "restart must return to the beginning while paused");
     }
 }
 

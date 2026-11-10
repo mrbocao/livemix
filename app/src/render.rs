@@ -1,6 +1,7 @@
 // Drawing of inputs, transitions, overlays and meters.
 
-use crate::model::{Effect, Input, Kind, Position};
+use crate::gt::Cue;
+use crate::model::{Effect, FULL, Input, Kind, Overlay, Position};
 use eframe::egui::{self, pos2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Vec2};
 
 // Colours sampled from the screenshot of the running original (reference/picture-1.png).
@@ -102,20 +103,20 @@ fn crop_rect(sr: Rect, pos: &Position) -> Rect {
 /// Draws one input in `r` with its Position, crop and Layers, at opacity `a`.
 /// `all` is the input list (layers refer to other inputs).
 pub fn draw_source(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input]) {
-    draw_layered(p, r, inp, a, t, all, 0);
+    draw_layered(p, r, inp, a, t, all, 0, Cue::Rest);
 }
 
 /// Input box picture with "Disable Effects on Input Previews": the input's own picture only,
 /// without its Position, crop or Layers.
 pub fn draw_plain(p: &Painter, r: Rect, inp: &Input, t: f64) {
-    draw_raw(p, r, inp, 1.0, t);
+    draw_raw(p, r, inp, 1.0, t, Cue::Rest);
 }
 
-fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input], depth: u32) {
+fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input], depth: u32, cue: Cue) {
     let sr = place_rect(r, &inp.place);
     let clip = crop_rect(sr, &inp.place).intersect(p.clip_rect());
     if clip.width() > 0.0 && clip.height() > 0.0 {
-        draw_raw(&p.with_clip_rect(clip), sr, inp, a, t);
+        draw_raw(&p.with_clip_rect(clip), sr, inp, a, t, cue);
     }
     // Layers 1–10 on top, in order (an input can't be its own layer; two levels deep at most).
     if depth >= 2 {
@@ -126,13 +127,13 @@ fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input]
         let lr = place_rect(r, &l.place);
         let lc = crop_rect(lr, &l.place).intersect(p.clip_rect());
         if lc.width() > 0.0 && lc.height() > 0.0 {
-            draw_layered(&p.with_clip_rect(lc), lr, li, a, t, all, depth + 1);
+            draw_layered(&p.with_clip_rect(lc), lr, li, a, t, all, depth + 1, Cue::Rest);
         }
     }
 }
 
 /// Draws the input's own picture filling `r` with opacity `a`.
-fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64) {
+fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
     if a <= 0.0 {
         return;
     }
@@ -167,6 +168,11 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64) {
             p.rect_filled(low, 0.0, fade(Color32::from_rgb(16, 16, 16), a));
             let wr = Rect::from_min_size(pos2(r.left() + bw * 1.25, low.top()), Vec2::new(bw * 1.25, low.height()));
             p.rect_filled(wr, 0.0, fade(Color32::from_rgb(235, 235, 235), a));
+        }
+        Kind::GtTitle { document, texts, .. } => {
+            if let Some(document) = document {
+                document.draw(p, r, a, texts, cue);
+            }
         }
         Kind::Title { text, sub } => {
             let bar = Rect::from_min_max(pos2(r.left() + w * 0.06, r.top() + h * 0.72), pos2(r.left() + w * 0.62, r.top() + h * 0.86));
@@ -374,9 +380,14 @@ pub fn draw_transition(p: &Painter, r: Rect, a: Option<&Input>, b: Option<&Input
     }
 }
 
-pub fn draw_overlay(p: &Painter, r: Rect, inp: &Input, e: Effect, level: f32, t: f64, all: &[Input]) {
-    let k = level.clamp(0.0, 1.0);
-    match e {
+pub fn draw_overlay(p: &Painter, r: Rect, inp: &Input, ch: &Overlay, t: f64, all: &[Input]) {
+    let k = (ch.level / FULL).clamp(0.0, 1.0);
+    if inp.kind.gt_seconds(!ch.on).is_some() {
+        let cue = if ch.on { Cue::In(k) } else { Cue::Out(1.0 - k) };
+        draw_layered(p, r, inp, 1.0, t, all, 0, cue);
+        return;
+    }
+    match ch.effect {
         Effect::Zoom => draw_in(p, r, scaled(r, k), Some(inp), k, t, all),
         Effect::Wipe => draw_in(p, Rect::from_min_max(r.min, pos2(r.left() + r.width() * k, r.bottom())), r, Some(inp), 1.0, t, all),
         Effect::Slide => draw_in(p, r, r.translate(Vec2::new(-r.width() * (1.0 - k), 0.0)), Some(inp), 1.0, t, all),

@@ -102,6 +102,11 @@ pub enum Kind {
     Colour(Color32),
     Bars,
     Title { text: String, sub: String },
+    GtTitle {
+        path: String,
+        texts: std::collections::BTreeMap<String, String>,
+        document: Option<std::sync::Arc<crate::gt::Document>>,
+    },
     Blank,
     Clock,
     Camera(u32),
@@ -132,10 +137,17 @@ impl Kind {
         matches!(self, Kind::Video { .. } | Kind::Camera(_))
     }
     pub fn transparent(&self) -> bool {
-        matches!(self, Kind::Title { .. } | Kind::Blank | Kind::ImageFile { .. } | Kind::ImageSequence { .. })
+        matches!(self, Kind::Title { .. } | Kind::GtTitle { .. } | Kind::Blank | Kind::ImageFile { .. } | Kind::ImageSequence { .. })
     }
     pub fn keyable(&self) -> bool {
         matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop)
+    }
+
+    pub fn gt_seconds(&self, exiting: bool) -> Option<f32> {
+        match self {
+            Self::GtTitle { document: Some(doc), .. } => doc.seconds(exiting),
+            _ => None,
+        }
     }
     /// Inputs whose picture comes from a media thread (camera, files, desktop…).
     pub fn streamed(&self) -> bool {
@@ -218,6 +230,7 @@ pub struct Input {
     /// "Starting…", "No signal …" etc. for real inputs.
     pub status: String,
     pub restart_req: bool,
+    pub seek_ms: Option<u64>,
     pub key: Key,
     /// Camera: the capture mode chosen in Input Settings (None = Auto), every mode the camera
     /// offers and the one in use (filled in from the camera reader).
@@ -227,6 +240,16 @@ pub struct Input {
 }
 
 impl Input {
+    pub fn reload_gt(&mut self) -> Result<(), String> {
+        let Kind::GtTitle { path, document, .. } = &mut self.kind else {
+            return Err("This input is not a GT Title.".into());
+        };
+        let loaded = crate::gt::Document::load(std::path::Path::new(path))?;
+        *document = Some(std::sync::Arc::new(loaded));
+        self.status.clear();
+        Ok(())
+    }
+
     pub fn new(id: u32, title: &str, kind: Kind) -> Self {
         Input {
             place: Position::default(),
@@ -249,6 +272,7 @@ impl Input {
             prev_tex: None,
             status: String::new(),
             restart_req: false,
+            seek_ms: None,
             key: Key::default(),
             cam_mode: None,
             cam_modes: Vec::new(),
@@ -275,8 +299,19 @@ pub struct Trans {
     pub direct: bool,
 }
 
+pub const OVERLAY_CHANNELS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlaySource {
+    pub input: u32,
+    pub on_preview: bool,
+}
+
 /// An overlay layer; `level` is 0–255 like the original's `rs::b` (rs::t @0x1b0890).
 pub struct Overlay {
+    /// Source selected for the next activation.
+    pub assigned: Option<OverlaySource>,
+    /// Source currently being rendered, including during fade-out.
     pub input: Option<u32>,
     pub on: bool,
     pub level: f32,
@@ -302,11 +337,185 @@ pub fn set_output_fps(fps: f32) {
     OUTPUT_FPS_BITS.store(fps.clamp(1.0, 240.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Output sizes offered for the project (the original's size list 640x480 … 1920x1080, plus
-/// 2560x1440 and 3840x2160).
-pub const OUTPUT_SIZES: [(u32, u32); 9] = [(640, 480), (720, 480), (720, 576), (768, 480), (768, 576), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
+/// Output sizes offered for the project (frmInput's list 640x480 … 1920x1080, plus the New
+/// Preset sizes 2560x1440, 3840x2160, 2276x1280 and 3412x1920 from ss::e @0x1c9128).
+pub const OUTPUT_SIZES: [(u32, u32); 11] = [(640, 480), (720, 480), (720, 576), (768, 480), (768, 576), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160), (2276, 1280), (3412, 1920)];
+/// Resolutions of the New Preset window, in the original's order (ss::e 0x060046cf @0x1c9128:
+/// 720x480, 720x576, 1280x720, 1920x1080, 2560x1440, 3840x2160, 2276x1280, 3412x1920), as
+/// OUTPUT_SIZES indexes.
+pub const NEW_PRESET_SIZES: [u8; 8] = [1, 2, 5, 6, 7, 8, 9, 10];
 /// Master Frame Rate choices (frames per second; for interlaced output: fields per second).
 pub const FRAME_RATES: [(&str, f32); 8] = [("23.976", 23.976), ("24", 24.0), ("25", 25.0), ("29.97", 29.97), ("30", 30.0), ("50", 50.0), ("59.94", 59.94), ("60", 60.0)];
+
+/// Steps of the New button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewStep {
+    Idle,
+    /// "Do you wish to save changes to the current preset?" (frmCloseConfirm lblMessage:
+    /// Save / Discard changes / Cancel).
+    SaveChanges,
+    /// The "New Preset" window (frmNewPreset: Resolution, Frame Rate, OK, Cancel).
+    Format,
+}
+
+/// Language file STOP_RECORDING: why New / Open is refused while outputs run.
+pub const STOP_OUTPUTS_MSG: &str = "Stop Recording, External Output, MultiCorder and Streaming before Opening a Preset.";
+
+/// Frame rate choices of the New Preset window: (name, FRAME_RATES index, interlaced) — ss::e
+/// (0x060046cf @0x1c9128) adds, in 100 ns frame durations: 400000 (25p), 333667 (29.97p),
+/// 200000 (50p), 166833 (59.94p), then interlaced 400000 (25 frames = 50i) and 333667
+/// (29.97 frames = 59.94i). Interlaced is kept as its field rate here, as the status bar shows it.
+pub const NEW_PRESET_RATES: [(&str, u8, bool); 6] = [
+    ("25p", 2, false),
+    ("29.97p", 3, false),
+    ("50p", 5, false),
+    ("59.94p", 6, false),
+    ("50i", 5, true),
+    ("59.94i", 6, true),
+];
+
+/// Safe area menu of the Preview: names and vMix.SafeAreasType values, in the original's menu
+/// order (kzzzzzj::b @0xf68ec builds the menu; kzzzzzj::d @0xf6d78 draws each type).
+pub const SAFE_AREAS: [(&str, u16); 12] = [
+    ("None", 0),
+    ("SMPTE/EBU", 10),
+    ("SMPTE/EBU with 4:3", 20),
+    ("90% / 80%", 30),
+    ("90% / 80% with 4:3", 32),
+    ("GRID 3", 33),
+    ("GRID 4", 40),
+    ("GRID 8 16:9", 80),
+    ("GRID 16", 160),
+    ("GRID 32", 320),
+    ("Square 1:1", 400),
+    ("Vertical 9:16", 402),
+];
+
+/// "Waveform Monitor" menu of the Preview, in the original's order with the value each item
+/// carries — hd::k (0x060012bb @0x87cb4).
+pub const WAVEFORMS: [(&str, u8); 11] = [
+    ("None", 0),
+    ("Waveform RGB + Preview", 20),
+    ("Waveform RGB", 5),
+    ("Waveform Y + Preview", 25),
+    ("Waveform Y", 6),
+    ("Parade RGB + Preview", 30),
+    ("Parade RGB", 10),
+    ("Vectorscope + Preview", 40),
+    ("Vectorscope", 15),
+    ("Vectorscope + Waveform Y", 50),
+    ("Vectorscope + Waveform Y + Preview", 60),
+];
+/// Scope pictures: Waveform RGB, Waveform Y, Parade RGB, Vectorscope.
+pub const SCOPE_RGB: u8 = 5;
+pub const SCOPE_Y: u8 = 6;
+pub const SCOPE_PARADE: u8 = 10;
+pub const SCOPE_VECTOR: u8 = 15;
+
+/// Where the Preview picture and the scopes go in the Preview monitor for a Waveform Monitor
+/// choice, as [x, y, w, h] in 0..1 of the picture (y down) — hc::a (0x06001292 @0x87134), which
+/// places layer 8 (the picture), 9 (vectorscope) and 10 (waveform) with Position zoom / pan
+/// (pan 1 = half the frame, pan Y up):
+/// - Waveform RGB / Y / Parade alone: picture and scope both full size, the scope on top;
+/// - "+ Preview": waveform zoom 0.5 pan X −0.5 (left half), picture zoom 0.5 pan X 0.5 (right);
+/// - Vectorscope: zoom 0.5625 × 1, centred, picture hidden;
+/// - Vectorscope + Preview: vectorscope 0.28125 × 0.5 pan X −0.5, picture right half;
+/// - Vectorscope + Waveform Y: vectorscope right (pan X 0.5), waveform left; picture hidden;
+/// - … + Preview: vectorscope top left (pan −0.5, 0.5), waveform bottom left (−0.5, −0.5),
+///   picture right half.
+/// Returns (picture place or None when hidden, [(scope, place)]).
+pub fn scope_layout(code: u8) -> (Option<[f32; 4]>, Vec<(u8, [f32; 4])>) {
+    let full = [0.0, 0.0, 1.0, 1.0];
+    let left = [0.0, 0.25, 0.5, 0.5];
+    let right = [0.5, 0.25, 0.5, 0.5];
+    // A 0.28125 × 0.5 square (9:16 of half the width) centred in a half.
+    let vs_at = |cx: f32, cy: f32| [cx - 0.140625, cy - 0.25, 0.28125, 0.5];
+    match code {
+        5 | 6 | 10 => (Some(full), vec![(code, full)]),
+        20 => (Some(right), vec![(SCOPE_RGB, left)]),
+        25 => (Some(right), vec![(SCOPE_Y, left)]),
+        30 => (Some(right), vec![(SCOPE_PARADE, left)]),
+        15 => (None, vec![(SCOPE_VECTOR, [0.21875, 0.0, 0.5625, 1.0])]),
+        40 => (Some(right), vec![(SCOPE_VECTOR, vs_at(0.25, 0.5))]),
+        50 => (None, vec![(SCOPE_Y, left), (SCOPE_VECTOR, vs_at(0.75, 0.5))]),
+        60 => (Some(right), vec![(SCOPE_VECTOR, vs_at(0.25, 0.25)), (SCOPE_Y, [0.0, 0.5, 0.5, 0.5])]),
+        _ => (Some(full), Vec::new()),
+    }
+}
+
+/// One guide line, from (x0, y0) to (x1, y1), in pixels of a w × h picture.
+pub type Guide = [f32; 4];
+
+/// The guide lines and boxes of a safe area type for a w × h picture — kzzzzzj::d
+/// (0x06002543 @0xf6d78):
+/// - SMPTE/EBU: title safe 0.90 and action safe 0.93 boxes, centred; "90% / 80%": 0.80 and 0.90;
+///   "with 4:3": two upright lines at the 4:3 width 0.675 (across the title box's height).
+/// - GRID n: n columns × n rows (GRID 16 = 16 × 9, GRID 32 = 32 × 18); on pictures narrower than
+///   1.7 : 1 a grid wider than 4 gets round(n / 4 × 3) rows (not GRID 8 16:9).
+/// - Square 1:1 / Vertical 9:16: upright lines left and right of a centred square / 9:16 area
+///   (9:16 width = h / 16 × 9, raised to a multiple of 4).
+/// - The safe area types also draw a centre cross 0.05 × h long.
+pub fn safe_area_guides(kind: u16, w: f32, h: f32) -> Vec<Guide> {
+    let mut g: Vec<Guide> = Vec::new();
+    let boxed = |g: &mut Vec<Guide>, share: f32| {
+        let (x, y) = ((1.0 - share) / 2.0 * w, (1.0 - share) / 2.0 * h);
+        let (bw, bh) = (share * w, share * h);
+        g.push([x, y, x + bw, y]);
+        g.push([x + bw, y, x + bw, y + bh]);
+        g.push([x + bw, y + bh, x, y + bh]);
+        g.push([x, y + bh, x, y]);
+        (y, bh)
+    };
+    match kind {
+        10 | 20 | 30 | 32 => {
+            let (title, action) = if kind == 30 || kind == 32 { (0.80, 0.90) } else { (0.90, 0.93) };
+            let (ty, th) = boxed(&mut g, title);
+            boxed(&mut g, action);
+            if kind == 20 || kind == 32 {
+                let x = (1.0 - 0.675) / 2.0 * w;
+                g.push([x, ty, x, ty + th]);
+                g.push([x + 0.675 * w, ty, x + 0.675 * w, ty + th]);
+            }
+            let len = h * 0.05;
+            g.push([w / 2.0, (h - len) / 2.0, w / 2.0, (h + len) / 2.0]);
+            g.push([(w - len) / 2.0, h / 2.0, (w + len) / 2.0, h / 2.0]);
+        }
+        33 | 40 | 80 | 160 | 320 => {
+            let (cols, mut rows) = match kind {
+                33 => (3, 3),
+                40 => (4, 4),
+                80 => (8, 8),
+                160 => (16, 9),
+                _ => (32, 18),
+            };
+            if kind != 80 && w / h < 1.7 && cols > 4 {
+                rows = (cols as f32 / 4.0 * 3.0).round() as i32;
+            }
+            for c in 1..cols {
+                let x = (w / cols as f32 * c as f32).round();
+                g.push([x, 0.0, x, h - 1.0]);
+            }
+            for r in 1..rows {
+                let y = (h / rows as f32 * r as f32).round();
+                g.push([0.0, y, w - 1.0, y]);
+            }
+        }
+        400 | 402 => {
+            let mut aw = h.round() as i32;
+            if kind == 402 {
+                aw = (h / 16.0 * 9.0).round() as i32;
+                while aw % 4 != 0 {
+                    aw += 1;
+                }
+            }
+            let x0 = ((w - aw as f32) / 2.0).round();
+            g.push([x0, 0.0, x0, h - 1.0]);
+            g.push([x0 + aw as f32, 0.0, x0 + aw as f32, h - 1.0]);
+        }
+        _ => {}
+    }
+    g
+}
 /// Full scale of transition progress, overlay level and T-bar (hm::r, rs::t, ms::zzzzzze).
 pub const FULL: f32 = 255.0;
 /// mr::zzy @0x12ce3c: step = 256 / round(ms * fps / 1000).
@@ -459,7 +668,7 @@ impl AddKind {
             AddKind::ImageFile => "A picture file (PNG, JPG, BMP). PNG transparency is kept, so logos work as Overlays.",
             AddKind::Photos => "A slideshow of every picture in a folder (JPG, PNG, BMP, TIF, GIF); while playing it moves to the next picture every 2 seconds.",
             AddKind::Colour => "A solid colour, a transparent (empty) input or colour bars.",
-            AddKind::Title => "A lower-third title with a transparent background, ideal as an Overlay.",
+            AddKind::Title => "Open a .gtzip template created in GT Designer. Edit its text in Input Settings.",
             AddKind::Blackmagic => "Blackmagic DeckLink, Intensity, UltraStudio, ATEM Mini or Web Presenter. DeckLink/Intensity/UltraStudio need Blackmagic Desktop Video installed.",
             AddKind::Clock => "A clock counting up from when the show started.",
             AddKind::TestCamera => "A drawn stand-in camera picture (for practice without hardware).",
@@ -506,8 +715,6 @@ pub struct AddDialog {
     pub open: bool,
     pub kind: AddKind,
     pub name: String,
-    pub text: String,
-    pub text2: String,
     pub colour: Color32,
     pub length: f32,
     pub devices: Vec<DeviceChoice>,
@@ -536,15 +743,13 @@ pub struct Switcher {
     pub ftb_level: f32,
     pub ftb_ms: u32,
     pub ftb_audio: bool,
-    pub overlays: [Overlay; 4],
+    pub overlays: [Overlay; OVERLAY_CHANNELS],
     pub rec: Option<f64>,
     pub multicorder: Option<f64>,
     pub playlist: Option<f64>,
     pub playlist_secs: f32,
     /// Fullscreen display (top bar "Fullscreen"): its own borderless window filling the chosen screen.
     pub fullscreen: bool,
-    /// The External window switched to fullscreen (double-click on it).
-    pub ext_full: bool,
     /// Setup windows of the gear buttons next to Record, Stream, MultiCorder and PlayList
     /// (frmmain cmdRecSetup, cmdStreamingSetup, cmdMultiCorderSetup, cmdPlayListSetup).
     pub rec_setup: bool,
@@ -568,6 +773,12 @@ pub struct Switcher {
     pub play_active: bool,
     pub restart_active: bool,
     pub preset_name: String,
+    /// The preset as last saved / opened / made new (None: never saved), for "save changes?".
+    pub saved_text: Option<String>,
+    /// Where the New button is: asking to save changes, or showing the New Preset window.
+    pub new_step: NewStep,
+    /// Video format picked in the New Preset window: (size, rate, interlaced) indexes.
+    pub new_format: (u8, u8, bool),
     pub notice: String,
     notice_until: f64,
     now: f64,
@@ -578,10 +789,13 @@ pub struct Switcher {
     // ---- requests from the UI to the app (real media, files, windows) ----
     /// Where the Output monitor is on screen (for snapshots and recording).
     pub output_rect: eframe::egui::Rect,
-    /// Where the Preview monitor's picture is on screen (for its waveform).
+    /// Where the scopes measure the Preview picture on screen (the picture itself when it is
+    /// shown uncovered, otherwise the Preview input's box picture).
     pub preview_rect: eframe::egui::Rect,
-    /// Waveform picture of the Preview (made by the app from window pictures), when shown.
-    pub waveform_tex: Option<eframe::egui::TextureId>,
+    /// Scope pictures of the Preview by kind (SCOPE_RGB …), made by the app from window pictures.
+    pub scope_tex: Vec<(u8, eframe::egui::TextureId)>,
+    /// Where the Preview input's own box picture is (scopes measure it when the picture is covered).
+    pub preview_tile_rect: eframe::egui::Rect,
     /// Interface frame counter (Preview Skip).
     pub ui_frame: u64,
     pub snapshot_req: bool,
@@ -589,8 +803,7 @@ pub struct Switcher {
     pub browse_req: Option<crate::media::PickKind>,
     pub refresh_devices: bool,
     pub dialog_error: String,
-    /// External window open (the "External" button).
-    pub output_window: bool,
+    pub external: [ExternalWindow; OUTPUT_COUNT],
     /// Input whose settings window (name, green-screen key) is open.
     pub settings_input: Option<u32>,
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
@@ -609,6 +822,25 @@ pub const SRC_MV1: u32 = u32::MAX - 1;
 pub const SRC_MV2: u32 = u32::MAX - 2;
 /// MultiView box left on automatic: the next input in list order.
 pub const MV_AUTO: u32 = u32::MAX;
+pub const OUTPUT_COUNT: usize = 4;
+
+#[derive(Clone, Copy, Default)]
+pub struct ExternalWindow {
+    pub open: bool,
+    pub fullscreen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputRoute {
+    pub source: u32,
+    pub overlays: bool,
+}
+
+impl Default for OutputRoute {
+    fn default() -> Self {
+        Self { source: SRC_OUTPUT, overlays: true }
+    }
+}
 
 /// The original's enum vMix.MultiViewLayout (token 0x0200105c), in its order:
 /// Pro (= 0, the config default), Standard, Quad, Sixteen, One.
@@ -749,9 +981,7 @@ pub struct Settings {
     pub start_maximised: bool,
     /// External window source (config OutputsExternal, empty = Output): SRC_OUTPUT, SRC_PREVIEW,
     /// SRC_MV1 / SRC_MV2 (MultiView 1 / 2) or an input id + 1.
-    pub ext_source: u32,
-    /// Include the overlays (Settings → Outputs "Overlays" column; estimated default on).
-    pub ext_overlays: bool,
+    pub outputs: [OutputRoute; OUTPUT_COUNT],
     /// Fullscreen display source (config OutputsFullscreen, empty = Output), same codes.
     pub fs_source: u32,
     pub fs_overlays: bool,
@@ -775,10 +1005,18 @@ pub struct Settings {
     pub rec_name: String,
     pub rec_mbps: u32,
     pub rec_split_min: u32,
+    pub rec_codec: crate::media::RecordFormat,
+    pub rec_source: usize,
+    pub rec_second: bool,
+    pub rec_second_codec: crate::media::RecordFormat,
+    pub rec_second_source: usize,
+    pub rec_second_mbps: u32,
     /// MultiCorder (frmMultiCorder): folder ("Change Recording Folder"), video bit rate, new file every.
     pub mc_folder: String,
     pub mc_mbps: u32,
     pub mc_split_min: u32,
+    pub mc_codec: crate::media::RecordFormat,
+    pub mc_outputs: [bool; OUTPUT_COUNT],
     /// Streaming Settings (frmStreaming): destination, URL, stream name or key, quality.
     pub stream_dest: u8,
     pub stream_url: String,
@@ -803,9 +1041,12 @@ pub struct Settings {
     pub no_input_effects: bool,
     pub hw_encoder: bool,
     pub auto_cam_max_h: u32,
-    /// Preview monitor tools: safe areas and waveform.
-    pub show_safe: bool,
-    pub show_waveform: bool,
+    /// Preview monitor tools: safe area type (vMix.SafeAreasType value, 0 = None — see
+    /// SAFE_AREAS) and Waveform Monitor choice (value from WAVEFORMS, 0 = None), with the
+    /// "Vectorscope 2X Zoom" switch.
+    pub safe_type: u16,
+    pub wave_type: u8,
+    pub vs_zoom: bool,
     /// Selected section of the Input Settings window.
     pub input_page: usize,
     /// Selected page in the Settings window.
@@ -833,8 +1074,7 @@ impl Default for Settings {
             start_fullscreen: false,
             start_external: false,
             start_maximised: true,
-            ext_source: SRC_OUTPUT,
-            ext_overlays: true,
+            outputs: [OutputRoute::default(); OUTPUT_COUNT],
             fs_source: SRC_OUTPUT,
             fs_overlays: true,
             fs_display: 1,
@@ -847,14 +1087,22 @@ impl Default for Settings {
             rec_name: "capture".into(),
             rec_mbps: crate::media::DEFAULT_MBPS,
             rec_split_min: 0,
+            rec_codec: Default::default(),
+            rec_source: 0,
+            rec_second: false,
+            rec_second_codec: Default::default(),
+            rec_second_source: 0,
+            rec_second_mbps: crate::media::DEFAULT_MBPS,
             mc_folder: String::new(),
             mc_mbps: crate::media::DEFAULT_MBPS,
             mc_split_min: 0,
+            mc_codec: Default::default(),
+            mc_outputs: [false; OUTPUT_COUNT],
             stream_dest: 0,
             stream_url: String::new(),
             stream_key: String::new(),
             stream_quality: 1,
-            playlist_loop: true,
+            playlist_loop: false,
             out_size: 6,
             out_rate: 6,
             interlaced: true,
@@ -863,8 +1111,9 @@ impl Default for Settings {
             no_input_effects: false,
             hw_encoder: true,
             auto_cam_max_h: 1080,
-            show_safe: false,
-            show_waveform: false,
+            safe_type: 0,
+            wave_type: 0,
+            vs_zoom: false,
             input_page: 0,
             page: 0,
         }
@@ -919,8 +1168,10 @@ impl Switcher {
             format!("start_fullscreen={}", b(c.start_fullscreen)),
             format!("start_external={}", b(c.start_external)),
             format!("start_maximised={}", b(c.start_maximised)),
-            format!("ext_source={}", c.ext_source),
-            format!("ext_overlays={}", b(c.ext_overlays)),
+            format!("ext_source={}", c.outputs[0].source),
+            format!("ext_overlays={}", b(c.outputs[0].overlays)),
+            format!("additional_outputs={}", c.outputs[1..].iter()
+                .map(|out| format!("{},{}", out.source, b(out.overlays))).collect::<Vec<_>>().join(";")),
             format!("ext_on_top={}", b(c.ext_on_top)),
             format!("ext_hide_cursor={}", b(c.ext_hide_cursor)),
             format!("ext_size={}", c.ext_size),
@@ -934,9 +1185,17 @@ impl Switcher {
             format!("rec_name={}", c.rec_name),
             format!("rec_mbps={}", c.rec_mbps),
             format!("rec_split_min={}", c.rec_split_min),
+            format!("rec_codec={}", c.rec_codec.key()),
+            format!("rec_source={}", c.rec_source),
+            format!("rec_second={}", b(c.rec_second)),
+            format!("rec_second_codec={}", c.rec_second_codec.key()),
+            format!("rec_second_source={}", c.rec_second_source),
+            format!("rec_second_mbps={}", c.rec_second_mbps),
             format!("mc_folder={}", c.mc_folder),
             format!("mc_mbps={}", c.mc_mbps),
             format!("mc_split_min={}", c.mc_split_min),
+            format!("mc_codec={}", c.mc_codec.key()),
+            format!("mc_outputs={}", c.mc_outputs.iter().map(|on| if *on { '1' } else { '0' }).collect::<String>()),
             format!("stream_dest={}", c.stream_dest),
             format!("stream_url={}", c.stream_url),
             format!("stream_key={}", c.stream_key),
@@ -950,8 +1209,9 @@ impl Switcher {
             format!("no_input_effects={}", b(c.no_input_effects)),
             format!("hw_encoder={}", b(c.hw_encoder)),
             format!("auto_cam_max_h={}", c.auto_cam_max_h),
-            format!("show_safe={}", b(c.show_safe)),
-            format!("show_waveform={}", b(c.show_waveform)),
+            format!("safe_type={}", c.safe_type),
+            format!("wave_type={}", c.wave_type),
+            format!("vs_zoom={}", b(c.vs_zoom)),
             format!("quickplay={},{}", self.quickplay_effect.code_pub(), self.quickplay_ms),
             format!("ftb_ms={}", self.ftb_ms),
             format!("ftb_audio={}", b(self.ftb_audio)),
@@ -993,8 +1253,16 @@ impl Switcher {
                 "start_fullscreen" => c.start_fullscreen = on,
                 "start_external" => c.start_external = on,
                 "start_maximised" => c.start_maximised = on,
-                "ext_source" => c.ext_source = v.parse().unwrap_or(0),
-                "ext_overlays" => c.ext_overlays = on,
+                "ext_source" => c.outputs[0].source = v.parse().unwrap_or(SRC_OUTPUT),
+                "ext_overlays" => c.outputs[0].overlays = on,
+                "additional_outputs" => {
+                    for (out, setting) in c.outputs[1..].iter_mut().zip(v.split(';')) {
+                        if let Some((source, overlays)) = setting.split_once(',') {
+                            out.source = source.parse().unwrap_or(SRC_OUTPUT);
+                            out.overlays = overlays == "1";
+                        }
+                    }
+                }
                 "ext_on_top" => c.ext_on_top = on,
                 "ext_hide_cursor" => c.ext_hide_cursor = on,
                 "ext_size" => c.ext_size = v.parse().unwrap_or(0),
@@ -1010,9 +1278,21 @@ impl Switcher {
                 "rec_name" => c.rec_name = if v.trim().is_empty() { "capture".into() } else { v.to_string() },
                 "rec_mbps" => c.rec_mbps = v.parse().unwrap_or(crate::media::DEFAULT_MBPS).clamp(1, 100),
                 "rec_split_min" => c.rec_split_min = v.parse().unwrap_or(0),
+                "rec_codec" => c.rec_codec = crate::media::RecordFormat::parse(v),
+                "rec_source" => c.rec_source = v.parse::<usize>().unwrap_or(0).min(OUTPUT_COUNT - 1),
+                "rec_second" => c.rec_second = on,
+                "rec_second_codec" => c.rec_second_codec = crate::media::RecordFormat::parse(v),
+                "rec_second_source" => c.rec_second_source = v.parse::<usize>().unwrap_or(0).min(OUTPUT_COUNT - 1),
+                "rec_second_mbps" => c.rec_second_mbps = v.parse().unwrap_or(crate::media::DEFAULT_MBPS).clamp(1, 100),
                 "mc_folder" => c.mc_folder = v.to_string(),
                 "mc_mbps" => c.mc_mbps = v.parse().unwrap_or(crate::media::DEFAULT_MBPS).clamp(1, 100),
                 "mc_split_min" => c.mc_split_min = v.parse().unwrap_or(0),
+                "mc_codec" => c.mc_codec = crate::media::RecordFormat::parse(v),
+                "mc_outputs" => {
+                    for (enabled, value) in c.mc_outputs.iter_mut().zip(v.bytes()) {
+                        *enabled = value == b'1';
+                    }
+                }
                 "stream_dest" => c.stream_dest = v.parse().unwrap_or(0),
                 "stream_url" => c.stream_url = v.to_string(),
                 "stream_key" => c.stream_key = v.to_string(),
@@ -1026,8 +1306,9 @@ impl Switcher {
                 "no_input_effects" => c.no_input_effects = on,
                 "hw_encoder" => c.hw_encoder = on,
                 "auto_cam_max_h" => c.auto_cam_max_h = v.parse().unwrap_or(1080),
-                "show_safe" => c.show_safe = on,
-                "show_waveform" => c.show_waveform = on,
+                "safe_type" => c.safe_type = v.parse().ok().filter(|t| SAFE_AREAS.iter().any(|s| s.1 == *t)).unwrap_or(0),
+                "wave_type" => c.wave_type = v.parse().ok().filter(|t| WAVEFORMS.iter().any(|w| w.1 == *t)).unwrap_or(0),
+                "vs_zoom" => c.vs_zoom = on,
                 "mv_boxes1" | "mv_boxes2" => {
                     let k = if k == "mv_boxes1" { 0 } else { 1 };
                     c.mv_boxes[k] = v.split(',').filter_map(|p| p.parse().ok()).collect();
@@ -1043,7 +1324,7 @@ impl Switcher {
                 "pause_preview" => self.pause_preview = on,
                 "play_active" => self.play_active = on,
                 "restart_active" => self.restart_active = on,
-                "playlist_secs" => self.playlist_secs = v.parse().unwrap_or(10.0),
+                "playlist_secs" => self.playlist_secs = v.parse().unwrap_or(PLAYLIST_DEFAULT_SECS),
                 _ => {}
             }
         }
@@ -1062,10 +1343,15 @@ const DEFAULT_TRANSITIONS: [TransBtn; 4] = [
     TransBtn { effect: Effect::CubeZoom, ms: 1000 },
 ];
 const DEFAULT_TRANSITION_MS: u32 = 500; // ii::e fallback for an unknown button
+/// PlayList item defaults — PlaylistItem::.ctor (0x06006d87 @0x2c201c): m_Transition = 100
+/// (Cut), m_TransitionDuration = 500 ms, and an input that can't seek gets TimeSpan(0, 0, 5).
+pub const PLAYLIST_EFFECT: Effect = Effect::Cut;
+pub const PLAYLIST_TRANSITION_MS: u32 = 500;
+pub const PLAYLIST_DEFAULT_SECS: f32 = 5.0;
 
 impl Switcher {
     fn empty() -> Self {
-        let ov = || Overlay { input: None, on: false, level: 0.0, effect: Effect::Fade, ms: OVERLAY_MS, on_preview: false };
+        let ov = || Overlay { assigned: None, input: None, on: false, level: 0.0, effect: Effect::Fade, ms: OVERLAY_MS, on_preview: false };
         Switcher {
             inputs: Vec::new(),
             next_id: 1,
@@ -1079,13 +1365,12 @@ impl Switcher {
             ftb_level: 0.0,
             ftb_ms: FTB_MS,
             ftb_audio: true,
-            overlays: [ov(), ov(), ov(), ov()],
+            overlays: std::array::from_fn(|_| ov()),
             rec: None,
             multicorder: None,
             playlist: None,
-            playlist_secs: 10.0,
+            playlist_secs: PLAYLIST_DEFAULT_SECS,
             fullscreen: false,
-            ext_full: false,
             rec_setup: false,
             stream_setup: false,
             mc_setup: false,
@@ -1100,8 +1385,6 @@ impl Switcher {
                 open: false,
                 kind: AddKind::Camera,
                 name: String::new(),
-                text: "Headline".into(),
-                text2: "Description".into(),
                 colour: Color32::from_rgb(0x20, 0x40, 0x80),
                 length: 60.0,
                 devices: Vec::new(),
@@ -1119,7 +1402,10 @@ impl Switcher {
             pause_preview: true,
             play_active: true,
             restart_active: false,
-            preset_name: "Untitled preset".into(),
+            preset_name: "Untitled".into(),
+            saved_text: None,
+            new_step: NewStep::Idle,
+            new_format: (6, 6, true),
             notice: String::new(),
             notice_until: 0.0,
             now: 0.0,
@@ -1128,13 +1414,14 @@ impl Switcher {
             frame_acc: 0.0,
             output_rect: eframe::egui::Rect::NOTHING,
             preview_rect: eframe::egui::Rect::NOTHING,
-            waveform_tex: None,
+            scope_tex: Vec::new(),
+            preview_tile_rect: eframe::egui::Rect::NOTHING,
             ui_frame: 0,
             snapshot_req: false,
             browse_req: None,
             refresh_devices: false,
             dialog_error: String::new(),
-            output_window: false,
+            external: [ExternalWindow::default(); OUTPUT_COUNT],
             settings_input: None,
             confirm_stop: None,
             position_clipboard: None,
@@ -1177,6 +1464,7 @@ impl Switcher {
         }
         s.output = Some(c1);
         s.preview = Some(c2);
+        s.assign_overlay(0, lt, false);
         s.overlays[0].input = Some(lt);
         s.overlays[0].on = true;
         s.overlays[0].level = FULL;
@@ -1323,32 +1611,32 @@ impl Switcher {
         }
     }
 
-    /// ms::zzv @0x130464: same input again fades out; another input replaces it and fades in.
-    pub fn toggle_overlay(&mut self, c: usize, id: u32, on_preview: bool) {
-        let ch = &mut self.overlays[c];
-        if ch.input == Some(id) && ch.on && ch.on_preview == on_preview {
-            ch.on = false;
-        } else {
-            ch.input = Some(id);
-            ch.level = if ch.effect == Effect::Cut { FULL } else { 0.0 };
-            ch.on = true;
-            ch.on_preview = on_preview;
+    /// Assign a source without affecting the current output of the channel.
+    pub fn assign_overlay(&mut self, channel: usize, id: u32, on_preview: bool) {
+        if self.input(id).is_some() {
+            if let Some(ch) = self.overlays.get_mut(channel) {
+                ch.assigned = Some(OverlaySource { input: id, on_preview });
+            }
         }
     }
 
-    /// Centre overlay buttons 1–4 — frmmain::zzzze (0x06005b17 @0x251180): when the channel is
-    /// on it goes off (ms::zzn with its current input); when off, the input last used on it
-    /// (rs::get_a, found with ms::zzzzf) is brought back on; with none, nothing happens.
-    /// Returns false when no input has been used on that channel yet.
+    /// Centre overlay buttons. Turning a channel off leaves its assignment ready for the next use.
     pub fn toggle_overlay_channel(&mut self, c: usize) -> bool {
-        let ch = &mut self.overlays[c];
-        if ch.input.is_none() {
-            return false;
-        }
+        let authored_in = self.overlays.get(c).and_then(|ch| ch.assigned)
+            .and_then(|source| self.input(source.input))
+            .and_then(|inp| inp.kind.gt_seconds(false)).is_some();
+        let Some(ch) = self.overlays.get_mut(c) else { return false };
         if ch.on {
             ch.on = false;
         } else {
-            ch.level = if ch.effect == Effect::Cut { FULL } else { 0.0 };
+            let Some(source) = ch.assigned else { return false };
+            if ch.effect == Effect::Cut && !authored_in {
+                ch.level = FULL;
+            } else if ch.input != Some(source.input) || ch.on_preview != source.on_preview {
+                ch.level = 0.0;
+            }
+            ch.input = Some(source.input);
+            ch.on_preview = source.on_preview;
             ch.on = true;
         }
         true
@@ -1375,6 +1663,15 @@ impl Switcher {
                 (r, src)
             })
             .collect()
+    }
+
+    /// How long the PlayList stays on the input now on Output: a video file's own length,
+    /// otherwise the Duration (PlaylistItem: inputs that can't seek get 5 s).
+    pub fn playlist_item_secs(&self) -> f32 {
+        match self.output.and_then(|o| self.input(o)) {
+            Some(i) if matches!(i.kind, Kind::VideoFile { .. } | Kind::VideoList { .. }) && i.duration > 0.0 => i.duration,
+            _ => self.playlist_secs,
+        }
     }
 
     /// The input the PlayList goes to next: the next ticked input after the one on Output, in
@@ -1413,7 +1710,9 @@ impl Switcher {
                 *b = MV_AUTO;
             }
         }
-        for src in [&mut self.cfg.ext_source, &mut self.cfg.fs_source] {
+        for src in self.cfg.outputs.iter_mut().map(|out| &mut out.source)
+            .chain(std::iter::once(&mut self.cfg.fs_source))
+        {
             if *src == id + 1 {
                 *src = SRC_OUTPUT;
             }
@@ -1433,6 +1732,9 @@ impl Switcher {
             self.trans = None;
         }
         for ch in &mut self.overlays {
+            if ch.assigned.is_some_and(|source| source.input == id) {
+                ch.assigned = None;
+            }
             if ch.input == Some(id) {
                 ch.input = None;
                 ch.on = false;
@@ -1462,7 +1764,13 @@ impl Switcher {
         let ftb_step = step_for(sanitize_ms(self.ftb_ms));
         self.ftb_level = if self.ftb_on { (self.ftb_level + ftb_step).min(FULL) } else { (self.ftb_level - ftb_step).max(0.0) };
         for ch in &mut self.overlays {
-            let step = if ch.effect == Effect::Cut { FULL } else { step_for(sanitize_ms(ch.ms)) };
+            let storyboard = ch.input.and_then(|id| self.inputs.iter().find(|i| i.id == id))
+                .and_then(|inp| inp.kind.gt_seconds(!ch.on));
+            let step = match storyboard {
+                Some(seconds) => FULL / (seconds * output_fps() as f32).round().max(1.0),
+                None if ch.effect == Effect::Cut => FULL,
+                None => step_for(sanitize_ms(ch.ms)),
+            };
             if ch.on {
                 ch.level = (ch.level + step).min(FULL);
             } else {
@@ -1500,14 +1808,15 @@ impl Switcher {
                 }
             }
         }
-        // playlist: every few seconds, take the next input to Output with transition 1
+        // PlayList: when the input on Output has had its time, the next one goes to Output with
+        // the item transition — PlaylistItem::.ctor (0x06006d87 @0x2c201c): Cut (100), 500 ms;
+        // a video plays its own length, anything that can't seek plays the Duration (5 s).
         if let Some(last) = self.playlist {
-            if t - last >= self.playlist_secs as f64 && self.trans.is_none() {
+            if t - last >= self.playlist_item_secs() as f64 && self.trans.is_none() {
                 match self.playlist_next() {
                     Some(next) => {
                         self.preview = Some(next);
-                        let tb = self.transitions[0];
-                        self.start_transition(tb.effect, tb.ms);
+                        self.start_transition(PLAYLIST_EFFECT, PLAYLIST_TRANSITION_MS);
                         self.playlist = Some(t);
                     }
                     None => self.playlist = None,
@@ -1606,7 +1915,19 @@ impl Switcher {
                 2 => (Kind::Bars, "Colour Bars".into()),
                 _ => (Kind::Colour(d.colour), "Colour".into()),
             },
-            AddKind::Title => (Kind::Title { text: d.text.clone(), sub: d.text2.clone() }, d.text.clone()),
+            AddKind::Title => {
+                let path = std::path::Path::new(d.path.trim());
+                if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("gtzip")) {
+                    return Err("Choose a GT Designer title (.gtzip).".into());
+                }
+                let document = crate::gt::Document::load(path)?;
+                let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                (Kind::GtTitle {
+                    path: path.to_string_lossy().into_owned(),
+                    texts: Default::default(),
+                    document: Some(std::sync::Arc::new(document)),
+                }, name)
+            }
             AddKind::Clock => (Kind::Clock, "Production Clock".into()),
             k => return Err(format!("{} is not available in this version yet.", k.label())),
         };
@@ -1639,13 +1960,94 @@ impl Switcher {
             .join("livemix_preset.txt")
     }
 
-    pub fn save_preset(&mut self) {
+    /// Saves the preset; false when it could not be written (then New stops, as sr::c only goes
+    /// on when sr::zw saved).
+    pub fn save_preset(&mut self) -> bool {
+        let out = self.preset_text();
+        match std::fs::write(Self::preset_path(), &out) {
+            Ok(_) => {
+                self.preset_name = "livemix_preset".into();
+                self.saved_text = Some(out);
+                self.notify("Preset saved");
+                true
+            }
+            Err(e) => {
+                self.notify(&format!("Could not save preset: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Unsaved changes — sr::c (0x06004664 @0x1beab4) with sr::get_e (@0x1bea6c): no inputs →
+    /// nothing to save; otherwise the preset is compared with the copy kept when it was last
+    /// saved / opened / made new, and a preset never saved counts as changed.
+    pub fn preset_changed(&self) -> bool {
+        if self.inputs.is_empty() {
+            return false;
+        }
+        match &self.saved_text {
+            Some(t) => *t != self.preset_text(),
+            None => true,
+        }
+    }
+
+    /// Recording, External Output, MultiCorder (or Streaming) running: the original refuses a
+    /// new or opened preset then (frmmain::zzr @0x24ffe8, error 11004 "ClosePresets").
+    pub fn outputs_busy(&self) -> bool {
+        self.rec.is_some() || self.multicorder.is_some() || self.external_active()
+    }
+
+    pub fn external_active(&self) -> bool {
+        self.external.iter().any(|window| window.open)
+    }
+
+    pub fn toggle_external(&mut self, channel: usize) {
+        let window = &mut self.external[channel];
+        window.open = !window.open;
+        window.fullscreen = false;
+    }
+
+    /// The New button — frmmain::zzr (0x06005ae8 @0x24ffe8): refused while outputs run, then
+    /// "save changes?" when there are unsaved changes, then the New Preset window.
+    pub fn press_new(&mut self) {
+        if self.outputs_busy() {
+            self.notify(STOP_OUTPUTS_MSG);
+            return;
+        }
+        // frmNewPreset::d (@0x259698) preselects the current OutputSize / FrameRate when they are
+        // in its lists; otherwise the app falls back to 1920x1080 59.94i.
+        let size = if NEW_PRESET_SIZES.contains(&self.cfg.out_size) { self.cfg.out_size } else { 6 };
+        let (rate, il) = if NEW_PRESET_RATES.iter().any(|r| r.1 == self.cfg.out_rate && r.2 == self.cfg.interlaced) {
+            (self.cfg.out_rate, self.cfg.interlaced)
+        } else {
+            (6, true)
+        };
+        self.new_format = (size, rate, il);
+        self.new_step = if self.preset_changed() { NewStep::SaveChanges } else { NewStep::Format };
+    }
+
+    /// New Preset OK — frmNewPreset::c (0x06005c39 @0x25960c): set the chosen video format
+    /// (ss::d) and start a blank preset (ss::c).
+    pub fn new_preset_with(&mut self, size: u8, rate: u8, interlaced: bool) {
+        self.cfg.out_size = size.min(OUTPUT_SIZES.len() as u8 - 1);
+        self.cfg.out_rate = rate.min(FRAME_RATES.len() as u8 - 1);
+        self.cfg.interlaced = interlaced;
+        set_output_fps(self.cfg.rate());
+        self.save_settings();
+        self.new_preset();
+    }
+
+    /// The preset as text (inputs, Preview/Output, positions, layers, transitions).
+    pub fn preset_text(&self) -> String {
         let mut out = String::from("livemix-preset 1\n");
         for i in &self.inputs {
             let (code, a, b) = match &i.kind {
                 Kind::Colour(c) => ("colour", format!("{},{},{}", c.r(), c.g(), c.b()), String::new()),
                 Kind::Bars => ("bars", String::new(), String::new()),
                 Kind::Title { text, sub } => ("title", text.clone(), sub.clone()),
+                Kind::GtTitle { path, texts, .. } => (
+                    "gttitle", path.clone(), serde_json::to_string(texts).unwrap_or_default(),
+                ),
                 Kind::Blank => ("blank", String::new(), String::new()),
                 Kind::Clock => ("clock", String::new(), String::new()),
                 Kind::Camera(s) => ("camera", s.to_string(), String::new()),
@@ -1698,13 +2100,13 @@ impl Switcher {
         for (k, tb) in self.transitions.iter().enumerate() {
             out.push_str(&format!("transition\t{}\t{}\t{}\n", k, tb.effect.code(), tb.ms));
         }
-        match std::fs::write(Self::preset_path(), out) {
-            Ok(_) => {
-                self.preset_name = "livemix_preset".into();
-                self.notify("Preset saved");
+        for (channel, overlay) in self.overlays.iter().enumerate() {
+            if let Some(source) = overlay.assigned {
+                out.push_str(&format!("overlay_source\t{}\t{}\t{}\n",
+                    channel, self.number_of(source.input), source.on_preview as u8));
             }
-            Err(e) => self.notify(&format!("Could not save preset: {e}")),
         }
+        out
     }
 
     pub fn load_preset(&mut self) {
@@ -1712,6 +2114,10 @@ impl Switcher {
             self.notify("No saved preset yet — use Save first");
             return;
         };
+        self.load_preset_text(&text);
+    }
+
+    fn load_preset_text(&mut self, text: &str) {
         let mut s = Self::empty();
         let mut ids = Vec::new();
         for line in text.lines() {
@@ -1725,6 +2131,11 @@ impl Switcher {
                         }
                         "bars" => Kind::Bars,
                         "title" => Kind::Title { text: f[3].into(), sub: f[4].into() },
+                        "gttitle" => Kind::GtTitle {
+                            path: f[3].into(),
+                            texts: serde_json::from_str(f[4]).unwrap_or_default(),
+                            document: None,
+                        },
                         "clock" => Kind::Clock,
                         "camera" => Kind::Camera(f[3].parse().unwrap_or(1)),
                         "video" => Kind::Video { hue: f[3].parse().unwrap_or(0.5) },
@@ -1739,6 +2150,11 @@ impl Switcher {
                         _ => Kind::Blank,
                     };
                     let mut i = Input::new(0, f[2], kind);
+                    if matches!(i.kind, Kind::GtTitle { .. }) {
+                        if let Err(error) = i.reload_gt() {
+                            i.status = error;
+                        }
+                    }
                     i.duration = f[5].parse().unwrap_or(60.0);
                     i.volume = f[6].parse().unwrap_or(80.0);
                     i.category = f[7].parse().ok();
@@ -1795,6 +2211,14 @@ impl Switcher {
                         }
                     }
                 }
+                Some("overlay_source") if f.len() >= 4 => {
+                    let channel = f[1].parse().unwrap_or(OVERLAY_CHANNELS);
+                    let input = f[2].parse::<usize>().ok()
+                        .and_then(|n| n.checked_sub(1)).and_then(|n| ids.get(n)).copied();
+                    if let Some(id) = input {
+                        s.assign_overlay(channel, id, f[3] == "1");
+                    }
+                }
                 _ => {}
             }
         }
@@ -1803,9 +2227,11 @@ impl Switcher {
         s.cfg = self.cfg.clone();
         s.now = self.now;
         *self = s;
+        self.saved_text = Some(self.preset_text());
         self.notify("Preset opened");
     }
 
+    /// A blank preset: no inputs, default transitions, the Settings kept.
     pub fn new_preset(&mut self) {
         let mixer = self.show_mixer;
         let now = self.now;
@@ -1814,7 +2240,8 @@ impl Switcher {
         self.show_mixer = mixer;
         self.cfg = cfg;
         self.now = now;
-        self.notify("New preset");
+        self.saved_text = Some(self.preset_text());
+        self.notify(&format!("New preset — {}", self.cfg.format_label()));
     }
 }
 
@@ -1882,6 +2309,84 @@ mod tests {
     }
 
     #[test]
+    fn new_button_follows_frmmain_zzr() {
+        let mut s = Switcher::demo();
+        // Outputs running: refused.
+        s.rec = Some(0.0);
+        s.press_new();
+        assert_eq!(s.new_step, NewStep::Idle);
+        s.rec = None;
+        s.external[0].open = false;
+        // Unsaved inputs: ask to save first, with the current format preselected.
+        s.press_new();
+        assert_eq!(s.new_step, NewStep::SaveChanges);
+        assert_eq!(s.new_format, (s.cfg.out_size, s.cfg.out_rate, s.cfg.interlaced));
+        // OK: blank preset in the chosen format (720p25), nothing unsaved.
+        s.new_step = NewStep::Idle;
+        s.cfg = Settings::default();
+        let mut cfg = s.cfg.clone();
+        cfg.out_size = 5;
+        cfg.out_rate = 2;
+        cfg.interlaced = false;
+        s.cfg.out_size = 5;
+        s.cfg.out_rate = 2;
+        s.cfg.interlaced = false;
+        s.new_preset();
+        assert!(s.inputs.is_empty());
+        assert_eq!(s.cfg.format_label(), "720p25");
+        assert!(!s.preset_changed());
+        // A blank preset goes straight to the format window, 720p25 preselected (both listed).
+        s.press_new();
+        assert_eq!(s.new_step, NewStep::Format);
+        assert_eq!(s.new_format, (5, 2, false));
+        // 30p is not in the original's list (ss::e): falls back to 1080 59.94i.
+        s.cfg.out_rate = 4;
+        s.press_new();
+        assert_eq!(s.new_format, (5, 6, true));
+        assert_eq!(NEW_PRESET_RATES.len(), 6);
+        assert_eq!(NEW_PRESET_SIZES.len(), 8);
+        let _ = cfg;
+        set_output_fps(DEFAULT_FPS);
+    }
+
+    #[test]
+    fn waveform_monitor_layouts_follow_hc_a() {
+        // "+ Preview": waveform on the left half, the picture on the right half.
+        let (pic, sc) = scope_layout(25);
+        assert_eq!(pic, Some([0.5, 0.25, 0.5, 0.5]));
+        assert_eq!(sc, vec![(SCOPE_Y, [0.0, 0.25, 0.5, 0.5])]);
+        // Alone: both full size, scope on top.
+        assert_eq!(scope_layout(10), (Some([0.0, 0.0, 1.0, 1.0]), vec![(SCOPE_PARADE, [0.0, 0.0, 1.0, 1.0])]));
+        // Vectorscope alone: 0.5625 × 1 centred, picture hidden.
+        assert_eq!(scope_layout(15), (None, vec![(SCOPE_VECTOR, [0.21875, 0.0, 0.5625, 1.0])]));
+        // Vectorscope + Waveform Y + Preview: three parts.
+        let (pic, sc) = scope_layout(60);
+        assert_eq!(pic, Some([0.5, 0.25, 0.5, 0.5]));
+        assert_eq!(sc.len(), 2);
+        assert_eq!(WAVEFORMS.len(), 11);
+    }
+
+    #[test]
+    fn safe_areas_follow_kzzzzzj_d() {
+        // SMPTE/EBU on 1920x1080: title box from 96 to 1824 (0.90), action from 67.2 (0.93).
+        let g = safe_area_guides(10, 1920.0, 1080.0);
+        assert_eq!(g.len(), 10);
+        assert!((g[0][0] - 96.0).abs() < 0.01 && (g[0][1] - 54.0).abs() < 0.01);
+        assert!((g[4][0] - 67.2).abs() < 0.01);
+        // Centre cross 0.05 of the height = 54 px long.
+        assert!((g[8][3] - g[8][1] - 54.0).abs() < 0.01);
+        // 90 % / 80 % with 4:3 adds the two 4:3 lines.
+        assert_eq!(safe_area_guides(32, 1920.0, 1080.0).len(), 12);
+        // GRID 16 = 15 + 8 lines; GRID 3 = 2 + 2.
+        assert_eq!(safe_area_guides(160, 1920.0, 1080.0).len(), 23);
+        assert_eq!(safe_area_guides(33, 1920.0, 1080.0).len(), 4);
+        // Vertical 9:16 on 1080 lines: 607.5 → 608 wide, centred.
+        let v = safe_area_guides(402, 1920.0, 1080.0);
+        assert_eq!(v[1][0] - v[0][0], 608.0);
+        assert!(safe_area_guides(0, 1920.0, 1080.0).is_empty());
+    }
+
+    #[test]
     fn project_format_names_and_rates() {
         let mut c = Settings::default();
         assert_eq!(c.format_label(), "1080i59,94");
@@ -1902,32 +2407,55 @@ mod tests {
     fn centre_overlay_buttons_only_switch_the_channel() {
         let mut s = Switcher::demo();
         let (a, p) = (s.inputs[4].id, s.preview);
-        s.overlays[1] = Overlay { input: None, on: false, level: 0.0, effect: Effect::Fade, ms: 500, on_preview: false };
-        // Nothing picked for overlay 2 yet: the button does nothing.
-        assert!(!s.toggle_overlay_channel(1));
-        assert!(!s.overlays[1].on);
-        // Picked on an input box, then the centre button turns it off and on again,
-        // keeping that input (the Preview input is not used).
-        s.toggle_overlay(1, a, false);
-        assert!(s.toggle_overlay_channel(1));
-        assert!(!s.overlays[1].on);
-        assert!(s.toggle_overlay_channel(1));
-        assert!(s.overlays[1].on);
-        assert_eq!(s.overlays[1].input, Some(a));
+        let channel = OVERLAY_CHANNELS - 1;
+        assert!(!s.toggle_overlay_channel(channel));
+        s.assign_overlay(channel, a, true);
+        frames(&mut s, 30);
+        assert!(!s.overlays[channel].on);
+        assert!(s.overlays[channel].input.is_none());
+        assert!(s.toggle_overlay_channel(channel));
+        assert_eq!(s.overlays[channel].input, Some(a));
+        assert!(s.overlays[channel].on_preview);
+        frames(&mut s, 30);
+        assert!(s.toggle_overlay_channel(channel));
+        frames(&mut s, 30);
+        assert!(s.overlays[channel].input.is_none());
+        assert!(s.toggle_overlay_channel(channel));
+        assert_eq!(s.overlays[channel].input, Some(a));
         assert_eq!(s.preview, p);
+    }
+
+    #[test]
+    fn preset_restores_overlay_sources_with_channels_off() {
+        let mut s = Switcher::demo();
+        let channel = OVERLAY_CHANNELS - 1;
+        s.assign_overlay(channel, s.inputs[3].id, true);
+        s.toggle_overlay_channel(channel);
+        let preset = s.preset_text();
+        s.load_preset_text(&preset);
+        assert_eq!(s.overlays[channel].assigned, Some(OverlaySource { input: s.inputs[3].id, on_preview: true }));
+        assert!(!s.overlays[channel].on);
+        assert!(s.overlays[channel].input.is_none());
+        s.remove_input(s.inputs[3].id);
+        assert!(s.overlays[channel].assigned.is_none());
     }
 
     #[test]
     fn playlist_skips_unticked_inputs_and_loops() {
         let mut s = Switcher::demo();
         let ids: Vec<u32> = s.inputs.iter().map(|i| i.id).collect();
+        // The original's PlayList starts with Loop off, 5 s per still input (vMix.PlayList /
+        // PlaylistItem constructors).
+        assert!(!Settings::default().playlist_loop);
+        assert_eq!(s.playlist_secs, PLAYLIST_DEFAULT_SECS);
         s.output = Some(ids[0]);
+        assert_eq!(s.playlist_item_secs(), 5.0);
         s.playlist_off.insert(ids[1]);
         assert_eq!(s.playlist_next(), Some(ids[2]));
         s.output = ids.last().copied();
-        assert_eq!(s.playlist_next(), Some(ids[0]));
-        s.cfg.playlist_loop = false;
         assert_eq!(s.playlist_next(), None);
+        s.cfg.playlist_loop = true;
+        assert_eq!(s.playlist_next(), Some(ids[0]));
     }
 
     #[test]
@@ -1991,14 +2519,15 @@ mod tests {
     #[test]
     fn overlay_and_ftb_reach_full_after_30_frames() {
         let mut s = Switcher::demo();
-        s.toggle_overlay(1, 1, false);
+        s.assign_overlay(1, 1, false);
+        s.toggle_overlay_channel(1);
         s.ftb_on = true;
         frames(&mut s, 15);
         assert!(s.overlays[1].level > 100.0 && s.overlays[1].level < 130.0);
         frames(&mut s, 15);
         assert_eq!(s.overlays[1].level, FULL);
         assert_eq!(s.ftb_level, FULL);
-        s.toggle_overlay(1, 1, false);
+        s.toggle_overlay_channel(1);
         frames(&mut s, 30);
         assert_eq!(s.overlays[1].input, None);
     }
