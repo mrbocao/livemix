@@ -15,6 +15,8 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW,
 
 type Handle = *mut c_void;
 const VIDEO: i32 = 2;
+const AUDIO: i32 = 4;
+const FPA1: u32 = u32::from_le_bytes(*b"FPA1");
 const BGRA: u32 = u32::from_le_bytes(*b"BGRA");
 const BGRX: u32 = u32::from_le_bytes(*b"BGRX");
 
@@ -159,13 +161,22 @@ fn receive(shared: &Shared, address: &str) -> Result<(), String> {
     let api = api()?;
     let address = CString::new(address).map_err(|_| "Invalid OMT address")?;
     unsafe {
-        let receiver = (api.recv_create)(address.as_ptr(), VIDEO, 2, 0);
+        let receiver = (api.recv_create)(address.as_ptr(), VIDEO | AUDIO, 2, 0);
         if receiver.is_null() { return Err("Could not create OMT receiver".into()); }
         *shared.status.lock().unwrap() = "Waiting for OMT video…".into();
         let mut last_frame = None;
+        let mut audio_phase = 0;
         while !shared.stop.load(Relaxed) {
-            let video = (api.recv)(receiver, VIDEO, 100);
-            if let Some(frame) = video.as_ref().and_then(|video| unpack(video)) {
+            let media = (api.recv)(receiver, VIDEO | AUDIO, 100);
+            if let Some(audio) = media.as_ref().filter(|frame| frame.frame_type == AUDIO && frame.codec == FPA1) {
+                let frames = audio.samples.max(0) as usize;
+                let channels = audio.channels.max(0) as usize;
+                let stride = frames * 4;
+                if stride.saturating_mul(channels) <= audio.data_length.max(0) as usize {
+                    crate::audio::capture_planar(shared, audio.data, frames, stride, channels,
+                        audio.sample_rate as usize, 32768.0, &mut audio_phase);
+                }
+            } else if let Some(frame) = media.as_ref().filter(|frame| frame.frame_type == VIDEO).and_then(|video| unpack(video)) {
                 if last_frame.is_none() { *shared.status.lock().unwrap() = "Receiving OMT video".into(); }
                 last_frame = Some(Instant::now());
                 *shared.size.lock().unwrap() = (frame.w, frame.h);
@@ -205,7 +216,7 @@ unsafe fn unpack(frame: &MediaFrame) -> Option<Frame> {
 
 #[derive(Clone)]
 pub struct Sender {
-    frames: mpsc::SyncSender<NetworkFrame>,
+    frames: mpsc::SyncSender<(NetworkFrame, crate::audio::Packet)>,
     stop: Arc<AtomicBool>,
     subscribed: Arc<AtomicBool>,
     status: Arc<Mutex<(String, bool)>>,
@@ -226,13 +237,13 @@ impl Sender {
         Self { frames, stop, subscribed, status }
     }
 
-    pub fn submit(&self, frame: NetworkFrame) { let _ = self.frames.try_send(frame); }
+    pub fn submit(&self, frame: NetworkFrame, audio: crate::audio::Packet) { let _ = self.frames.try_send((frame, audio)); }
     pub fn stop(&self) { self.stop.store(true, Relaxed); }
     pub fn subscribed(&self) -> bool { self.subscribed.load(Relaxed) }
     pub fn status(&self) -> (String, bool) { self.status.lock().unwrap().clone() }
 }
 
-fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<NetworkFrame>,
+fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<(NetworkFrame, crate::audio::Packet)>,
     stop: &AtomicBool, subscribed: &AtomicBool, status: &Mutex<(String, bool)>) -> Result<(), String>
 {
     let api = api()?;
@@ -244,6 +255,7 @@ fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<NetworkFrame>,
         *status.lock().unwrap() = ("Waiting for OMT receivers…".into(), false);
         let start = Instant::now();
         let mut last_check = start - Duration::from_millis(250);
+        let mut slot = 0;
         while !stop.load(Relaxed) {
             if last_check.elapsed() >= Duration::from_millis(250) {
                 last_check = Instant::now();
@@ -252,7 +264,7 @@ fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<NetworkFrame>,
                     *status.lock().unwrap() = (if active { "Sending OMT video" } else { "Waiting for OMT receivers…" }.into(), false);
                 }
             }
-            let frame = match frames.recv_timeout(Duration::from_millis(100)) {
+            let (frame, packet) = match frames.recv_timeout(Duration::from_millis(100)) {
                 Ok(frame) => frame,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -271,6 +283,21 @@ fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<NetworkFrame>,
             video.data = frame.pixels.as_ptr();
             video.data_length = frame.pixels.len() as i32;
             (api.send)(sender, &mut video);
+            if !packet.is_empty() {
+                let count = packet.len().min(crate::audio::frames_for_slot(slot, n, d));
+                let planar = crate::audio::planar(&packet[..count], 1.0 / 32768.0);
+                let mut audio: MediaFrame = std::mem::zeroed();
+                audio.frame_type = AUDIO;
+                audio.timestamp = video.timestamp;
+                audio.codec = FPA1;
+                audio.sample_rate = crate::audio::RATE as i32;
+                audio.channels = 2;
+                audio.samples = count as i32;
+                audio.data = planar.as_ptr().cast();
+                audio.data_length = (planar.len() * 4) as i32;
+                (api.send)(sender, &mut audio);
+            }
+            slot += 1;
         }
         subscribed.store(false, Relaxed);
         (api.send_destroy)(sender);
@@ -295,9 +322,12 @@ fn omt_video_loopback() {
     let worker = std::thread::spawn(move || run_capture(receiver, &source));
     let frame = NetworkFrame { pixels: Arc::new([20, 55, 180, 255].repeat(320 * 180)), width: 320, height: 180 };
     let deadline = Instant::now() + Duration::from_secs(8);
-    while input.seq.load(Relaxed) == 0 && Instant::now() < deadline {
-        if sender.subscribed() { sender.submit(frame.clone()); }
+    let packet: crate::audio::Packet = vec![[4800, -4800]; 1920].into();
+    let mut level = 0.0;
+    while (input.seq.load(Relaxed) == 0 || level < 0.1) && Instant::now() < deadline {
+        if sender.subscribed() { sender.submit(frame.clone(), packet.clone()); }
         std::thread::sleep(Duration::from_millis(40));
+        level = crate::audio::input_peak((&input, false, 1.0), Instant::now());
     }
     input.stop.store(true, Relaxed);
     sender.stop();
@@ -305,5 +335,6 @@ fn omt_video_loopback() {
     let frame = input.frame.lock().unwrap();
     let frame = frame.as_ref().unwrap_or_else(|| panic!("receiver: {}, sender: {:?}", input.status.lock().unwrap(), sender.status()));
     assert_eq!((frame.w, frame.h), (320, 180));
+    assert!(level >= 0.1, "OMT stereo audio was not received");
     assert!(frame.rgba[0] > 145 && frame.rgba[2] < 55, "color {:?}", &frame.rgba[..4]);
 }

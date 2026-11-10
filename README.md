@@ -11,7 +11,8 @@ LiveMix is an experimental live video production switcher built in Rust for Wind
 - Switch live sources with Cut, timed transitions, a manual T-bar, GT stingers, and eight overlay channels. Open a larger preview from any input card.
 - Build scenes with picture-in-picture layers, crop, position, and chroma key. Load supported GT Designer `.gtzip` titles, edit text fields, and use template clocks.
 - Check the picture with safe areas, waveform, RGB parade, and vectorscope. The status bar reports the measured project cadence separately from interface repaints.
-- Route Program, Preview, MultiView, or an input to four independent outputs. Use local output windows, NDI, OMT, SRT, or supported DeckLink devices on Windows.
+- Route Program, Preview, MultiView, or an input to four independent outputs. Use local output windows, NDI, OMT, SRT, or supported DeckLink devices.
+- Mix real stereo audio at 48 kHz from microphones, video files, DeckLink, NDI, OMT, and SRT. Monitor Master, A, or B through the system audio output.
 - Record two configurable video outputs, record selected sources with MultiCorder, and stream RTMP/RTMPS through FFmpeg. Save projects as `.vmix` presets for the supported input types.
 
 ## Screenshots
@@ -56,13 +57,17 @@ The macOS CI job packages an ad hoc signed development build as `LiveMix-macOS-a
 | RTMP/RTMPS and SRT | Install FFmpeg or set `LIVEMIX_FFMPEG` to its full path. Verify SRT is listed by `ffmpeg -protocols`. SRT supports Caller and Listener with H.264 or HEVC. |
 | NDI | Install the native NDI runtime for the platform. On macOS, set `LIVEMIX_NDI_DIR` when `libndi.dylib` is outside the standard install locations. |
 | OMT | Provide `libomt.dll` and `libvmx.dll` on Windows, or `libomt.dylib` and `libvmx.dylib` on macOS. Place the pair beside the executable or set `LIVEMIX_OMT_DIR` to their folder. [OMT SDK releases](https://github.com/openmediatransport/libomtnet/releases) |
-| DeckLink | Windows only. Install Blackmagic Desktop Video and use **Blackmagic** in **Add Input** or configure a device under **External Output**. Hardware verification is still needed. |
+| DeckLink | Install Blackmagic Desktop Video. On Windows, LiveMix uses the installed SDK interfaces. On macOS, set `LIVEMIX_DECKLINK_FFMPEG` to an FFmpeg executable built with DeckLink support. Use **Add Input → Blackmagic** for capture and **Settings → External Output** for playback. [FFmpeg DeckLink setup](https://ffmpeg.org/ffmpeg-devices.html#decklink) |
 
 Discover LAN sources under **Add Input → NDI / OMT / Desktop Capture**, or choose **Stream / SRT** for an SRT input. Configure publishing under **Settings → Outputs / NDI / OMT / SRT**. To run local network checks with the runtimes installed, use `cargo test --locked --release loopback -- --ignored` from `app`.
 
+Use **Add Input → Audio Input** for a microphone, audio interface, or the separate audio endpoint of a USB camera. Allow microphone access in the operating system. Embedded sound from video files uses FFmpeg, including on Windows. **Audio Mixer → Monitor** plays the selected bus through the default audio output. It starts off.
+
+Program and MultiView routes use the Master mix. Preview and specific-input routes use the corresponding input audio. MP4 and RTMP/SRT carry stereo AAC, NDI and OMT carry stereo audio, and DeckLink carries embedded PCM. MultiCorder uses the audio of each recorded source.
+
 ## Current limits
 
-LiveMix is in alpha. Audio controls and meters are still experimental. RTMP and SRT send silent AAC, NDI and OMT carry video, and recording is video-only. GT templates and project presets support a subset of their respective features. The Mac port still needs device and network interoperability testing, and its recording formats are limited to H.264 and HEVC MP4. Sustained network frame rates depend on the source, encoder, machine, and receiver.
+LiveMix is in alpha. DeckLink audio and video require testing with physical hardware. On macOS, select the playback connector in Blackmagic Desktop Video Setup. MP4 recording on macOS supports H.264 and HEVC. Windows WMV recording is video-only. GT templates and project presets support a subset of their respective features. Sustained network frame rates depend on the source, encoder, machine, and receiver.
 
 ## Contribute
 

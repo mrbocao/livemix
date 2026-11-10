@@ -116,15 +116,50 @@ pub fn run_capture(shared: Arc<Shared>, config: Connection) {
 }
 
 fn receive_once(shared: &Shared, url: &str) -> Result<(), String> {
+    let audio_socket = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
+    audio_socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let audio_address = audio_socket.local_addr().map_err(|e| e.to_string())?;
+    // A single demuxer keeps SRT video and audio on the same connection. The tee
+    // leaves the video pipe running when a sender has no audio track.
+    let outputs = format!("[select=v:f=image2pipe]pipe:1|[select=a:f=s16le:onfail=ignore]tcp://{audio_address}");
     let mut child = crate::stream::command().args(["-hide_banner", "-loglevel", "error", "-nostdin",
         "-rw_timeout", "5000000", "-analyzeduration", "750000", "-probesize", "262144", "-f", "mpegts", "-i", url,
-        "-map", "0:v:0", "-an", "-threads", "1", "-c:v", "bmp", "-pix_fmt", "bgra", "-f", "image2pipe", "pipe:1"])
+        "-map", "0:v:0", "-map", "0:a:0?", "-threads:v", "1", "-c:v", "bmp", "-pix_fmt", "bgra",
+        "-c:a", "pcm_s16le", "-ac", "2", "-ar", "48000", "-f", "tee", &outputs])
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
         .map_err(|e| format!("Could not start the SRT receiver: {e}"))?;
     let mut pipe = BufReader::new(child.stdout.take().unwrap());
     let child = Mutex::new(child);
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        scope.spawn(|| {
+            use std::io::ErrorKind;
+            let socket = loop {
+                if done.load(Relaxed) || shared.stop.load(Relaxed) { return; }
+                match audio_socket.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => return,
+                }
+            };
+            if socket.set_read_timeout(Some(Duration::from_millis(100))).is_err() { return; }
+            let mut pipe = BufReader::new(socket);
+            let mut block = [0; 480 * 4];
+            let mut filled = 0;
+            while !done.load(Relaxed) && !shared.stop.load(Relaxed) {
+                match pipe.read(&mut block[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
+                    Err(_) => break,
+                }
+                if filled == block.len() {
+                    let samples: Vec<_> = crate::audio::pcm(&block).collect();
+                    shared.audio.lock().unwrap().capture(&samples);
+                    filled = 0;
+                }
+            }
+        });
         scope.spawn(|| {
             while !done.load(Relaxed) && !shared.stop.load(Relaxed) {
                 std::thread::sleep(Duration::from_millis(50));
@@ -191,9 +226,12 @@ fn srt_video_loopback() {
         let output = crate::stream::Output::start_srt(&config, [320, 180], 25.0).unwrap();
         let frame = NetworkFrame { pixels: Arc::new([20, 55, 180, 255].repeat(320 * 180)), width: 320, height: 180 };
         let deadline = Instant::now() + Duration::from_secs(12);
-        while shared.seq.load(Relaxed) == 0 && Instant::now() < deadline && !output.status().1 {
-            output.submit(frame.clone());
+        let packet = crate::audio::test_tone(1920);
+        let mut level = 0.0;
+        while (shared.seq.load(Relaxed) == 0 || level < 0.05) && Instant::now() < deadline && !output.status().1 {
+            output.submit_audio(frame.clone(), packet.clone(), Instant::now());
             std::thread::sleep(Duration::from_millis(40));
+            level = crate::audio::input_peak((&shared, false, 1.0), Instant::now());
         }
         shared.stop.store(true, Relaxed);
         output.stop();
@@ -202,6 +240,7 @@ fn srt_video_loopback() {
         let frame = frame.as_ref().unwrap_or_else(|| panic!("HEVC {hevc}, receiver {}, sender {:?}",
             shared.status.lock().unwrap(), output.status()));
         assert_eq!((frame.w, frame.h), (320, 180));
+        assert!(level >= 0.05, "SRT stereo audio was not received");
         assert!(frame.rgba[0] > 145 && frame.rgba[2] < 55, "color {:?}", &frame.rgba[..4]);
     }
 }

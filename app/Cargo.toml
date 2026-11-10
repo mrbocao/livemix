@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = "1"
+cpal = "0.16"
 eframe = "0.31"
 fontdb = "0.24"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "gif"] }

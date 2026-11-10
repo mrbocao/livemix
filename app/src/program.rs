@@ -34,6 +34,7 @@ struct Readback {
 
 #[derive(Clone, Default)]
 pub struct Destinations {
+    pub audio: crate::audio::Packet,
     pub recorders: Vec<Arc<crate::media::Recorder>>,
     pub decklinks: Vec<crate::decklink::OutputSink>,
     pub streams: Vec<crate::stream::Output>,
@@ -278,22 +279,22 @@ impl Target {
             let pixels = self.copy_readback(std::slice::from_raw_parts(data, len));
             gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
             for sink in &frame.destinations.decklinks {
-                sink.submit(Arc::clone(&pixels), w, h);
+                sink.submit(Arc::clone(&pixels), w, h, frame.destinations.audio.clone());
             }
             let network_frame = NetworkFrame { pixels: Arc::clone(&pixels), width: w, height: h };
             for sink in &frame.destinations.streams {
-                sink.submit(network_frame.clone());
+                sink.submit_audio(network_frame.clone(), frame.destinations.audio.clone(), frame.captured_at);
             }
             for sink in &frame.destinations.ndi {
-                sink.submit_pixels(network_frame.clone(), frame.uyvy);
+                sink.submit_pixels(network_frame.clone(), frame.uyvy, frame.destinations.audio.clone());
             }
             for sink in &frame.destinations.omt {
-                sink.submit(network_frame.clone());
+                sink.submit(network_frame.clone(), frame.destinations.audio.clone());
             }
             if let Some((key, mailbox)) = frame.destinations.scope {
                 *mailbox.lock().unwrap() = Some(ScopeFrame { key, size: frame.size, pixels: Arc::clone(&pixels) });
             }
-            crate::media::Recorder::push_group(&frame.destinations.recorders, pixels, w, h, frame.captured_at, true);
+            crate::media::Recorder::push_group_audio(&frame.destinations.recorders, pixels, w, h, frame.captured_at, true, frame.destinations.audio);
         }
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, previous_pack);
         result

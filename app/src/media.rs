@@ -129,12 +129,17 @@ pub fn blackmagic_driver_installed() -> bool {
 pub fn start(src: Source) -> Arc<Shared> {
     let sh = Arc::new(Shared::default());
     sh.set_status("Starting…");
+    if let Source::File(path) = &src {
+        let (source, path) = (sh.clone(), path.clone());
+        std::thread::spawn(move || crate::audio::play_file(source, path));
+    }
     let s2 = sh.clone();
     std::thread::spawn(move || match src {
         Source::DeckLink(config) => crate::decklink::run_capture(s2, config),
         Source::Ndi(name) => crate::ndi::run_capture(s2, &name),
         Source::Omt(address) => crate::omt::run_capture(s2, &address),
         Source::Srt(config) => crate::srt::run_capture(s2, config),
+        Source::AudioDevice(device) => crate::audio::capture_device(s2, &device),
         Source::Desktop => run_desktop(s2),
         Source::Sequence(folder, fps) => run_pictures(s2, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(s2, folder, false, 0.0, secs),
@@ -415,6 +420,7 @@ fn run(sh: Arc<Shared>, src: Source) {
                 }
             }
             need_open = false;
+            if is_file { crate::audio::reset_position(&sh); }
             t0 = Instant::now();
             base_ts = -1;
             last_frame_ts = None;
@@ -427,6 +433,7 @@ fn run(sh: Arc<Shared>, src: Source) {
                 if let Some(r) = &reader {
                     match unsafe { r.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(ts)) } {
                         Ok(()) => {
+                            crate::audio::reset_position(&sh);
                             seek_to = Some(ts);
                             resume_at = None;
                             base_ts = -1;
@@ -521,6 +528,7 @@ fn run(sh: Arc<Shared>, src: Source) {
                 std::thread::sleep(target - el);
             }
             sh.pos_ms.store((ts / 10_000).max(0) as u64, Ordering::Relaxed);
+            crate::audio::mark_position(&sh, (ts / 10_000).max(0) as u64);
         }
         let (w, h) = (dims.w, dims.h);
         if w == 0 || h == 0 {
@@ -551,7 +559,7 @@ impl RecordFormat {
     }
 }
 
-unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts) -> Res<(IMFSinkWriter, u32)> {
+unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts) -> Res<(IMFSinkWriter, u32, Option<u32>)> {
     let bitrate = opts.mbps.clamp(1, 100) * 1_000_000;
     let mut a: Option<IMFAttributes> = None;
     MFCreateAttributes(&mut a, 1)?;
@@ -580,8 +588,28 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts) -> Res<(IMFSin
     inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par)?;
     inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4)?;
     wr.SetInputMediaType(idx, &inp, None)?;
+    let audio = if opts.format != RecordFormat::Wmv {
+        let make_audio_type = |subtype, bytes_per_second, alignment| -> Res<IMFMediaType> {
+            let ty = MFCreateMediaType()?;
+            ty.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+            ty.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+            ty.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+            ty.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, crate::audio::RATE)?;
+            ty.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+            ty.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_second)?;
+            ty.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, alignment)?;
+            Ok(ty)
+        };
+        let target = make_audio_type(&MFAudioFormat_AAC, 16_000, 1)?;
+        let pcm = make_audio_type(&MFAudioFormat_PCM, crate::audio::RATE * 4, 4)?;
+        let index = wr.AddStream(&target)?;
+        wr.SetInputMediaType(index, &pcm, None)?;
+        Some(index)
+    } else {
+        None
+    };
     wr.BeginWriting()?;
-    Ok((wr, idx))
+    Ok((wr, idx, audio))
 }
 
 unsafe fn encoder_name(writer: &IMFSinkWriter, stream: u32, format: RecordFormat) -> String {
@@ -624,12 +652,13 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
         *err.lock().unwrap() = "Media Foundation not available".into();
         return;
     }
-    let mut writer: Option<(IMFSinkWriter, u32, usize, usize)> = None;
+    let mut writer: Option<(IMFSinkWriter, u32, Option<u32>, usize, usize)> = None;
     let mut first_frame = None;
     let mut last_t: i64 = -1;
+    let mut next_audio_slot = 0;
     let (rn, rd) = rate_fraction(opts.fps);
     let frame_dur = (10_000_000u64 * u64::from(rd) / u64::from(rn.max(1))) as i64;
-    while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, bgra }) = rx.recv() {
+    while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, bgra, audio }) = rx.recv() {
         // Scale the picture to the project's Output Size.
         if let Some((tw, th)) = opts.size {
             let (tw, th) = ((tw as usize & !1).max(2), (th as usize & !1).max(2));
@@ -644,9 +673,9 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
             let w = (fw & !1).max(2);
             let h = (fh & !1).max(2);
             match unsafe { make_writer(&path, w as u32, h as u32, &opts) } {
-                Ok((wr, idx)) => {
+                Ok((wr, idx, audio_idx)) => {
                     *encoder.lock().unwrap() = unsafe { encoder_name(&wr, idx, opts.format) };
-                    writer = Some((wr, idx, w, h));
+                    writer = Some((wr, idx, audio_idx, w, h));
                 }
                 Err(e) => {
                     *err.lock().unwrap() = format!("Could not start {} recording: {}", opts.format.codec(), e.message());
@@ -654,7 +683,7 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 }
             }
         }
-        let Some((wr, idx, w, h)) = writer.as_ref() else { continue };
+        let Some((wr, idx, audio_idx, w, h)) = writer.as_ref() else { continue };
         let (w, h) = (*w, *h);
         let len = w * h * 4;
         let start = *first_frame.get_or_insert(captured_at);
@@ -692,6 +721,28 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 s.SetSampleTime(t)?;
                 s.SetSampleDuration(frame_dur)?;
                 wr.WriteSample(*idx, &s)?;
+                if let Some(index) = *audio_idx {
+                    let slot = ((t + frame_dur / 2) / frame_dur) as u64;
+                    let slot = slot.max(next_audio_slot);
+                    next_audio_slot = slot + 1;
+                    let frame_count = crate::audio::frames_for_slot(slot, rn, rd);
+                    let audio_offset = slot * u64::from(crate::audio::RATE) * u64::from(rd) / u64::from(rn);
+                    let to_hns = |samples| (samples * 10_000_000 / u64::from(crate::audio::RATE)) as i64;
+                    let len = (frame_count * 4) as u32;
+                    let buffer = MFCreateMemoryBuffer(len)?;
+                    let mut ptr = std::ptr::null_mut();
+                    buffer.Lock(&mut ptr, None, None)?;
+                    let bytes = std::slice::from_raw_parts_mut(ptr, len as usize);
+                    crate::audio::write_pcm(bytes, &audio, frame_count)
+                        .map_err(|_| windows::core::Error::from(E_FAIL))?;
+                    buffer.Unlock()?;
+                    buffer.SetCurrentLength(len)?;
+                    let sample = MFCreateSample()?;
+                    sample.AddBuffer(&buffer)?;
+                    sample.SetSampleTime(to_hns(audio_offset))?;
+                    sample.SetSampleDuration(to_hns(audio_offset + frame_count as u64) - to_hns(audio_offset))?;
+                    wr.WriteSample(index, &sample)?;
+                }
                 Ok(())
             })()
         };
@@ -970,6 +1021,7 @@ mod tests {
                     }
                 }
                 let mut frame = RecFrame {
+                    audio: crate::audio::test_tone(1600),
                     pixels: Arc::new(px), w, h, bgra: false,
                     captured_at: first_capture + Duration::from_millis(33 * u64::from(f)),
                 };
@@ -999,6 +1051,9 @@ mod tests {
         let meta = std::fs::metadata(&path).expect("mp4 written");
         println!("mp4 size {}", meta.len());
         assert!(meta.len() > 1000);
+        if crate::stream::command().arg("-version").output().is_ok_and(|output| output.status.success()) {
+            crate::audio::assert_audio_file(std::path::Path::new(&path));
+        }
         let sh = start(Source::File(path.clone()));
         let t = Instant::now();
         while sh.seq.load(Ordering::Relaxed) < 5 && t.elapsed() < Duration::from_secs(10) {

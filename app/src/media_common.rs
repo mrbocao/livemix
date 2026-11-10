@@ -11,6 +11,9 @@ pub struct Frame {
 
 #[derive(Default)]
 pub struct Shared {
+    pub audio: Mutex<crate::audio::Buffer>,
+    pub audio_position: Mutex<Option<(u64, Instant)>>,
+    pub audio_epoch: AtomicU64,
     pub frame: Mutex<Option<Frame>>,
     pub seq: AtomicU64,
     pub status: Mutex<String>,
@@ -95,6 +98,7 @@ pub enum Source {
     Omt(String),
     Srt(crate::srt::Connection),
     File(String),
+    AudioDevice(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
     Sequence(String, f32),
@@ -104,6 +108,7 @@ pub enum Source {
 
 #[derive(Clone)]
 pub(crate) struct RecFrame {
+    pub(crate) audio: crate::audio::Packet,
     pub(crate) pixels: Arc<Vec<u8>>,
     pub(crate) w: usize,
     pub(crate) h: usize,
@@ -144,12 +149,12 @@ impl Recorder {
         let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts));
         (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0) }, worker)
     }
-    pub fn push(&self, rgba: Vec<u8>, w: usize, h: usize) {
-        self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at: Instant::now(), bgra: false });
+    pub fn push_audio(&self, rgba: Vec<u8>, w: usize, h: usize, captured_at: Instant, audio: crate::audio::Packet) {
+        self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at, bgra: false, audio });
     }
 
-    pub fn push_group(recorders: &[Arc<Self>], pixels: impl Into<Arc<Vec<u8>>>, w: usize, h: usize, captured_at: Instant, bgra: bool) {
-        let frame = RecFrame { pixels: pixels.into(), w, h, captured_at, bgra };
+    pub fn push_group_audio(recorders: &[Arc<Self>], pixels: impl Into<Arc<Vec<u8>>>, w: usize, h: usize, captured_at: Instant, bgra: bool, audio: crate::audio::Packet) {
+        let frame = RecFrame { pixels: pixels.into(), w, h, captured_at, bgra, audio };
         for recorder in recorders {
             recorder.enqueue(frame.clone());
         }

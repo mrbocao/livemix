@@ -13,7 +13,7 @@ mod performance;
 mod gt;
 mod preset;
 #[cfg(target_os = "macos")]
-#[path = "decklink_unavailable.rs"]
+#[path = "decklink_macos.rs"]
 mod decklink;
 #[cfg(windows)]
 mod decklink;
@@ -22,6 +22,7 @@ mod stream;
 mod ndi;
 mod omt;
 mod srt;
+mod audio;
 
 use eframe::glow::HasContext;
 use std::sync::{Arc, Mutex};
@@ -160,6 +161,8 @@ struct App {
     performance: performance::Monitor,
     video_clock: performance::VideoClock,
     media: std::collections::HashMap<u32, Feed>,
+    audio_monitor: Option<audio::Monitor>,
+    monitor_bus: u8,
     /// Recording slots 1 and 2 start and stop with Record.
     recordings: [Option<ComposedRecording>; 2],
     multi_outputs: [Option<ComposedRecording>; OUTPUT_COUNT],
@@ -335,6 +338,8 @@ impl App {
             performance: performance::Monitor::new(),
             video_clock: Default::default(),
             media: Default::default(),
+            audio_monitor: None,
+            monitor_bus: 0,
             recordings: Default::default(),
             multi_outputs: Default::default(),
             multi_output_failed: [false; OUTPUT_COUNT],
@@ -423,6 +428,9 @@ impl App {
                 k if k.streamed() => {
                     // Which reader this input needs; a different key restarts the reader.
                     let (src, key, is_file, is_device) = match &inp.kind {
+                        Kind::Device { link, .. } if link.starts_with("audio:") => (
+                            media::Source::AudioDevice(link[6..].to_owned()), link.clone(), false, false,
+                        ),
                         Kind::Device { link, .. } if link.starts_with("ndi:") => (
                             media::Source::Ndi(link[4..].to_owned()), link.clone(), false, true,
                         ),
@@ -530,7 +538,10 @@ impl App {
                                 let p = rec_dir(&mc_dir).join(format!("{}.{}", media::recording_name(&safe_name(&inp.title)), mc_format.extension()));
                                 media::Recorder::start_opts(p.to_string_lossy().to_string(), media::RecOpts { mbps: mc_mbps, size: None, fps: mc_fps, hw: mc_hw, format: mc_format })
                             });
-                            rec.push(rgba, w, h);
+                            let at = Instant::now();
+                            let count = (f64::from(audio::RATE) / f64::from(mc_fps)).ceil() as usize;
+                            let packet = audio::mix([(&*sh, false, 1.0)], at, count);
+                            rec.push_audio(rgba, w, h, at, packet);
                         }
                     }
                     // Preview Skip counts project pictures, even during rapid UI events.
@@ -854,6 +865,51 @@ impl App {
         }
     }
 
+    fn audio_input(&self, input: &Input) -> Option<(&media::Shared, bool, f32)> {
+        let source = self.media.get(&input.id)?.shared.as_deref()?;
+        let file = matches!(input.kind, Kind::VideoFile { .. } | Kind::VideoList { .. });
+        let gain = if input.audio_on { input.volume / 100.0 } else { 0.0 };
+        Some((source, file, gain))
+    }
+
+    fn mix_audio(&self, route: u32, at: Instant, frames: usize) -> audio::Packet {
+        let master = matches!(route, SRC_OUTPUT | SRC_MV1 | SRC_MV2);
+        let selected = match route {
+            SRC_PREVIEW => self.s.preview,
+            _ => route.checked_sub(1),
+        };
+        let gain = if master { self.master_gain() } else { 1.0 };
+        audio::mix(self.s.inputs.iter().filter(|input| {
+            if master { input.bus_m } else { Some(input.id) == selected }
+        }).filter_map(|input| self.audio_input(input))
+            .map(|(source, file, level)| (source, file, level * gain)), at, frames)
+    }
+
+    fn master_gain(&self) -> f32 {
+        let fade = if self.s.ftb_audio { 1.0 - self.s.ftb_level / FULL } else { 1.0 };
+        if self.s.master_on { self.s.master_volume / 100.0 * fade } else { 0.0 }
+    }
+
+    fn update_audio_monitor(&mut self) {
+        let Some(monitor) = &self.audio_monitor else { return };
+        let error = monitor.error.lock().unwrap().take();
+        if let Some(error) = error {
+            self.audio_monitor = None;
+            self.s.notice(&format!("Audio monitor: {error}"));
+            return;
+        }
+        let gain = if self.monitor_bus == 0 { self.master_gain() } else { 1.0 };
+        let sources = self.s.inputs.iter().filter(|input| match self.monitor_bus {
+            1 => input.bus_a,
+            2 => input.bus_b,
+            _ => input.bus_m,
+        }).filter_map(|input| {
+            let (_, file, volume) = self.audio_input(input)?;
+            Some((self.media.get(&input.id)?.shared.clone()?, file, volume * gain))
+        }).collect();
+        *monitor.sources.lock().unwrap() = sources;
+    }
+
     /// Capture the Program when due and record the elapsed time at the end of drawing.
     fn finish_frame(&mut self, ctx: &egui::Context, now: f64, started: Instant) {
         let (available, scopes_available, pending) = {
@@ -924,7 +980,9 @@ impl App {
                 }
             }
             let captured_at = Instant::now();
-            for (route, recorders) in groups {
+            for (route, mut recorders) in groups {
+                let count = (f64::from(audio::RATE) / self.record_format.1).ceil() as usize;
+                recorders.audio = self.mix_audio(route.source, captured_at, count);
                 draw_src(&egui::Painter::new(ctx.clone(), layer, rect), rect, &self.s, now, route.source, route.overlays);
                 let shapes = ctx.graphics_mut(|graphics| {
                     std::mem::take(graphics.entry(layer)).all_entries().cloned().collect()
@@ -1058,7 +1116,10 @@ impl App {
                 self.snap_rx = Some(media::save_picture_dialog(media::snapshot_name("LiveMix Capture "), self.photo_filter));
             }
             if !recorders.is_empty() && w > 0 && h > 0 {
-                media::Recorder::push_group(&recorders, px, w, h, Instant::now(), false);
+                let at = Instant::now();
+                let count = (f64::from(audio::RATE) / self.record_format.1).ceil() as usize;
+                let audio = self.mix_audio(SRC_OUTPUT, at, count);
+                media::Recorder::push_group_audio(&recorders, px, w, h, at, false, audio);
             }
         }
         if check_due {
@@ -1171,7 +1232,7 @@ impl App {
             self.s.add_dialog.devices = decklinks.into_iter().filter(|device| device.capture)
                 .map(|device| DeviceChoice { name: device.name, link: format!("decklink:{}", device.index), blackmagic: true })
                 .chain(media::list_devices()
-                .into_iter()
+                .into_iter().chain(audio::devices())
                 .map(|x| DeviceChoice { name: x.name, link: x.link, blackmagic: x.blackmagic }))
                 .collect();
             self.s.add_dialog.devices_loaded = true;
@@ -1309,8 +1370,24 @@ impl eframe::App for App {
         bottom_bar(ctx, &mut self.s, t);
         monitors(ctx, &mut self.s, picture_time);
         if self.s.show_mixer {
-            mixer_panel(ctx, &mut self.s, t);
+            let at = Instant::now();
+            let levels = self.s.inputs.iter().filter(|input| input.kind.has_audio()).map(|input| {
+                let level = self.audio_input(input).map_or(0.0, |source| audio::input_peak(source, at));
+                (input.id, level)
+            }).collect();
+            let master = audio::peak(&self.mix_audio(SRC_OUTPUT, at, 960));
+            let mut monitor = self.audio_monitor.is_some();
+            mixer_panel(ctx, &mut self.s, &levels, master, &mut monitor, &mut self.monitor_bus);
+            if monitor && self.audio_monitor.is_none() {
+                match audio::Monitor::start() {
+                    Ok(stream) => self.audio_monitor = Some(stream),
+                    Err(error) => self.s.notice(&format!("Audio monitor: {error}")),
+                }
+            } else if !monitor {
+                self.audio_monitor = None;
+            }
         }
+        self.update_audio_monitor();
         inputs_panel(ctx, &mut self.s, picture_time);
         let encoder = if self.recordings.iter().all(Option::is_none) {
             "Start recording to identify the encoder".into()
@@ -2629,23 +2706,33 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
 
 // ---------------------------------------------------------------- mixer
 
-fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
+fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, levels: &std::collections::HashMap<u32, f32>,
+    master: f32, monitor: &mut bool, bus: &mut u8)
+{
     egui::SidePanel::right("mixer")
         .exact_width(330.0)
         .resizable(false)
         .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             ui.label(RichText::new("Audio Mixer").strong().color(Color32::WHITE));
+            ui.horizontal(|ui| {
+                ui.checkbox(monitor, "Monitor").on_hover_text("Listen through the system output. Use headphones when a microphone is live.");
+                egui::ComboBox::from_id_salt("audio-monitor-bus").selected_text(["Master", "A", "B"][usize::from(*bus)])
+                    .show_ui(ui, |ui| {
+                        for (index, label) in ["Master", "A", "B"].into_iter().enumerate() {
+                            ui.selectable_value(bus, index as u8, label);
+                        }
+                    });
+            });
             ui.add_space(2.0);
             egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     // master strip
-                    let master_level = s.master_level(t);
-                    strip(ui, "Master", &mut s.master_volume, &mut s.master_on, master_level, None);
+                    strip(ui, "Master", &mut s.master_volume, &mut s.master_on, master, None);
                     ui.separator();
                     let ids: Vec<u32> = s.inputs.iter().filter(|i| i.kind.has_audio()).map(|i| i.id).collect();
                     for id in ids {
-                        let level = s.input_level(id, t);
+                        let level = levels.get(&id).copied().unwrap_or_default();
                         let num = s.number_of(id);
                         if let Some(i) = s.input_mut(id) {
                             let name = format!("{} {}", num, i.title);
@@ -3302,7 +3389,7 @@ fn srt_output_dialog(ctx: &egui::Context, s: &mut Switcher) {
                     ui.end_row();
                 });
             });
-            ui.label(RichText::new("Progressive video with silent AAC.").size(11.0).color(TEXT_DIM));
+            ui.label(RichText::new("Progressive video with stereo AAC.").size(11.0).color(TEXT_DIM));
             ui.label(&s.srt_status[channel]);
             ui.horizontal(|ui| {
                 if ui.button(if *active { "Stop SRT" } else { "Start SRT" }).clicked() {
@@ -3447,11 +3534,16 @@ fn decklink_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
     }
     if let Some(device) = route.device {
         ui.horizontal(|ui| {
-            ui.label("Connector");
-            decklink_connector(ui, "decklink-output-port", &mut route.port);
+            if cfg!(windows) {
+                ui.label("Connector");
+                decklink_connector(ui, "decklink-output-port", &mut route.port);
+            }
             ui.label("Mode");
             decklink_mode_picker(ui, "decklink-output-mode", device, true, &mut route.mode);
         });
+        if cfg!(target_os = "macos") {
+            ui.label("Set the playback connector in Blackmagic Desktop Video Setup.");
+        }
         if ui.button(if s.decklink_active[channel] { "Stop DeckLink output" } else { "Start DeckLink output" }).clicked() {
             s.toggle_external_route(channel);
         }
@@ -3783,10 +3875,8 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
             ui.label("A live video production switcher.");
             ui.add_space(4.0);
             ui.label(format!("Inputs: {}", s.inputs.len()));
-            #[cfg(windows)]
-            ui.label(format!("Video devices: Media Foundation · Blackmagic driver {}", if media::blackmagic_driver_installed() { "installed" } else { "not found" }));
-            #[cfg(target_os = "macos")]
-            ui.label("Video devices: AVFoundation via FFmpeg");
+            let backend = if cfg!(windows) { "Media Foundation" } else { "AVFoundation" };
+            ui.label(format!("Video devices: {backend} · Blackmagic driver {}", if media::blackmagic_driver_installed() { "available" } else { "not found" }));
         }
         _ => {
             ui.label(RichText::new("This section is unavailable in this build.").color(TEXT_DIM));
@@ -4003,7 +4093,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 ui.checkbox(&mut destination.hardware, stream::HARDWARE_ENCODER_LABEL);
                 ui.end_row();
             }));
-            ui.label(RichText::new("FFmpeg · H.264 with silent AAC (the mixer has no audio signal yet)").size(11.0).color(TEXT_DIM));
+            ui.label(RichText::new("FFmpeg · H.264 with stereo AAC").size(11.0).color(TEXT_DIM));
             ui.label(&s.stream_status[index]);
             ui.horizontal(|ui| {
                 if ui.add_enabled(*active || !destination.url.trim().is_empty(),
@@ -4293,9 +4383,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                             if ui.add_sized([156.0, 19.0], egui::Button::new(label)
                                 .fill(if active { OUTPUT } else { BTN_DARK })).clicked()
                             {
-                                if !s.add_dialog.kind.uses_device() || !k.uses_device() {
-                                    s.add_dialog.device = 0;
-                                }
+                                s.add_dialog.device = 0;
                                 s.add_dialog.kind = k;
                                 if k == AddKind::Desktop { s.add_dialog.ndi_scan = true; }
                                 s.dialog_error.clear();
@@ -4416,7 +4504,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                 ui.add(egui::DragValue::new(&mut s.add_dialog.length).range(1.0..=3600.0));
                             });
                         }
-                        AddKind::Camera | AddKind::Blackmagic => {
+                        AddKind::Camera | AddKind::Blackmagic | AddKind::AudioInput => {
                             let list = s.dialog_devices();
                             if s.add_dialog.kind == AddKind::Blackmagic {
                                 let ok = media::blackmagic_driver_installed();
@@ -4425,6 +4513,9 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                         .size(11.0)
                                         .color(if ok { Color32::from_rgb(0x7c, 0xe0, 0x8a) } else { Color32::from_rgb(0xff, 0xc8, 0x60) }),
                                 );
+                                if cfg!(target_os = "macos") {
+                                    ui.label("DeckLink requires a DeckLink-enabled FFmpeg build (LIVEMIX_DECKLINK_FFMPEG).");
+                                }
                             }
                             ui.horizontal(|ui| {
                                 ui.label("Device");
@@ -4432,8 +4523,8 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                 let sel = list.get(s.add_dialog.device).map(|d| d.name.clone()).unwrap_or_else(|| "— none found —".into());
                                 egui::ComboBox::from_id_salt("device").width(200.0).selected_text(sel).show_ui(ui, |ui| {
                                     for (k, d) in list.iter().enumerate() {
-                                        let label = if decklink::device_index(&d.link).is_some() { format!("{}  (DeckLink SDK)", d.name) }
-                                            else if d.blackmagic { format!("{}  (WDM)", d.name) } else { d.name.clone() };
+                                        let label = if decklink::device_index(&d.link).is_some() { format!("{}  (DeckLink)", d.name) }
+                                            else { d.name.clone() };
                                         ui.selectable_value(&mut s.add_dialog.device, k, label);
                                     }
                                 });

@@ -61,17 +61,35 @@ struct Video {
     timestamp: i64,
 }
 
+#[repr(C)]
+struct Audio {
+    rate: i32,
+    channels: i32,
+    samples: i32,
+    timecode: i64,
+    fourcc: u32,
+    data: *const u8,
+    stride: i32,
+    metadata: *const c_char,
+    timestamp: i64,
+}
+
+const FLTP: u32 = u32::from_le_bytes(*b"FLTp");
+const NDI_PCM_SCALE: f32 = 3276.8; // SMPTE reference, 20 dB of headroom above NDI unity.
+
 struct Api {
     find_create: unsafe extern "C" fn(*const FindSettings) -> Handle,
     find_wait: unsafe extern "C" fn(Handle, u32) -> bool,
     find_sources: unsafe extern "C" fn(Handle, *mut u32) -> *const Source,
     find_destroy: unsafe extern "C" fn(Handle),
     recv_create: unsafe extern "C" fn(*const ReceiveSettings) -> Handle,
-    recv_capture: unsafe extern "C" fn(Handle, *mut Video, Handle, Handle, u32) -> i32,
+    recv_capture: unsafe extern "C" fn(Handle, *mut Video, *mut Audio, Handle, u32) -> i32,
     recv_free: unsafe extern "C" fn(Handle, *const Video),
+    recv_free_audio: unsafe extern "C" fn(Handle, *const Audio),
     recv_destroy: unsafe extern "C" fn(Handle),
     send_create: unsafe extern "C" fn(*const SendSettings) -> Handle,
     send_video: unsafe extern "C" fn(Handle, *const Video),
+    send_audio: unsafe extern "C" fn(Handle, *const Audio),
     connections: unsafe extern "C" fn(Handle, u32) -> i32,
     send_destroy: unsafe extern "C" fn(Handle),
 }
@@ -92,9 +110,11 @@ impl Api {
             recv_create: symbol!("recv_create_v3"),
             recv_capture: symbol!("recv_capture_v3"),
             recv_free: symbol!("recv_free_video_v2"),
+            recv_free_audio: symbol!("recv_free_audio_v3"),
             recv_destroy: symbol!("recv_destroy"),
             send_create: symbol!("send_create"),
             send_video: symbol!("send_send_video_async_v2"),
+            send_audio: symbol!("send_send_audio_v3"),
             connections: symbol!("send_get_no_connections"),
             send_destroy: symbol!("send_destroy"),
         };
@@ -198,10 +218,13 @@ fn receive(shared: &Shared, name: &str) -> Result<(), String> {
         if recv.is_null() { return Err("Could not open NDI source".into()); }
         let mut last_frame = Instant::now();
         let mut receiving = false;
+        let mut audio_phase = 0;
         *shared.status.lock().unwrap() = "Waiting for NDI video…".into();
         while !shared.stop.load(Relaxed) {
             let mut video: Video = std::mem::zeroed();
-            if (api.recv_capture)(recv, &mut video, null_mut(), null_mut(), 100) == 1 {
+            let mut audio: Audio = std::mem::zeroed();
+            let kind = (api.recv_capture)(recv, &mut video, &mut audio, null_mut(), 100);
+            if kind == 1 {
                 if let Some(frame) = unpack(&video) {
                     *shared.size.lock().unwrap() = (frame.w, frame.h);
                     *shared.frame.lock().unwrap() = Some(frame);
@@ -213,6 +236,12 @@ fn receive(shared: &Shared, name: &str) -> Result<(), String> {
                     }
                 }
                 (api.recv_free)(recv, &video);
+            } else if kind == 2 {
+                if audio.fourcc == FLTP {
+                    crate::audio::capture_planar(shared, audio.data, audio.samples as usize, audio.stride as usize,
+                        audio.channels as usize, audio.rate as usize, NDI_PCM_SCALE, &mut audio_phase);
+                }
+                (api.recv_free_audio)(recv, &audio);
             }
             if receiving && last_frame.elapsed() >= Duration::from_secs(3) {
                 *shared.status.lock().unwrap() = "Waiting for NDI signal…".into();
@@ -247,7 +276,7 @@ unsafe fn unpack(video: &Video) -> Option<Frame> {
 
 #[derive(Clone)]
 pub struct Sender {
-    frames: mpsc::SyncSender<(NetworkFrame, bool)>,
+    frames: mpsc::SyncSender<(NetworkFrame, bool, crate::audio::Packet)>,
     stop: Arc<AtomicBool>,
     subscribed: Arc<AtomicBool>,
     status: Arc<Mutex<(String, bool)>>,
@@ -268,8 +297,8 @@ impl Sender {
         Self { frames, stop, subscribed, status }
     }
 
-    pub fn submit_pixels(&self, frame: NetworkFrame, uyvy: bool) {
-        let _ = self.frames.try_send((frame, uyvy));
+    pub fn submit_pixels(&self, frame: NetworkFrame, uyvy: bool, audio: crate::audio::Packet) {
+        let _ = self.frames.try_send((frame, uyvy, audio));
     }
 
     pub fn stop(&self) {
@@ -285,7 +314,7 @@ impl Sender {
     }
 }
 
-fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool)>, stop: &AtomicBool, subscribed: &AtomicBool,
+fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool, crate::audio::Packet)>, stop: &AtomicBool, subscribed: &AtomicBool,
     status: &Mutex<(String, bool)>) -> Result<(), String>
 {
     let api = api()?;
@@ -299,6 +328,7 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool)>, stop
         *status.lock().unwrap() = ("Waiting for NDI receivers…".into(), false);
         let mut last_check = Instant::now() - Duration::from_millis(250);
         let mut outstanding = None;
+        let mut slot = 0;
         while !stop.load(Relaxed) {
             if last_check.elapsed() >= Duration::from_millis(250) {
                 last_check = Instant::now();
@@ -311,7 +341,7 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool)>, stop
                     drop(outstanding.take());
                 }
             }
-            let (frame, uyvy) = match frames.recv_timeout(Duration::from_millis(100)) {
+            let (frame, uyvy, packet) = match frames.recv_timeout(Duration::from_millis(100)) {
                 Ok(frame) => frame,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -326,6 +356,16 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool)>, stop
                 metadata: null(), timestamp: 0,
             };
             (api.send_video)(sender, &video);
+            if !packet.is_empty() {
+                let count = packet.len().min(crate::audio::frames_for_slot(slot, rate_n, rate_d));
+                let planar = crate::audio::planar(&packet[..count], 1.0 / NDI_PCM_SCALE);
+                (api.send_audio)(sender, &Audio {
+                    rate: crate::audio::RATE as i32, channels: 2, samples: count as i32,
+                    timecode: i64::MAX, fourcc: FLTP, data: planar.as_ptr().cast(),
+                    stride: (count * 4) as i32, metadata: null(), timestamp: 0,
+                });
+            }
+            slot += 1;
             // NDI may read the previous frame until this submission returns.
             drop(outstanding.replace(frame));
         }
@@ -349,9 +389,12 @@ fn ndi_video_loopback() {
     let worker = std::thread::spawn(move || run_capture(receiver, &source));
     let frame = NetworkFrame { pixels: Arc::new([20, 55, 180, 255].repeat(320 * 180)), width: 320, height: 180 };
     let deadline = Instant::now() + Duration::from_secs(8);
-    while input.seq.load(Relaxed) == 0 && Instant::now() < deadline {
-        sender.submit_pixels(frame.clone(), false);
+    let packet: crate::audio::Packet = vec![[4800, -4800]; 1920].into();
+    let mut level = 0.0;
+    while (input.seq.load(Relaxed) == 0 || level < 0.1) && Instant::now() < deadline {
+        sender.submit_pixels(frame.clone(), false, packet.clone());
         std::thread::sleep(Duration::from_millis(40));
+        level = crate::audio::input_peak((&input, false, 1.0), Instant::now());
     }
     input.stop.store(true, Relaxed);
     sender.stop();
@@ -359,5 +402,6 @@ fn ndi_video_loopback() {
     let frame = input.frame.lock().unwrap();
     let frame = frame.as_ref().unwrap_or_else(|| panic!("{}", input.status.lock().unwrap()));
     assert_eq!((frame.w, frame.h), (320, 180));
+    assert!(level >= 0.1, "NDI stereo audio was not received");
     assert!(frame.rgba[0] > 160 && frame.rgba[2] < 40, "color {:?}", &frame.rgba[..4]);
 }

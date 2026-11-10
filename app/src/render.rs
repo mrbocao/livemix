@@ -278,7 +278,11 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
                 }
                 _ => {
                     p.rect_filled(r, 0.0, fade(Color32::from_rgb(0x0c, 0x14, 0x26), a));
-                    let msg = if inp.status.is_empty() { "Starting…".to_string() } else { inp.status.clone() };
+                    let msg = if !inp.status.is_empty() { &inp.status } else if matches!(&inp.kind,
+                        Kind::Device { link, .. } if link.starts_with("audio:"))
+                    {
+                        "Audio Input"
+                    } else { "Starting…" };
                     p.text(r.center() - Vec2::new(0.0, h * 0.06), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.08).max(7.0)), fade(Color32::WHITE, a));
                     p.text(r.center() + Vec2::new(0.0, h * 0.06), Align2::CENTER_CENTER, msg, FontId::proportional((h * 0.05).max(6.0)), fade(TEXT_DIM, a));
                 }

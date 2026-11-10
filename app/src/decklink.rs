@@ -40,6 +40,16 @@ const CONFIG_VIDEO_OUTPUT_CONNECTION: u32 = 0x766F_636E; // bmdDeckLinkConfigVid
 
 /// `bmdVideoInputEnableFormatDetection`.
 const VIDEO_INPUT_ENABLE_FORMAT_DETECTION: u32 = 1;
+const AUDIO_DEPTH: u32 = 16;
+const AUDIO_CHANNELS: u32 = 2;
+const AUDIO_TIMESTAMPED: u32 = 2;
+
+#[repr(C)]
+struct AudioPacketVtable {
+    unknown: IUnknown_Vtbl,
+    frame_count: unsafe extern "system" fn(*mut c_void) -> u32,
+    bytes: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+}
 
 /// Connectors, as the original's Input/Output Settings list them.
 pub const CONNECTIONS: [(&str, u32); 7] = [
@@ -585,11 +595,23 @@ impl IDeckLinkInputCallback_Impl for CaptureCallback_Impl {
     unsafe fn VideoInputFrameArrived(
         &self,
         video_frame: *mut c_void,
-        _audio_packet: *mut c_void,
+        audio_packet: *mut c_void,
     ) -> HRESULT {
-        if video_frame.is_null() || self.shared.stop.load(Ordering::Relaxed) {
+        if self.shared.stop.load(Ordering::Relaxed) {
             return S_OK;
         }
+        if !audio_packet.is_null() {
+            let vtable = &**audio_packet.cast::<*const AudioPacketVtable>();
+            let count = (vtable.frame_count)(audio_packet) as usize;
+            let mut bytes = std::ptr::null_mut();
+            if (1..=crate::audio::RATE as usize).contains(&count)
+                && (vtable.bytes)(audio_packet, &mut bytes).is_ok() && !bytes.is_null()
+            {
+                let samples = std::slice::from_raw_parts(bytes.cast::<crate::audio::Stereo>(), count);
+                self.shared.audio.lock().unwrap().capture(samples);
+            }
+        }
+        if video_frame.is_null() { return S_OK; }
         // The frame is only lent to us for the duration of the callback.
         let frame = std::mem::ManuallyDrop::new(IDeckLinkVideoFrame::from_raw(video_frame));
         let width = frame.GetWidth().max(0) as usize;
@@ -716,6 +738,7 @@ pub fn run_capture(shared: Arc<Shared>, config: CaptureConfig) {
                 if let Some(mode) = modes.iter().find(|m| m.mode == mode) {
                     *shared.mode.lock().unwrap() = Some(mode.cam_mode());
                 }
+                let _ = input.EnableAudioInput(crate::audio::RATE, AUDIO_DEPTH, AUDIO_CHANNELS);
                 input.StartStreams().ok().map_err(|e| format!("StartStreams: {e}"))?;
                 *shared.status.lock().unwrap() = "DeckLink: waiting for signal".into();
                 while !shared.stop.load(Ordering::Relaxed) {
@@ -734,6 +757,7 @@ pub fn run_capture(shared: Arc<Shared>, config: CaptureConfig) {
                 Ok(())
             })();
             let _ = input.StopStreams();
+            let _ = input.DisableAudioInput();
             let _ = input.DisableVideoInput();
             let _ = input.SetCallback(std::ptr::null_mut());
             drop(callback);
@@ -764,6 +788,7 @@ struct Latest {
     pixels: Arc<Vec<u8>>,
     w: usize,
     h: usize,
+    audio: crate::audio::Packet,
 }
 
 struct OutputShared {
@@ -799,11 +824,11 @@ impl OutputSink {
     }
 
     /// Hands over the newest composed picture (BGRA rows, as OpenGL read them).
-    pub fn submit(&self, pixels: Arc<Vec<u8>>, w: usize, h: usize) {
+    pub fn submit(&self, pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: crate::audio::Packet) {
         if self.shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        *self.shared.latest.lock().unwrap() = Some(Latest { pixels, w, h });
+        *self.shared.latest.lock().unwrap() = Some(Latest { pixels, w, h, audio });
     }
 
     pub fn stop(&self) {
@@ -853,16 +878,19 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 .map_err(|e| format!("DeckLink EnableVideoOutput ({}): {e}", mode.label()))?;
             let time_scale = mode.fps_n.max(1) as i64;
             let time_value = mode.fps_d.max(1) as i64;
+            let audio_enabled = output.EnableAudioOutput(crate::audio::RATE, AUDIO_DEPTH, AUDIO_CHANNELS, AUDIO_TIMESTAMPED).is_ok();
             shared.error.lock().unwrap().clear();
             let playback = (|| -> Result<(), String> {
                 let mut display_time: i64 = 0;
                 let mut latest: Option<Latest> = None;
                 let mut started = false;
+                let mut audio_time = 0_i64;
+                let mut audio = Vec::new();
                 while !shared.stop.load(Ordering::Relaxed) {
                 if let Some(frame) = shared.latest.lock().unwrap().take() {
                     latest = Some(frame);
                 }
-                let Some(frame) = latest.as_ref() else {
+                let Some(frame) = latest.as_mut() else {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
@@ -911,6 +939,19 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 scheduled
                     .ok()
                     .map_err(|e| format!("DeckLink ScheduleVideoFrame: {e}"))?;
+                if audio_enabled {
+                    let slot = (display_time / time_value) as u64;
+                    let count = crate::audio::frames_for_slot(slot, time_scale as u32, time_value as u32);
+                    let samples = std::mem::take(&mut frame.audio);
+                    audio.clear();
+                    audio.extend(samples.iter().copied().take(count));
+                    audio.resize(count, [0, 0]);
+                    let mut written = 0;
+                    output.ScheduleAudioSamples(audio.as_mut_ptr().cast(), count as u32, audio_time,
+                        i64::from(crate::audio::RATE), &mut written).ok()
+                        .map_err(|e| format!("DeckLink ScheduleAudioSamples: {e}"))?;
+                    audio_time += count as i64;
+                }
                 display_time = display_time.wrapping_add(time_value);
                 if !started && display_time >= 3 * time_value {
                     output.StartScheduledPlayback(0, time_scale, 1.0).ok()
@@ -924,6 +965,7 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 Ok(())
             })();
             let _ = output.StopScheduledPlayback(0, std::ptr::null_mut(), time_scale);
+            if audio_enabled { let _ = output.DisableAudioOutput(); }
             let _ = output.DisableVideoOutput();
             playback
         })();

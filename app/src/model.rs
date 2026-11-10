@@ -132,9 +132,8 @@ impl Kind {
     pub fn playable(&self) -> bool {
         matches!(self, Kind::Video { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::ImageSequence { .. } | Kind::Photos { .. })
     }
-    /// Only the test inputs have (simulated) sound; real audio capture is not built yet.
     pub fn has_audio(&self) -> bool {
-        matches!(self, Kind::Video { .. } | Kind::Camera(_))
+        matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. })
     }
     pub fn transparent(&self) -> bool {
         matches!(self, Kind::Title { .. } | Kind::GtTitle { .. } | Kind::Blank | Kind::ImageFile { .. } | Kind::ImageSequence { .. })
@@ -664,7 +663,6 @@ impl AddKind {
                 | AddKind::VideoDelay
                 | AddKind::PowerPoint
                 | AddKind::AudioFile
-                | AddKind::AudioInput
                 | AddKind::VirtualSet
                 | AddKind::WebBrowser
                 | AddKind::VideoCall
@@ -694,7 +692,7 @@ impl AddKind {
             AddKind::VideoDelay => "A delayed copy of another input — not available in this version.",
             AddKind::PowerPoint => "PowerPoint slides — not available in this version (export the slides as pictures and use Photos).",
             AddKind::AudioFile => "An audio file — not available in this version (audio is not built yet).",
-            AddKind::AudioInput => "A microphone or line input — not available in this version (audio is not built yet).",
+            AddKind::AudioInput => "A microphone, USB audio interface or line input.",
             AddKind::VirtualSet => "Virtual studio sets — not available in this version.",
             AddKind::WebBrowser => "A web page as an input — not available in this version.",
             AddKind::VideoCall => "Remote guests by video call — not available in this version.",
@@ -703,7 +701,7 @@ impl AddKind {
         }
     }
     pub fn uses_device(self) -> bool {
-        matches!(self, AddKind::Camera | AddKind::Blackmagic)
+        matches!(self, AddKind::Camera | AddKind::Blackmagic | AddKind::AudioInput)
     }
     /// Needs a file (Some(true) = video, Some(false) = picture).
     pub fn file_kind(self) -> Option<bool> {
@@ -2012,37 +2010,16 @@ impl Switcher {
         }
     }
 
-    // ------------------------------------------------------------ audio
-
-    pub fn input_level(&self, id: u32, t: f64) -> f32 {
-        let Some(i) = self.input(id) else { return 0.0 };
-        if !i.audio_on || !i.kind.has_audio() || (i.kind.playable() && !i.playing) {
-            return 0.0;
-        }
-        let k = id as f64;
-        let base = 0.55 + 0.3 * (t * 6.1 + k * 1.3).sin() * (t * 1.7 + k).sin() + 0.1 * (t * 23.0 + k * 5.0).sin();
-        let mut l = base as f32 * i.volume / 100.0;
-        if self.ftb_audio {
-            // me::a @0x11ee48: master audio follows the FTB layer level.
-            l *= 1.0 - self.ftb_level / FULL;
-        }
-        l.clamp(0.0, 1.0)
-    }
-
-    pub fn master_level(&self, t: f64) -> f32 {
-        if !self.master_on {
-            return 0.0;
-        }
-        let m = self.inputs.iter().filter(|i| i.bus_m).map(|i| self.input_level(i.id, t)).fold(0.0f32, f32::max);
-        (m * self.master_volume / 100.0 * 1.1).clamp(0.0, 1.0)
-    }
-
     // ------------------------------------------------------------ add input
 
     /// Devices offered for the selected kind (Blackmagic tab shows only Blackmagic devices).
     pub fn dialog_devices(&self) -> Vec<DeviceChoice> {
         let d = &self.add_dialog;
-        d.devices.iter().filter(|x| d.kind != AddKind::Blackmagic || x.blackmagic).cloned().collect()
+        d.devices.iter().filter(|x| match d.kind {
+            AddKind::AudioInput => x.link.starts_with("audio:"),
+            AddKind::Blackmagic => x.blackmagic,
+            _ => !x.link.starts_with("audio:"),
+        }).cloned().collect()
     }
 
     /// Adds the input described by the Add Input dialog. Returns an error to show, if any.
@@ -2053,10 +2030,12 @@ impl Switcher {
         let seed = self.next_id;
         let file_name = std::path::Path::new(d.path.trim()).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let (kind, default_name) = match d.kind {
-            AddKind::Camera | AddKind::Blackmagic => {
+            AddKind::Camera | AddKind::Blackmagic | AddKind::AudioInput => {
                 let Some(dev) = devices.get(d.device) else {
                     return Err(if d.kind == AddKind::Blackmagic {
                         "No Blackmagic device found. Connect it and install Blackmagic Desktop Video, then press Refresh.".into()
+                    } else if d.kind == AddKind::AudioInput {
+                        "No audio input found. Check microphone permissions and connected devices, then press Refresh.".into()
                     } else {
                         "No camera or capture device found. Connect one and press Refresh.".into()
                     });
