@@ -3876,7 +3876,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                         }
                     });
                 });
-                ui.separator();
+                ui.add_space(10.0);
                 ui.vertical(|ui| {
                     ui.set_width(440.0);
                     ui.set_min_height(body_height);
@@ -4084,7 +4084,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                 ui.selectable_value(&mut page, k, label);
                             }
                         });
-                        ui.separator();
+                        ui.add_space(10.0);
                         ui.vertical(|ui| {
                             ui.set_width(460.0);
                             ui.label(RichText::new(INPUT_PAGES[page]).strong().size(15.0).color(Color32::WHITE));
