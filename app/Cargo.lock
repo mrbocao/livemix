@@ -1782,6 +1782,8 @@ dependencies = [
  "eframe",
  "fontdb",
  "image",
+ "libc",
+ "libloading",
  "roxmltree 0.21.2",
  "serde",
  "serde_json",

@@ -1,7 +1,6 @@
 //! Blackmagic DeckLink capture and playback, through the DeckLink COM API directly.
 //!
-//! The original vMix talks to DeckLink through DirectShow filters. LiveMix instead uses the
-//! DeckLink SDK interfaces (as current Desktop Video installs them): `IDeckLinkIterator`,
+//! LiveMix uses the DeckLink SDK interfaces (as current Desktop Video installs them): `IDeckLinkIterator`,
 //! `IDeckLinkInput` for capture and `IDeckLinkOutput` for playback. The interface GUIDs and
 //! vtable orders below were read from the type library of `DeckLinkAPI64.dll`.
 //!

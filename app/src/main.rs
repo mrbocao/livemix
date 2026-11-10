@@ -1,13 +1,21 @@
-// LiveMix — a live video production switcher (own rebuild).
-// Rules and numbers come from MECHANICS.md / mechanics.json.
+// LiveMix — a live video production switcher.
 
 mod model;
 mod render;
+mod media_common;
+#[cfg(target_os = "macos")]
+#[path = "media_macos.rs"]
+mod media;
+#[cfg(windows)]
 mod media;
 mod program;
 mod performance;
 mod gt;
 mod preset;
+#[cfg(target_os = "macos")]
+#[path = "decklink_unavailable.rs"]
+mod decklink;
+#[cfg(windows)]
 mod decklink;
 mod scopes;
 mod stream;
@@ -1186,7 +1194,7 @@ enum ShortcutFn {
 }
 
 /// The original's "Default Keyboard" shortcut template
-/// (shortcuts\templates\Default Keyboard.vMixShortcutTemplate, 36 shortcuts).
+/// The default keyboard layout contains 36 shortcuts.
 fn default_keyboard() -> Vec<(egui::Key, ShortcutFn)> {
     use egui::Key::*;
     use ShortcutFn::*;
@@ -1371,7 +1379,7 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher) {
                 if bar_btn(ui, "New", s.new_step != NewStep::Idle).on_hover_text("Start a new blank preset with a video format you choose").clicked() {
                     s.press_new();
                 }
-                if bar_btn(ui, "Open", false).on_hover_text("Choose a vMix preset file").clicked() {
+                if bar_btn(ui, "Open", false).on_hover_text("Choose a project preset").clicked() {
                     if s.outputs_busy() {
                         s.notice(STOP_OUTPUTS_MSG);
                     } else {
@@ -3062,7 +3070,7 @@ fn input_colour_key(ui: &mut egui::Ui, inp: &mut Input) {
     ui.horizontal(|ui| {
         ui.label("Tolerance");
         ui.add(egui::Slider::new(&mut inp.key.tolerance, 5..=150));
-        if ui.small_button("Reset").on_hover_text("Reset like the original (frmInputSettings::zo)").clicked() {
+        if ui.small_button("Reset").on_hover_text("Restore the default colour key settings").clicked() {
             inp.key = Key::default();
         }
     });
@@ -3290,7 +3298,7 @@ fn srt_output_dialog(ctx: &egui::Context, s: &mut Switcher) {
                     ui.add(egui::DragValue::new(&mut cfg.gop_seconds).range(1..=10).suffix(" s"));
                     ui.end_row();
                     ui.label("Encoder");
-                    ui.checkbox(&mut cfg.hardware, "Use NVIDIA NVENC when available");
+                    ui.checkbox(&mut cfg.hardware, stream::HARDWARE_ENCODER_LABEL);
                     ui.end_row();
                 });
             });
@@ -3743,7 +3751,7 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
         }
         11 => {
             // Shortcuts
-            ui.label("Keyboard shortcuts (the original's \"Default Keyboard\" template):");
+            ui.label("Default keyboard shortcuts");
             egui::Grid::new("set-shortcuts").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
                 for (k, f) in [
                     ("Q W E R T Y U I O P", "Input 1–10 to Preview"),
@@ -3775,10 +3783,13 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
             ui.label("A live video production switcher.");
             ui.add_space(4.0);
             ui.label(format!("Inputs: {}", s.inputs.len()));
+            #[cfg(windows)]
             ui.label(format!("Video devices: Media Foundation · Blackmagic driver {}", if media::blackmagic_driver_installed() { "installed" } else { "not found" }));
+            #[cfg(target_os = "macos")]
+            ui.label("Video devices: AVFoundation via FFmpeg");
         }
         _ => {
-            ui.label(RichText::new("This section of the original is not available in this version yet.").color(TEXT_DIM));
+            ui.label(RichText::new("This section is unavailable in this build.").color(TEXT_DIM));
         }
     }
 }
@@ -3810,11 +3821,11 @@ fn new_file_every(ui: &mut egui::Ui, id: &str, v: &mut u32) -> bool {
 fn recording_format_tabs(ui: &mut egui::Ui, format: &mut media::RecordFormat, multi: bool) -> bool {
     use media::RecordFormat::{H264, Hevc, Wmv};
     let tabs: &[(&str, Option<media::RecordFormat>)] = if multi {
-        &[("AVI", None), ("vMix AVI", None), ("MKV", None), ("MP4", Some(H264)),
-          ("FFMPEG", None), ("MPEG-2 TS", None), ("WMV", Some(Wmv))]
+        &[("AVI", None), ("VMX AVI", None), ("MKV", None), ("MP4", Some(H264)),
+          ("FFMPEG", None), ("MPEG-2 TS", None), ("WMV", cfg!(windows).then_some(Wmv))]
     } else {
-        &[("AVI", None), ("MPEG-2", None), ("WMV", Some(Wmv)), ("WMV Streaming", None),
-          ("MP4", Some(H264)), ("FFMPEG", None), ("vMix AVI", None)]
+        &[("AVI", None), ("MPEG-2", None), ("WMV", cfg!(windows).then_some(Wmv)), ("WMV Streaming", None),
+          ("MP4", Some(H264)), ("FFMPEG", None), ("VMX AVI", None)]
     };
     let before = *format;
     ui.horizontal_wrapped(|ui| {
@@ -3989,7 +4000,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                     });
                 ui.end_row();
                 ui.label("Encoder");
-                ui.checkbox(&mut destination.hardware, "Use NVIDIA NVENC when available");
+                ui.checkbox(&mut destination.hardware, stream::HARDWARE_ENCODER_LABEL);
                 ui.end_row();
             }));
             ui.label(RichText::new("FFmpeg · H.264 with silent AAC (the mixer has no audio signal yet)").size(11.0).color(TEXT_DIM));

@@ -2,15 +2,22 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use windows::core::{w, GUID};
+#[cfg(windows)]
 use windows::Win32::Devices::DeviceAndDriverInstallation::*;
+#[cfg(windows)]
 use windows::Win32::Devices::Properties::{DEVPROPKEY, DEVPROPTYPE, DEVPROP_TYPE_UINT32};
+#[cfg(windows)]
 use windows::Win32::Foundation::{ERROR_SUCCESS, FILETIME};
+#[cfg(windows)]
 use windows::Win32::System::Registry::{RegCloseKey, RegGetValueW, KEY_QUERY_VALUE, RRF_RT_REG_QWORD};
+#[cfg(windows)]
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes};
 
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_TRANSFER_BUDGET: u64 = 250 * MIB;
+#[cfg(windows)]
 const LARGE_BAR_FALLBACK: u64 = 1000 * MIB;
 
 #[derive(Default)]
@@ -109,10 +116,14 @@ impl Monitor {
         }
     }
 
+    #[cfg(windows)]
     pub fn set_adapter(&mut self, renderer: &str) {
         self.status.transfer_budget = unsafe { adapter_budget(renderer) }
             .unwrap_or(DEFAULT_TRANSFER_BUDGET);
     }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_adapter(&mut self, _renderer: &str) {}
 
     pub fn update(&mut self, now: Instant, transfer_bytes: impl FnOnce() -> u64) {
         let elapsed = now.duration_since(self.sampled_at);
@@ -126,7 +137,7 @@ impl Monitor {
             .map(|ms| (ms as f64 * 0.1 / seconds / self.logical_processors).round_ties_even() as u32);
         self.status.total_cpu = current.system.zip(self.previous.system)
             .and_then(|(next, prev)| system_percent(next, prev))
-            // The vMix status formatter scales the rounded system sample by the timer interval.
+            // The status formatter scales the rounded system sample by the timer interval.
             .map(|percent| (percent / seconds).round_ties_even() as u32);
         let peak = self.render_peak.swap(0, Relaxed);
         self.status.render_ms = (peak != 0).then_some(peak / 1000);
@@ -144,6 +155,7 @@ struct CpuTimes {
 }
 
 impl CpuTimes {
+    #[cfg(windows)]
     fn read() -> Self {
         let (mut creation, mut exit, mut kernel, mut user, mut idle) = Default::default();
         unsafe {
@@ -154,8 +166,21 @@ impl CpuTimes {
             Self { process, system }
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn read() -> Self {
+        let process = unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            (libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0).then(|| {
+                let millis = |time: libc::timeval| time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
+                millis(usage.ru_utime) + millis(usage.ru_stime)
+            })
+        };
+        Self { process, system: None }
+    }
 }
 
+#[cfg(windows)]
 fn ticks(time: FILETIME) -> u64 {
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
@@ -169,8 +194,9 @@ fn system_percent(next: [u64; 3], prev: [u64; 3]) -> Option<f64> {
     (total > 0).then(|| (100.0 * busy as f64 / total as f64).round_ties_even())
 }
 
-// Match the active GL adapter to a display device. As in vMix, use driver
+// Match the active GL adapter to a display device. Use driver
 // memory only when the PCI property reports a 64-bit prefetchable memory BAR.
+#[cfg(windows)]
 unsafe fn adapter_budget(renderer: &str) -> Option<u64> {
     const BAR_TYPES: DEVPROPKEY = DEVPROPKEY {
         fmtid: GUID::from_u128(0x3ab22e31_8264_4b4e_9af5_a8d2d8e33e62),
@@ -208,6 +234,7 @@ unsafe fn adapter_budget(renderer: &str) -> Option<u64> {
     budget
 }
 
+#[cfg(windows)]
 unsafe fn driver_memory(devices: HDEVINFO, device: &SP_DEVINFO_DATA) -> Option<u64> {
     let key = SetupDiOpenDevRegKey(devices, device, DICS_FLAG_GLOBAL.0, 0, DIREG_DRV, KEY_QUERY_VALUE.0).ok()?;
     let mut bytes = 0u64;

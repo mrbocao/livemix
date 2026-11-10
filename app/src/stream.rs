@@ -1,5 +1,6 @@
 use crate::program::NetworkFrame;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -31,6 +32,11 @@ impl std::fmt::Debug for Destination {
 }
 
 pub const COUNT: usize = 3;
+pub const HARDWARE_ENCODER_LABEL: &str = if cfg!(target_os = "macos") {
+    "Use Apple VideoToolbox when available"
+} else {
+    "Use NVIDIA NVENC when available"
+};
 
 #[derive(Clone)]
 pub struct Output {
@@ -59,17 +65,20 @@ fn publish_url(dest: &Destination) -> Result<String, String> {
 }
 
 pub(crate) fn command() -> Command {
+    let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     let ffmpeg = std::env::var_os("LIVEMIX_FFMPEG").map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok().map(|p| p.with_file_name("ffmpeg.exe")).filter(|p| p.is_file()))
-        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-            .map(|p| p.join("LiveMix/dependencies/ffmpeg/ffmpeg.exe")).filter(|p| p.is_file()))
-        .or_else(|| std::env::var_os("PATH").into_iter().flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-            .map(|p| p.join("ffmpeg.exe")).find(|p| p.is_file()))
-        .or_else(|| std::env::var_os("ProgramFiles(x86)").map(PathBuf::from)
-            .map(|p| p.join("vMix/streaming/ffmpeg6.exe")).filter(|p| p.is_file()))
-        .unwrap_or_else(|| PathBuf::from("ffmpeg.exe"));
+        .or_else(|| std::env::current_exe().ok().map(|p| p.with_file_name(exe)).filter(|p| p.is_file()))
+        .or_else(|| ["LOCALAPPDATA", "HOME"].into_iter().filter_map(std::env::var_os)
+            .map(PathBuf::from).flat_map(|p| [p.join("LiveMix/dependencies/ffmpeg"), p.join("Library/Application Support/LiveMix/bin")])
+            .map(|p| p.join(exe)).find(|p| p.is_file()))
+        .or_else(|| ["/opt/homebrew/bin", "/usr/local/bin"].into_iter().filter(|_| cfg!(target_os = "macos"))
+            .map(|p| PathBuf::from(p).join(exe)).find(|p| p.is_file()))
+        .unwrap_or_else(|| PathBuf::from(exe));
     let mut command = Command::new(ffmpeg);
+    #[cfg(windows)]
     command.creation_flags(0x08000000);
+    #[cfg(target_os = "macos")]
+    command.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default()));
     command
 }
 
@@ -143,8 +152,13 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encodin
     let (n, d) = crate::media::rate_fraction(fps as f32);
     let srt = encoding.muxer == "mpegts";
     if srt { crate::srt::check_ffmpeg()?; }
-    let (gpu, cpu) = if encoding.hevc { ("hevc_nvenc", "libx265") } else { ("h264_nvenc", "libx264") };
-    let encoder = if encoding.hardware && nvenc_available(gpu) { gpu } else { cpu };
+    let (gpu, cpu) = match (cfg!(target_os = "macos"), encoding.hevc) {
+        (true, true) => ("hevc_videotoolbox", "libx265"),
+        (true, false) => ("h264_videotoolbox", "libx264"),
+        (false, true) => ("hevc_nvenc", "libx265"),
+        (false, false) => ("h264_nvenc", "libx264"),
+    };
+    let encoder = if encoding.hardware && hardware_encoder_available(gpu) { gpu } else { cpu };
     let bitrate = format!("{}k", encoding.kbps.clamp(100, 100_000));
     let mut state_lock = state.lock().unwrap();
     if state_lock.stop { return Ok(()); }
@@ -206,7 +220,7 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encodin
     }
 }
 
-fn nvenc_available(encoder: &str) -> bool {
+fn hardware_encoder_available(encoder: &str) -> bool {
     command().args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=size=128x128:rate=30",
         "-frames:v", "1", "-c:v", encoder, "-f", "null", "-"])
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())

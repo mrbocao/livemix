@@ -1,5 +1,6 @@
 /app/target/
 /app/shots/
+/app/dist/
 
 # Local investigation and workspace artifacts
 /app/tools/

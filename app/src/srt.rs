@@ -150,7 +150,7 @@ fn receive_once(shared: &Shared, url: &str) -> Result<(), String> {
 }
 
 // Image2pipe preserves the dimensions of each frame, including changes after reconnect.
-fn read_frame(pipe: &mut impl Read) -> Option<Frame> {
+pub(crate) fn read_frame(pipe: &mut impl Read) -> Option<Frame> {
     let mut header = [0; 26];
     pipe.read_exact(&mut header).ok()?;
     if &header[..2] != b"BM" { return None; }

@@ -6,8 +6,11 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows::core::{HSTRING, PCSTR};
-use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+#[cfg(windows)]
+use windows::Win32::Foundation::FreeLibrary;
+#[cfg(windows)]
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 type Handle = *mut c_void;
@@ -74,11 +77,11 @@ struct Api {
 }
 
 impl Api {
-    unsafe fn load(module: HMODULE) -> Option<Self> {
+    unsafe fn load(symbol: impl Fn(&[u8]) -> Option<*const ()>) -> Option<Self> {
         macro_rules! symbol {
             ($name:literal) => {{
                 let name = concat!("NDIlib_", $name, "\0");
-                std::mem::transmute(GetProcAddress(module, PCSTR(name.as_ptr()))?)
+                std::mem::transmute(symbol(name.as_bytes())?)
             }};
         }
         let api = Self {
@@ -100,6 +103,7 @@ impl Api {
     }
 }
 
+#[cfg(windows)]
 fn api() -> Result<&'static Api, String> {
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| {
@@ -111,13 +115,10 @@ fn api() -> Result<&'static Api, String> {
                 candidates.push(programs.join(dir).join(dll));
             }
         }
-        if let Some(programs) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
-            candidates.push(programs.join("vMix/ndi/Processing.NDI.Lib.dll"));
-        }
         for path in candidates.into_iter().filter(|p| p.is_absolute() && p.is_file()) {
             unsafe {
                 if let Ok(module) = LoadLibraryW(&HSTRING::from(path.as_os_str())) {
-                    if let Some(api) = Api::load(module) {
+                    if let Some(api) = Api::load(|name| GetProcAddress(module, PCSTR(name.as_ptr())).map(|p| p as *const ())) {
                         // Keep the runtime loaded for the lifetime of the process.
                         return Some(api);
                     }
@@ -127,6 +128,27 @@ fn api() -> Result<&'static Api, String> {
         }
         None
     }).as_ref().ok_or_else(|| "NDI runtime unavailable. Install the 64-bit NDI Runtime or NDI Tools and restart LiveMix.".into())
+}
+
+#[cfg(target_os = "macos")]
+fn api() -> Result<&'static Api, String> {
+    static API: OnceLock<Option<Api>> = OnceLock::new();
+    API.get_or_init(|| {
+        let mut paths: Vec<_> = ["LIVEMIX_NDI_DIR", "NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5"].into_iter()
+            .filter_map(std::env::var_os).map(PathBuf::from).collect();
+        paths.extend(["/usr/local/lib", "/opt/homebrew/lib", "/Library/NDI SDK for Apple/lib/macOS"].into_iter().map(PathBuf::from));
+        for dir in paths.into_iter().filter(|path| path.is_absolute()) {
+            unsafe {
+                if let Ok(library) = libloading::Library::new(dir.join("libndi.dylib")) {
+                    if let Some(api) = Api::load(|name| library.get::<unsafe extern "C" fn()>(name).ok().map(|p| *p as *const ())) {
+                        std::mem::forget(library);
+                        return Some(api);
+                    }
+                }
+            }
+        }
+        None
+    }).as_ref().ok_or_else(|| "NDI runtime unavailable. Install the Mac runtime or set LIVEMIX_NDI_DIR.".into())
 }
 
 pub fn discover() -> Result<Vec<String>, String> {

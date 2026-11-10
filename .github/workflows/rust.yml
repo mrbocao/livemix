@@ -28,3 +28,38 @@ jobs:
     - name: Run tests
       # These two tests require an interactive desktop or a physical camera.
       run: cargo test --locked --release -- --skip desktop_capture_delivers_frames --skip first_camera_delivers_frames
+
+  macos:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Select Apple Silicon toolchain
+      run: rustup default stable-aarch64-apple-darwin
+    - name: Build and test
+      run: |
+        cargo build --locked --release
+        cargo test --locked --release
+    - name: Test FFmpeg video recording and playback
+      run: |
+        command -v ffmpeg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg
+        cargo test --locked --release ffmpeg_video_roundtrip -- --ignored
+    - name: Package LiveMix.app
+      run: |
+        mkdir -p dist/LiveMix.app/Contents/MacOS
+        cp packaging/macos/Info.plist dist/LiveMix.app/Contents/Info.plist
+        install -m 755 target/release/livemix dist/LiveMix.app/Contents/MacOS/livemix
+        plutil -lint dist/LiveMix.app/Contents/Info.plist
+        lipo -verify_arch arm64 dist/LiveMix.app/Contents/MacOS/livemix
+        codesign --force --sign - dist/LiveMix.app
+        codesign --verify --strict dist/LiveMix.app
+        ditto -c -k --keepParent dist/LiveMix.app dist/LiveMix-macOS-arm64.zip
+    - uses: actions/upload-artifact@v4
+      with:
+        name: LiveMix-macOS-arm64
+        path: app/dist/LiveMix-macOS-arm64.zip

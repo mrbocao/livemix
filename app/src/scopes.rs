@@ -1,4 +1,4 @@
-//! Scope sampling and graticules based on the vMix 28 he shaders (0x060012c1).
+//! Waveform, RGB parade and vectorscope sampling and graticules.
 
 use crate::model::{SCOPE_PARADE, SCOPE_RGB, SCOPE_VECTOR};
 use crate::program::{ScopeFrame, ScopeKey};

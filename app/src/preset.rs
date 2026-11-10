@@ -1,5 +1,4 @@
-//! vMix 28 preset interchange. The XML and Input layout come from sr::zj / sr::zf
-//! (0x06004685 / 0x06004681) and presets saved by vMix 28.0.0.42.
+//! Version 9 XML project preset interchange.
 
 use crate::model::*;
 use crate::media::RecordFormat;
@@ -38,9 +37,23 @@ fn tf(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
 
+#[cfg(windows)]
 fn guid() -> Result<String, String> {
     unsafe { windows::Win32::System::Com::CoCreateGuid() }
         .map(|id| format!("{id:?}")).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn guid() -> Result<String, String> {
+    extern "C" { fn uuid_generate_random(bytes: *mut u8); }
+    let mut bytes = [0_u8; 16];
+    unsafe { uuid_generate_random(bytes.as_mut_ptr()) };
+    let mut id = String::with_capacity(36);
+    for (i, byte) in bytes.into_iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) { id.push('-'); }
+        write!(id, "{byte:02x}").unwrap();
+    }
+    Ok(id)
 }
 
 pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -157,7 +170,7 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
     }
     out.push_str("  </OutputFormat>\n");
 
-    // vMix ignores comments. Preserve LiveMix settings with no vMix equivalent.
+    // Preserve LiveMix settings that have no equivalent in the XML schema.
     let mut local = s.preset_text();
     let route_code = |source: u32| {
         if matches!(source, SRC_OUTPUT | SRC_PREVIEW | SRC_MV1 | SRC_MV2) { source }
@@ -213,7 +226,7 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
     let doc = roxmltree::Document::parse(text).map_err(|error| error.to_string())?;
     let root = doc.root_element();
     if !root.has_tag_name("XML") || child(root, "Version").and_then(|n| n.text()).and_then(|v| v.parse::<u32>().ok()).is_none() {
-        return Err("Expected a vMix preset (XML with a Version element).".into());
+        return Err("Expected a project preset in XML with a Version element.".into());
     }
     let local = root.children().filter(Node::is_comment)
         .filter_map(|n| n.text()).find_map(|s| s.strip_prefix(LOCAL))
@@ -383,16 +396,17 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    #[ignore = "uses a preset and title from the locally installed vMix 28"]
-    fn installed_vmix_interchange() {
+    #[ignore = "requires externally supplied preset and GT title fixtures"]
+    fn preset_and_title_fixtures() {
         let dir = std::env::temp_dir();
-        let path = dir.join("livemix-reference-v28.vmix");
+        let path = PathBuf::from(std::env::var_os("LIVEMIX_PRESET_FIXTURE").expect("Set LIVEMIX_PRESET_FIXTURE"));
+        let installed = PathBuf::from(std::env::var_os("LIVEMIX_GT_FIXTURES").expect("Set LIVEMIX_GT_FIXTURES"));
         let mut s = Switcher::empty();
         decode(&mut s, &path, &fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(s.inputs.len(), 2);
-        let path = r"C:\Program Files (x86)\vMix\titles\GT Title\Spinner 180.gtzip";
+        let path = installed.join("GT Title/Spinner 180.gtzip");
         let mut title = Input::new(0, "Spinner 180", Kind::GtTitle {
-            path: path.into(), texts: Default::default(), document: None,
+            path: path.to_string_lossy().into_owned(), texts: Default::default(), document: None,
         });
         title.reload_gt().unwrap();
         let Kind::GtTitle { document: Some(document), .. } = &title.kind else { unreachable!() };
@@ -412,12 +426,11 @@ mod tests {
             }).unwrap()
         };
         assert_ne!(points_at(0.0), points_at(2.0));
-        let installed = Path::new(r"C:\Program Files (x86)\vMix\titles");
         for name in [
-            r"GT Stingers\Stinger 2- Havin a blinder Blue.gtzip",
-            r"GT Social\Social 1- Kimono.gtzip",
-            r"GT ScoreBoard\Scoreboard 13- The Extreme.gtzip",
-            r"GT ScoreBoard\Scoreboard 3- Lineup 12.gtzip",
+            "GT Stingers/Stinger 2- Havin a blinder Blue.gtzip",
+            "GT Social/Social 1- Kimono.gtzip",
+            "GT ScoreBoard/Scoreboard 13- The Extreme.gtzip",
+            "GT ScoreBoard/Scoreboard 3- Lineup 12.gtzip",
         ] {
             let document = crate::gt::Document::load(&installed.join(name)).unwrap();
             assert!(document.unsupported.is_empty(), "{name}: {:?}", document.unsupported);
@@ -460,7 +473,9 @@ mod tests {
     #[test]
     fn native_preset_and_live_mix_round_trip() {
         let mut s = Switcher::empty();
-        let path = Path::new(r"C:\Presets\test.vmix");
+        let folder = std::env::temp_dir();
+        let preset = folder.join("test.vmix");
+        let path = preset.as_path();
         let xml = r#"<XML><Version>9</Version>
           <Input Type="100" OriginalTitle="Blank" />
           <Input Type="0" Title="Vídeo &amp; som" Loop="True">clip.mp4</Input>
@@ -473,7 +488,7 @@ mod tests {
         assert_eq!(s.output, Some(s.inputs[0].id));
         assert_eq!(s.preview, Some(s.inputs[1].id));
         assert_eq!(s.inputs[1].title, "Vídeo & som");
-        assert!(matches!(&s.inputs[1].kind, Kind::VideoFile { path } if path == r"C:\Presets\clip.mp4"));
+        assert!(matches!(&s.inputs[1].kind, Kind::VideoFile { path } if Path::new(path) == folder.join("clip.mp4")));
         let id = s.inputs[0].id;
         s.remove_input(id);
         s.cfg.outputs[1].source = s.inputs[0].id + 1;

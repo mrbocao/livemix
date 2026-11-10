@@ -389,7 +389,7 @@ pub const NEW_PRESET_RATES: [(&str, u8, bool); 6] = [
     ("59.94i", 6, true),
 ];
 
-/// Safe area menu of the Preview: names and vMix.SafeAreasType values, in the original's menu
+/// Safe area menu of the Preview: names and SafeAreasType values, in the original's menu
 /// order (kzzzzzj::b @0xf68ec builds the menu; kzzzzzj::d @0xf6d78 draws each type).
 pub const SAFE_AREAS: [(&str, u16); 12] = [
     ("None", 0),
@@ -879,7 +879,7 @@ impl Default for OutputRoute {
     }
 }
 
-/// The original's enum vMix.MultiViewLayout (token 0x0200105c), in its order:
+/// The original's enum MultiViewLayout (token 0x0200105c), in its order:
 /// Pro (= 0, the config default), Standard, Quad, Sixteen, One.
 pub const MV_LAYOUTS: [&str; 5] = ["Pro", "Standard", "Quad", "Sixteen", "One"];
 
@@ -1088,7 +1088,7 @@ pub struct Settings {
     pub no_input_effects: bool,
     pub hw_encoder: bool,
     pub auto_cam_max_h: u32,
-    /// Preview monitor tools: safe area type (vMix.SafeAreasType value, 0 = None — see
+    /// Preview monitor tools: safe area type (SafeAreasType value, 0 = None — see
     /// SAFE_AREAS) and Waveform Monitor choice (value from WAVEFORMS, 0 = None), with the
     /// "Vectorscope 2X Zoom" switch.
     pub safe_type: u16,
@@ -2736,7 +2736,7 @@ mod tests {
     fn playlist_skips_unticked_inputs_and_loops() {
         let mut s = Switcher::demo();
         let ids: Vec<u32> = s.inputs.iter().map(|i| i.id).collect();
-        // The original's PlayList starts with Loop off, 5 s per still input (vMix.PlayList /
+        // The original's PlayList starts with Loop off, 5 s per still input (PlayList /
         // PlaylistItem constructors).
         assert!(!Settings::default().playlist_loop);
         assert_eq!(s.playlist_secs, PLAYLIST_DEFAULT_SECS);

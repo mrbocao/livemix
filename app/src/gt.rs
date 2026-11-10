@@ -1,8 +1,6 @@
 //! Native reader and compositor for GT Designer packages.
 //!
-//! vMix opens the composition in mm::l (0x06002acf) and renders to a shared
-//! Direct3D surface in mm::Render (0x06002ad1). LiveMix reads the package directly
-//! and draws it through its own compositor.
+//! The reader draws the package through the LiveMix compositor.
 
 use eframe::egui::{self, Color32, Painter, Pos2, Rect, Stroke, Vec2};
 use roxmltree::Node;
@@ -520,10 +518,7 @@ impl Document {
                 ObjectKind::Text(text) => {
                     let value = texts.get(&obj.name).unwrap_or(&text.value);
                     let clock = value.starts_with("{0:").then(|| {
-                        let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-                        let ms = ((u32::from(now.wHour) * 60 + u32::from(now.wMinute)) * 60
-                            + u32::from(now.wSecond)) * 1000 + u32::from(now.wMilliseconds);
-                        clock_text(value, ms)
+                        clock_text(value, crate::media::local_clock_ms())
                     }).flatten();
                     let value = clock.as_deref().unwrap_or(value);
                     draw_text(&p, view, text, value, view.bounds.height() / obj.size.y);

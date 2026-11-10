@@ -5,8 +5,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows::core::{HSTRING, PCSTR};
-use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+#[cfg(windows)]
+use windows::Win32::Foundation::FreeLibrary;
+#[cfg(windows)]
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW,
     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR};
 
@@ -52,11 +55,11 @@ struct Api {
 }
 
 impl Api {
-    unsafe fn load(module: HMODULE) -> Option<Self> {
+    unsafe fn load(symbol: impl Fn(&[u8]) -> Option<*const ()>) -> Option<Self> {
         macro_rules! symbol {
             ($name:literal) => {{
                 let name = concat!("omt_", $name, "\0");
-                std::mem::transmute(GetProcAddress(module, PCSTR(name.as_ptr()))?)
+                std::mem::transmute(symbol(name.as_bytes())?)
             }};
         }
         Some(Self { addresses: symbol!("discovery_getaddresses"),
@@ -66,6 +69,7 @@ impl Api {
     }
 }
 
+#[cfg(windows)]
 fn api() -> Result<&'static Api, String> {
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| {
@@ -83,7 +87,9 @@ fn api() -> Result<&'static Api, String> {
                 let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
                 let Ok(codec) = LoadLibraryExW(&HSTRING::from(codec.as_os_str()), None, flags) else { continue };
                 if let Ok(module) = LoadLibraryExW(&HSTRING::from(library.as_os_str()), None, flags) {
-                    if let Some(api) = Api::load(module) { return Some(api); }
+                    if let Some(api) = Api::load(|name| GetProcAddress(module, PCSTR(name.as_ptr())).map(|p| p as *const ())) {
+                        return Some(api);
+                    }
                     let _ = FreeLibrary(module);
                 }
                 let _ = FreeLibrary(codec);
@@ -91,6 +97,31 @@ fn api() -> Result<&'static Api, String> {
         }
         None
     }).as_ref().ok_or_else(|| "OMT SDK unavailable. Set LIVEMIX_OMT_DIR to the directory containing libomt.dll and libvmx.dll.".into())
+}
+
+#[cfg(target_os = "macos")]
+fn api() -> Result<&'static Api, String> {
+    static API: OnceLock<Option<Api>> = OnceLock::new();
+    API.get_or_init(|| {
+        let dirs = [
+            std::env::var_os("LIVEMIX_OMT_DIR").map(PathBuf::from),
+            std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)),
+            std::env::var_os("HOME").map(PathBuf::from).map(|p| p.join("Library/Application Support/LiveMix/lib")),
+        ];
+        for dir in dirs.into_iter().flatten().filter(|path| path.is_absolute()) {
+            unsafe {
+                let Ok(codec) = libloading::Library::new(dir.join("libvmx.dylib")) else { continue };
+                if let Ok(library) = libloading::Library::new(dir.join("libomt.dylib")) {
+                    if let Some(api) = Api::load(|name| library.get::<unsafe extern "C" fn()>(name).ok().map(|p| *p as *const ())) {
+                        std::mem::forget(codec);
+                        std::mem::forget(library);
+                        return Some(api);
+                    }
+                }
+            }
+        }
+        None
+    }).as_ref().ok_or_else(|| "OMT SDK unavailable. Set LIVEMIX_OMT_DIR to the directory containing libomt.dylib and libvmx.dylib.".into())
 }
 
 pub fn discover() -> Result<Vec<String>, String> {
