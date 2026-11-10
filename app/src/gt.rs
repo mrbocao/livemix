@@ -27,6 +27,10 @@ pub struct Document {
     assets: HashMap<String, Asset>,
     entrance: Storyboard,
     exit: Storyboard,
+    data_in: Storyboard,
+    data_out: Storyboard,
+    field_boards: HashMap<String, (Storyboard, Storyboard)>,
+    rotations: HashMap<String, Spin>,
     pub fields: BTreeMap<String, String>,
     pub unsupported: BTreeSet<String>,
 }
@@ -65,6 +69,9 @@ struct Object {
     size: Vec2,
     opacity: f32,
     visible: bool,
+    crop: Option<[f32; 4]>,
+    skew: Vec2,
+    shadow: Option<Shadow>,
     kind: ObjectKind,
 }
 
@@ -72,8 +79,29 @@ struct Object {
 enum ObjectKind {
     Layer { size: Vec2, objects: Vec<Object> },
     Shape { kind: ShapeKind, fill: Brush, stroke: Color32, thickness: f32 },
-    Image(String),
+    Image { source: String, cube_depth: Option<f32> },
     Text(Text),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Shadow {
+    blur: f32,
+    offset: Vec2,
+    color: Color32,
+}
+
+#[derive(Clone, Debug)]
+pub struct DataChange {
+    pub started: f64,
+    pub field: String,
+    pub previous: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct Spin {
+    speed: f32,
+    delay: f32,
+    axes: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,7 +137,7 @@ struct Storyboard {
 }
 
 #[derive(Clone, Copy)]
-pub enum Cue { Rest, In(f32), Out(f32) }
+pub enum Cue<'a> { Rest, In(f32), Out(f32), DataIn(f32, &'a str), DataOut(f32, &'a str) }
 
 #[derive(Debug)]
 struct Animation {
@@ -117,11 +145,13 @@ struct Animation {
     delay: f32,
     duration: f32,
     direction: Vec2,
+    centered: bool,
+    reverse: bool,
     ease: Ease,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Motion { Fade, Fly, Reveal, Expand, Zoom, ZoomFade }
+enum Motion { Fade, Fly, Reveal, Expand, Zoom, ZoomFade, Rotate, Hidden }
 
 #[derive(Clone, Copy, Debug)]
 enum Ease { Linear, In, Out, InOut }
@@ -198,6 +228,9 @@ impl Document {
         let mut result = Self {
             size, objects: Vec::new(), assets: HashMap::new(),
             entrance: Storyboard::default(), exit: Storyboard::default(),
+            data_in: Storyboard::default(), data_out: Storyboard::default(),
+            field_boards: HashMap::new(),
+            rotations: HashMap::new(),
             fields: BTreeMap::new(), unsupported: BTreeSet::new(),
         };
         result.objects = result.parse_objects(root, size, 0)?;
@@ -205,9 +238,24 @@ impl Document {
             return Err("The GT document has no supported objects".into());
         }
         for storyboard in root.children().filter(|n| n.has_tag_name("Storyboard")) {
-            let target = match storyboard.attribute("Type").unwrap_or("TransitionIn") {
+            let kind = storyboard.attribute("Type").unwrap_or("TransitionIn");
+            if matches!(kind, "DataChangeIn" | "DataChangeOut") {
+                if let Some(field) = storyboard.attribute("DataName").filter(|field| !field.is_empty()) {
+                    let field = field.strip_suffix(".Text").unwrap_or(field);
+                    let (entrance, exit) = result.field_boards.entry(field.into()).or_default();
+                    parse_storyboard(storyboard, if kind == "DataChangeIn" { entrance } else { exit }, &mut result.unsupported);
+                    continue;
+                }
+            }
+            let target = match kind {
                 "TransitionIn" => &mut result.entrance,
                 "TransitionOut" => &mut result.exit,
+                "DataChangeIn" => &mut result.data_in,
+                "DataChangeOut" => &mut result.data_out,
+                "Continuous" => {
+                    result.parse_continuous(storyboard);
+                    continue;
+                }
                 name => {
                     result.unsupported.insert(format!("Storyboard {name}"));
                     continue;
@@ -268,8 +316,43 @@ impl Document {
             let fill = color(brush("Fill").and_then(|b| b.attribute("Color")), Color32::WHITE);
             let stroke = color(brush("Stroke").and_then(|b| b.attribute("Color")), Color32::TRANSPARENT);
             let thickness = number(node.attribute("StrokeThickness"), 0.0).max(0.0);
-            for prop in ["Effects", "Mask", "Transform", "Crop", "Geometry"] {
+            for prop in ["Mask", "Transform"] {
                 if property(prop).is_some() { self.unsupported.insert(prop.into()); }
+            }
+            let crop = property("Crop").and_then(|p| child(p, "Crop")).and_then(|c| {
+                if c.attribute("Feather").is_some_and(|f| f.split(',').any(|s| number(Some(s), 0.0) != 0.0)) {
+                    self.unsupported.insert("Crop feather".into());
+                }
+                let values: Vec<f32> = c.attribute("Range")?.split(',').filter_map(|n| n.parse().ok()).collect();
+                <[f32; 4]>::try_from(values).ok().filter(|r| r.iter().all(|n| n.is_finite()))
+            });
+            let mut shadow = None;
+            let mut skew = Vec2::ZERO;
+            if let Some(effects) = property("Effects") {
+                for effect in effects.children().filter(Node::is_element) {
+                    match effect.attribute("Type").unwrap_or_default() {
+                        "Shadow" if matches!(tag, "Image" | "Rectangle" | "Ellipse" | "Triangle" | "RightTriangle")
+                            && effect.attribute("Mode").unwrap_or("Shadow") == "Shadow" => {
+                            shadow = Some(Shadow {
+                                blur: number(effect.attribute("BlurAmount"), 5.0).clamp(0.0, 64.0),
+                                offset: pair(effect.attribute("Offset"), Vec2::ZERO),
+                                color: color(effect.attribute("Color"), Color32::BLACK),
+                            });
+                        }
+                        "Skew" if matches!(tag, "Rectangle" | "Ellipse" | "Triangle" | "RightTriangle") => {
+                            let angle = pair(effect.attribute("Angle"), Vec2::ZERO);
+                            skew = Vec2::new(angle.x.clamp(-80.0, 80.0).to_radians().tan(),
+                                angle.y.clamp(-80.0, 80.0).to_radians().tan());
+                        }
+                        kind => { self.unsupported.insert(format!("Effect {kind}")); }
+                    }
+                }
+            }
+            let geometry = property("Geometry").and_then(|p| child(p, "Geometry")).and_then(|n| n.attribute("Type"));
+            if let Some(geometry) = geometry {
+                if tag != "Image" || geometry != "Cube" {
+                    self.unsupported.insert(format!("Geometry {geometry}"));
+                }
             }
             let kind = match tag {
                 "Layer" => {
@@ -288,7 +371,10 @@ impl Document {
                 }
                 "Image" => {
                     let Some(source) = property("Bitmap").and_then(|n| child(n, "Bitmap")).and_then(|n| n.attribute("Source")) else { continue };
-                    ObjectKind::Image(source.into())
+                    let cube_depth = (geometry == Some("Cube")).then(|| {
+                        number(node.attribute("Dimensions").and_then(|value| value.split(',').nth(2)), dimensions.x)
+                    });
+                    ObjectKind::Image { source: source.into(), cube_depth }
                 }
                 "TextBlock" => {
                     let value = node.attribute("Text").unwrap_or_default().to_owned();
@@ -321,6 +407,7 @@ impl Document {
                 name: name.into(), location: pair(node.attribute("Location"), Vec2::ZERO),
                 size: dimensions, opacity: number(node.attribute("Opacity"), 1.0).clamp(0.0, 1.0),
                 visible: node.attribute("Visible") != Some("False"),
+                crop, skew, shadow,
                 kind,
             });
         }
@@ -332,35 +419,103 @@ impl Document {
         (duration > 0.0).then_some(duration)
     }
 
-    pub fn draw(&self, p: &Painter, rect: Rect, opacity: f32, texts: &BTreeMap<String, String>, cue: Cue) {
+    fn data_board(&self, field: &str, exiting: bool) -> &Storyboard {
+        self.field_boards.get(field).map(|(enter, exit)| if exiting { exit } else { enter })
+            .filter(|b| b.seconds > 0.0 || !b.animations.is_empty())
+            .unwrap_or(if exiting { &self.data_out } else { &self.data_in })
+    }
+
+    pub fn data_cue<'a>(&self, age: f32, field: &'a str) -> Option<Cue<'a>> {
+        let out = self.data_board(field, true).seconds;
+        let enter = self.data_board(field, false).seconds;
+        if age < out {
+            Some(Cue::DataOut(age / out, field))
+        } else if age < out + enter {
+            Some(Cue::DataIn((age - out) / enter, field))
+        } else {
+            None
+        }
+    }
+
+    fn parse_continuous(&mut self, storyboard: Xml<'_, '_>) {
+        let Some(animations) = child(storyboard, "Storyboard.Animations") else { return; };
+        for animation in animations.children().filter(Node::is_element) {
+            let effect = animation.tag_name().name();
+            let target = animation.attribute("Object").unwrap_or_default();
+            if effect != "RotateContinuous" || !has_cube(&self.objects, target) {
+                self.unsupported.insert(format!("Continuous animation {effect}"));
+                continue;
+            }
+            // GraphicsEngine RotateContinuousTransition::BuildInternal (0x060002c7):
+            // a 1000 ms segment changes the selected axes by Speed × 360 degrees.
+            let axes = match animation.attribute("Direction").unwrap_or("Left") {
+                "Top" | "10" => [-1.0, 0.0, 0.0],
+                "Bottom" | "40" => [1.0, 0.0, 0.0],
+                "Right" | "80" => [0.0, -1.0, 0.0],
+                "TopLeft" | "20" => [-1.0, -1.0, 0.0],
+                "TopRight" | "30" => [1.0, -1.0, 0.0],
+                "BottomLeft" | "50" => [-1.0, 1.0, 0.0],
+                "BottomRight" | "60" => [1.0, 1.0, 0.0],
+                "Center" | "5" => [0.0, 0.0, -1.0],
+                _ => [0.0, 1.0, 0.0],
+            };
+            let reverse = if animation.attribute("Reverse") == Some("True") { -1.0 } else { 1.0 };
+            self.rotations.insert(target.into(), Spin {
+                axes,
+                speed: number(animation.attribute("Speed"), 1.0) * reverse,
+                delay: number(animation.attribute("Delay"), 0.0).max(0.0) / 1000.0,
+            });
+        }
+    }
+
+    pub fn draw(&self, p: &Painter, rect: Rect, opacity: f32, texts: &BTreeMap<String, String>, cue: Cue<'_>, t: f64) {
         let scale = (rect.width() / self.size.x).min(rect.height() / self.size.y);
         if scale <= 0.0 { return; }
         let bounds = Rect::from_center_size(rect.center(), self.size * scale);
         let view = View { bounds, opacity };
         let (p, view) = self.animate(p.with_clip_rect(rect), view, "", cue);
-        self.draw_objects(&p, &self.objects, view, self.size, texts, cue);
+        self.draw_objects(&p, &self.objects, view, self.size, texts, cue, t);
     }
 
-    fn draw_objects(&self, p: &Painter, objects: &[Object], parent: View, size: Vec2, texts: &BTreeMap<String, String>, cue: Cue) {
+    fn draw_objects(&self, p: &Painter, objects: &[Object], parent: View, size: Vec2, texts: &BTreeMap<String, String>, cue: Cue<'_>, t: f64) {
         if parent.opacity <= 0.0 || size.x <= 0.0 || size.y <= 0.0 { return; }
         let scale = parent.bounds.size() / size;
         for obj in objects {
             if !obj.visible || obj.opacity <= 0.0 || obj.size.x <= 0.0 || obj.size.y <= 0.0 { continue; }
             let bounds = Rect::from_min_size(parent.bounds.min + obj.location * scale, obj.size * scale);
             let view = View { bounds, opacity: parent.opacity * obj.opacity };
-            let (p, view) = self.animate(p.clone(), view, &obj.name, cue);
+            let (mut p, view) = self.animate(p.clone(), view, &obj.name, cue);
+            if let Some([x1, y1, x2, y2]) = obj.crop {
+                let r = view.bounds;
+                p = p.with_clip_rect(Rect::from_min_max(r.min + r.size() * Vec2::new(x1, y1),
+                    r.min + r.size() * Vec2::new(x2, y2)));
+            }
             if view.opacity <= 0.0 || !p.clip_rect().intersects(view.bounds) { continue; }
             match &obj.kind {
                 ObjectKind::Layer { size, objects } => {
-                    self.draw_objects(&p.with_clip_rect(view.bounds), objects, view, *size, texts, cue);
+                    self.draw_objects(&p.with_clip_rect(view.bounds), objects, view, *size, texts, cue, t);
                 }
-                ObjectKind::Image(source) => {
+                ObjectKind::Image { source, cube_depth } => {
                     if let Some(asset) = self.assets.get(source) {
-                        p.image(asset.texture(p.ctx(), source), view.bounds, unit_rect(), Color32::WHITE.gamma_multiply(view.opacity));
+                        let texture = asset.texture(p.ctx(), source);
+                        if let Some(depth) = cube_depth {
+                            let angles = self.rotations.get(&obj.name).map_or([0.0; 3], |spin| {
+                                let phase = ((t - spin.delay as f64).max(0.0) * spin.speed as f64).rem_euclid(1.0);
+                                spin.axes.map(|axis| axis * phase as f32 * std::f32::consts::TAU)
+                            });
+                            draw_cube(&p, view, texture, depth * scale.y, angles);
+                        } else {
+                            if let Some(shadow) = obj.shadow {
+                                shadow_samples(shadow, scale, view.opacity, |offset, color| {
+                                    p.image(texture, view.bounds.translate(offset), unit_rect(), color);
+                                });
+                            }
+                            p.image(texture, view.bounds, unit_rect(), Color32::WHITE.gamma_multiply(view.opacity));
+                        }
                     }
                 }
                 ObjectKind::Shape { kind, fill, stroke, thickness } => {
-                    self.draw_shape(&p, view, *kind, fill, Stroke::new(thickness * scale.y, stroke.gamma_multiply(view.opacity)));
+                    self.draw_shape(&p, view, *kind, fill, Stroke::new(thickness * scale.y, stroke.gamma_multiply(view.opacity)), obj.skew, obj.shadow, scale);
                 }
                 ObjectKind::Text(text) => {
                     let value = texts.get(&obj.name).unwrap_or(&text.value);
@@ -370,11 +525,19 @@ impl Document {
         }
     }
 
-    fn animate(&self, mut p: Painter, mut view: View, name: &str, cue: Cue) -> (Painter, View) {
+    fn animate(&self, mut p: Painter, mut view: View, name: &str, cue: Cue<'_>) -> (Painter, View) {
         let (storyboard, time, exiting) = match cue {
             Cue::Rest => return (p, view),
             Cue::In(t) => (&self.entrance, t * self.entrance.seconds, false),
             Cue::Out(t) => (&self.exit, t * self.exit.seconds, true),
+            Cue::DataIn(t, field) => {
+                let board = self.data_board(field, false);
+                (board, t * board.seconds, false)
+            }
+            Cue::DataOut(t, field) => {
+                let board = self.data_board(field, true);
+                (board, t * board.seconds, true)
+            }
         };
         if let Some(animations) = storyboard.animations.get(name) {
             for animation in animations {
@@ -383,8 +546,11 @@ impl Document {
                 let shown = if exiting { 1.0 - progress } else { progress };
                 match animation.effect {
                     Motion::Fade => view.opacity *= shown,
-                    Motion::Fly => view.bounds = view.bounds.translate(animation.direction * view.bounds.size() * (1.0 - shown)),
-                    Motion::Reveal => p = p.with_clip_rect(reveal(view.bounds, animation.direction, shown)),
+                    Motion::Fly => {
+                        let direction = if animation.reverse { -animation.direction } else { animation.direction };
+                        view.bounds = view.bounds.translate(direction * view.bounds.size() * (1.0 - shown));
+                    }
+                    Motion::Reveal => p = p.with_clip_rect(reveal(view.bounds, animation.direction, animation.centered, shown)),
                     Motion::Expand | Motion::Zoom | Motion::ZoomFade => {
                         let scale = if matches!(animation.effect, Motion::Expand) && animation.direction.x != 0.0 {
                             Vec2::new(shown, 1.0)
@@ -396,15 +562,22 @@ impl Document {
                         view.bounds = Rect::from_center_size(view.bounds.center(), view.bounds.size() * scale);
                         if matches!(animation.effect, Motion::ZoomFade) { view.opacity *= shown; }
                     }
+                    Motion::Hidden if time >= animation.delay => view.opacity = 0.0,
+                    Motion::Hidden => {},
+                    Motion::Rotate => {
+                        let axis = (shown * std::f32::consts::FRAC_PI_2).sin();
+                        let scale = if animation.direction.y != 0.0 { Vec2::new(1.0, axis) } else { Vec2::new(axis, 1.0) };
+                        view.bounds = Rect::from_center_size(view.bounds.center(), view.bounds.size() * scale);
+                    }
                 }
             }
         }
         (p, view)
     }
 
-    fn draw_shape(&self, p: &Painter, view: View, kind: ShapeKind, fill: &Brush, stroke: Stroke) {
+    fn draw_shape(&self, p: &Painter, view: View, kind: ShapeKind, fill: &Brush, stroke: Stroke, skew: Vec2, shadow: Option<Shadow>, scale: Vec2) {
         let r = view.bounds;
-        let polygon: Vec<Pos2> = match kind {
+        let mut polygon: Vec<Pos2> = match kind {
             ShapeKind::Rectangle => vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()],
             ShapeKind::Ellipse => (0..48).map(|i| {
                 let a = i as f32 * std::f32::consts::TAU / 48.0;
@@ -413,6 +586,16 @@ impl Document {
             ShapeKind::Triangle => vec![r.center_top(), r.right_bottom(), r.left_bottom()],
             ShapeKind::RightTriangle => vec![r.left_top(), r.right_bottom(), r.left_bottom()],
         };
+        for point in &mut polygon {
+            let delta = *point - r.center();
+            *point += Vec2::new(delta.y * skew.x, delta.x * skew.y);
+        }
+        if let Some(shadow) = shadow {
+            shadow_samples(shadow, scale, view.opacity, |offset, color| {
+                let points = polygon.iter().map(|&p| p + offset).collect();
+                p.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+            });
+        }
         match fill {
             Brush::Solid(color) => {
                 p.add(egui::Shape::convex_polygon(polygon, color.gamma_multiply(view.opacity), stroke));
@@ -451,6 +634,62 @@ impl Document {
             p.add(egui::Shape::closed_line(polygon, stroke));
         }
     }
+}
+
+fn has_cube(objects: &[Object], target: &str) -> bool {
+    objects.iter().any(|obj| match &obj.kind {
+        ObjectKind::Image { cube_depth: Some(_), .. } => obj.name == target,
+        ObjectKind::Layer { objects, .. } => has_cube(objects, target),
+        _ => false,
+    })
+}
+
+fn shadow_samples(shadow: Shadow, scale: Vec2, opacity: f32, mut draw: impl FnMut(Vec2, Color32)) {
+    let taps = [
+        (Vec2::ZERO, 0.24), (Vec2::X, 0.12), (-Vec2::X, 0.12), (Vec2::Y, 0.12), (-Vec2::Y, 0.12),
+        (Vec2::new(1.0, 1.0), 0.07), (Vec2::new(-1.0, 1.0), 0.07),
+        (Vec2::new(1.0, -1.0), 0.07), (Vec2::new(-1.0, -1.0), 0.07),
+    ];
+    if shadow.blur <= 0.0 {
+        draw(shadow.offset * scale, shadow.color.gamma_multiply(opacity));
+    } else {
+        for (offset, weight) in taps {
+            draw((shadow.offset + offset * shadow.blur * 0.55) * scale, shadow.color.gamma_multiply(opacity * weight));
+        }
+    }
+}
+
+fn draw_cube(p: &Painter, view: View, texture: egui::TextureId, depth: f32, angles: [f32; 3]) {
+    let bounds = view.bounds;
+    let half = bounds.size() * 0.5;
+    let half_depth = depth.max(0.0) * 0.5;
+    let distance = 8.0 * half.x.max(half.y).max(half_depth);
+    let [(sx, cx), (sy, cy), (sz, cz)] = angles.map(f32::sin_cos);
+    let corners = [
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+    ].map(|[x, y, z]| {
+        let (x, y, z) = (x * half.x, y * half.y, z * half_depth);
+        let (y, z) = (cx * y - sx * z, sx * y + cx * z);
+        let (x, z) = (cy * x + sy * z, -sy * x + cy * z);
+        let (x, y) = (cz * x - sz * y, sz * x + cz * y);
+        bounds.center() + Vec2::new(x, y) * ((distance - half_depth) / (distance - z))
+    });
+    let faces = [[0, 1, 2, 3], [1, 5, 6, 2], [5, 4, 7, 6], [4, 0, 3, 7], [4, 5, 1, 0], [3, 2, 6, 7]];
+    let uv = [egui::pos2(0.0, 0.0), egui::pos2(1.0, 0.0), egui::pos2(1.0, 1.0), egui::pos2(0.0, 1.0)];
+    let mut mesh = egui::Mesh::with_texture(texture);
+    let color = Color32::WHITE.gamma_multiply(view.opacity);
+    for face in faces {
+        let pts = face.map(|i| corners[i]);
+        let a = pts[1] - pts[0];
+        let b = pts[2] - pts[0];
+        if a.x * b.y - a.y * b.x <= 0.0 { continue; }
+        let first = mesh.vertices.len() as u32;
+        mesh.vertices.extend(pts.into_iter().zip(uv).map(|(pos, uv)| egui::epaint::Vertex { pos, uv, color }));
+        mesh.add_triangle(first, first + 1, first + 2);
+        mesh.add_triangle(first, first + 2, first + 3);
+    }
+    p.add(egui::Shape::mesh(mesh));
 }
 
 #[derive(Clone, Copy)]
@@ -540,19 +779,28 @@ impl Ease {
 fn parse_storyboard(xml: Xml<'_, '_>, board: &mut Storyboard, unsupported: &mut BTreeSet<String>) {
     let Some(list) = child(xml, "Storyboard.Animations") else { return };
     for animation in list.children().filter(Node::is_element) {
+        let delay = number(animation.attribute("Delay"), 0.0).clamp(0.0, 60.0);
+        let duration = number(animation.attribute("Duration"), 1.0).clamp(0.0, 60.0);
         let effect = match animation.tag_name().name() {
             "Fade" => Motion::Fade, "Fly" => Motion::Fly, "Reveal" => Motion::Reveal,
             "Expand" => Motion::Expand, "Zoom" => Motion::Zoom, "ZoomFade" => Motion::ZoomFade,
-            "None" => continue,
+            "Rotate" => Motion::Rotate, "Hidden" => Motion::Hidden,
+            "None" => {
+                if animation.attribute("Duration").is_some() {
+                    board.seconds = board.seconds.max(delay + duration);
+                }
+                continue;
+            }
             name => {
                 unsupported.insert(format!("Animation {name}"));
                 continue;
             }
         };
-        let delay = number(animation.attribute("Delay"), 0.0).clamp(0.0, 60.0);
-        let duration = number(animation.attribute("Duration"), 1.0).clamp(0.001, 60.0);
+        let centered = animation.attribute("Direction") == Some("Center");
         let direction = match animation.attribute("Direction") {
-            Some("Right") => Vec2::X, Some("Top") => -Vec2::Y, Some("Bottom") => Vec2::Y, _ => -Vec2::X,
+            Some("Right") => Vec2::X, Some("Top") => -Vec2::Y, Some("Bottom") => Vec2::Y,
+            Some("Center") if animation.attribute("CenterAxis") == Some("Y") => Vec2::Y,
+            _ => -Vec2::X,
         };
         let ease = match animation.attribute("Interpolation") {
             Some("CubicEasingIn") => Ease::In, Some("CubicEasingOut") => Ease::Out,
@@ -560,11 +808,16 @@ fn parse_storyboard(xml: Xml<'_, '_>, board: &mut Storyboard, unsupported: &mut 
         };
         board.seconds = board.seconds.max(delay + duration);
         board.animations.entry(animation.attribute("Object").unwrap_or_default().into()).or_default()
-            .push(Animation { effect, delay, duration, direction, ease });
+            .push(Animation { effect, delay, duration: duration.max(0.001), direction, centered,
+                reverse: animation.attribute("Reverse") == Some("True"), ease });
     }
 }
 
-fn reveal(bounds: Rect, direction: Vec2, shown: f32) -> Rect {
+fn reveal(bounds: Rect, direction: Vec2, centered: bool, shown: f32) -> Rect {
+    if centered {
+        let scale = if direction.x != 0.0 { Vec2::new(shown, 1.0) } else { Vec2::new(1.0, shown) };
+        return Rect::from_center_size(bounds.center(), bounds.size() * scale);
+    }
     let mut rect = bounds;
     if direction.x > 0.0 { rect.max.x = rect.min.x + rect.width() * shown; }
     else if direction.x < 0.0 { rect.min.x = rect.max.x - rect.width() * shown; }

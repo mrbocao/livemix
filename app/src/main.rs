@@ -7,6 +7,9 @@ mod media;
 mod program;
 mod performance;
 mod gt;
+mod preset;
+mod decklink;
+mod scopes;
 
 use eframe::glow::HasContext;
 use std::sync::{Arc, Mutex};
@@ -43,8 +46,8 @@ fn main() -> eframe::Result<()> {
         "LiveMix",
         options,
         Box::new(move |cc| {
-            apply_style(&cc.egui_ctx);
             let mut app = App::new(screenshot);
+            apply_style(&cc.egui_ctx, app.s.cfg.theme);
             if let Some(gl) = &cc.gl {
                 app.graphics_adapter = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
                 app.performance.set_adapter(&app.graphics_adapter);
@@ -54,7 +57,8 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-fn apply_style(ctx: &egui::Context) {
+// ozzzzzs::a (0x060039c0) selects the palette independently of the layout.
+fn apply_style(ctx: &egui::Context, theme: InterfaceTheme) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = WINDOW;
@@ -71,10 +75,38 @@ fn apply_style(ctx: &egui::Context) {
     v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x8c, 0xb4, 0xf0));
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.selection.bg_fill = HOVER;
-    ctx.set_visuals(v);
-    let mut style = (*ctx.style()).clone();
+    let mut style = egui::Style::default();
     style.spacing.item_spacing = Vec2::new(4.0, 4.0);
     style.spacing.button_padding = Vec2::new(6.0, 3.0);
+    if theme == InterfaceTheme::Modern {
+        let edge = Color32::from_rgb(47, 57, 72);
+        let accent = Color32::from_rgb(111, 167, 246);
+        v.panel_fill = Color32::from_rgb(17, 23, 33);
+        v.window_fill = Color32::from_rgb(24, 32, 45);
+        v.extreme_bg_color = Color32::from_rgb(13, 19, 28);
+        v.faint_bg_color = Color32::from_white_alpha(9);
+        v.window_corner_radius = egui::CornerRadius::same(10);
+        v.menu_corner_radius = egui::CornerRadius::same(8);
+        v.window_stroke = Stroke::new(1.0_f32, edge);
+        v.selection.bg_fill = Color32::from_rgb(40, 69, 108);
+        v.selection.stroke = Stroke::new(1.0_f32, accent);
+        for widget in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+            widget.corner_radius = egui::CornerRadius::same(6);
+            widget.expansion = 0.0;
+        }
+        v.widgets.inactive.bg_fill = Color32::from_rgb(35, 45, 60);
+        v.widgets.inactive.weak_bg_fill = v.widgets.inactive.bg_fill;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, edge);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(49, 65, 86);
+        v.widgets.hovered.weak_bg_fill = v.widgets.hovered.bg_fill;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
+        v.widgets.active.bg_fill = v.selection.bg_fill;
+        v.widgets.active.weak_bg_fill = v.selection.bg_fill;
+        v.widgets.active.bg_stroke = v.selection.stroke;
+        style.spacing.window_margin = egui::Margin::same(12);
+        style.spacing.menu_margin = egui::Margin::same(7);
+    }
+    style.visuals = v;
     ctx.set_style(style);
 }
 
@@ -103,11 +135,11 @@ impl Drop for Feed {
 
 struct App {
     s: Switcher,
+    applied_theme: InterfaceTheme,
     frame: u64,
     screenshot: Option<String>,
     shot_pending: bool,
     shot_recording: Option<f64>,
-    shot_wave: bool,
     next_record_frame: f64,
     record_format: ([u32; 2], f64),
     program: Arc<Mutex<ProgramCapture>>,
@@ -120,6 +152,7 @@ struct App {
     recordings: [Option<ComposedRecording>; 2],
     multi_outputs: [Option<ComposedRecording>; OUTPUT_COUNT],
     multi_output_failed: [bool; OUTPUT_COUNT],
+    decklink_outputs: [Option<(decklink::OutputConfig, decklink::OutputSink)>; OUTPUT_COUNT],
     /// One recording per camera (MultiCorder).
     multi: std::collections::HashMap<u32, media::Recorder>,
     browse_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
@@ -134,12 +167,18 @@ struct App {
     /// Preview waveform picture and when to refresh it.
     scopes: std::collections::HashMap<u8, egui::TextureHandle>,
     next_wave: f64,
+    scope_frame: program::ScopeMailbox,
+    scope_key: program::ScopeKey,
+    scope_jobs: std::sync::mpsc::SyncSender<program::ScopeFrame>,
+    scope_images: scopes::Mailbox,
 }
 
 #[derive(Default)]
 struct ProgramCapture {
     target: Option<program::Target>,
     error: Option<String>,
+    scope_target: Option<program::Target>,
+    scope_error: Option<String>,
 }
 
 struct ComposedRecording {
@@ -154,74 +193,6 @@ impl ComposedRecording {
         let recorder = Arc::new(media::Recorder::start_opts(path.to_string_lossy().into_owned(), opts));
         Self { recorder, channel, started }
     }
-}
-
-/// Scope picture of a picture for the Waveform Monitor: SCOPE_RGB — red, green and blue levels
-/// of every column laid over each other; SCOPE_Y — brightness (BT.709); SCOPE_PARADE — red,
-/// green and blue side by side; SCOPE_VECTOR — colour (Cb across, Cr up) round the centre of a
-/// square picture, twice as large with "Vectorscope 2X Zoom". Levels run 0 % at the bottom to
-/// 100 % at the top.
-#[allow(non_snake_case)]
-fn waveform_image(px: &[u8], w: usize, h: usize, kind: u8, vs_zoom: bool) -> egui::ColorImage {
-    let vector = kind == SCOPE_VECTOR;
-    let (W, H): (usize, usize) = if vector { (128, 128) } else { (256, 128) };
-    // counts[channel][row * W + col]; channel 3 = white (luma / vectorscope).
-    let mut counts = vec![vec![0u32; W * H]; 4];
-    let step = ((w * h) / 120_000).max(1);
-    let level_row = |v: f32| H - 1 - ((v / 255.0).clamp(0.0, 1.0) * (H - 1) as f32).round() as usize;
-    let vs_scale = if vs_zoom { 2.0 } else { 1.0 };
-    let mut i = 0;
-    while i < w * h {
-        let (x, p) = (i % w, i * 4);
-        let (r, g, b) = (px[p] as f32, px[p + 1] as f32, px[p + 2] as f32);
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let kind = match kind {
-            SCOPE_RGB => 1,
-            SCOPE_PARADE => 3,
-            SCOPE_VECTOR => 4,
-            _ => 2,
-        };
-        match kind {
-            1 => {
-                let col = x * W / w;
-                for (c, v) in [r, g, b].into_iter().enumerate() {
-                    counts[c][level_row(v) * W + col] += 1;
-                }
-            }
-            3 => {
-                // Three thirds: red, green, blue.
-                let third = W / 3;
-                for (c, v) in [r, g, b].into_iter().enumerate() {
-                    let col = c * third + x * third / w;
-                    counts[c][level_row(v) * W + col] += 1;
-                }
-            }
-            4 => {
-                let cb = (b - luma) / 1.8556;
-                let cr = (r - luma) / 1.5748;
-                let col = (W as f32 / 2.0 + cb / 255.0 * H as f32 * 0.9 * vs_scale).clamp(0.0, W as f32 - 1.0) as usize;
-                let row = (H as f32 / 2.0 - cr / 255.0 * H as f32 * 0.9 * vs_scale).clamp(0.0, H as f32 - 1.0) as usize;
-                counts[3][row * W + col] += 1;
-            }
-            _ => {
-                counts[3][level_row(luma) * W + x * W / w] += 1;
-            }
-        }
-        i += step;
-    }
-    let per_col = ((w * h / step) as f32 / W as f32).max(1.0);
-    let alpha = |c: u32| ((c as f32 / per_col * 40.0).sqrt().min(1.0) * 255.0) as u8;
-    let mut img = egui::ColorImage::new([W, H], Color32::TRANSPARENT);
-    for k in 0..W * H {
-        let (cr, cg, cb, cw) = (counts[0][k], counts[1][k], counts[2][k], counts[3][k]);
-        if cw > 0 {
-            img.pixels[k] = Color32::from_rgba_unmultiplied(170, 255, 170, alpha(cw).max(60));
-        } else if cr + cg + cb > 0 {
-            let lit = |c: u32| if c > 0 { 255 } else { 40 };
-            img.pixels[k] = Color32::from_rgba_unmultiplied(lit(cr), lit(cg), lit(cb), alpha(cr.max(cg).max(cb)).max(60));
-        }
-    }
-    img
 }
 
 /// Recording folder: the one chosen in a setup window, or Documents\LiveMixStorage.
@@ -332,13 +303,14 @@ impl App {
             }
             _ => {}
         }
+        let (scope_jobs, scope_images) = scopes::worker();
         Self {
+            applied_theme: s.cfg.theme,
             s,
             frame: 0,
             screenshot,
             shot_pending: false,
             shot_recording: None,
-            shot_wave: false,
             next_record_frame: 0.0,
             record_format: ([1920, 1080], 30.0),
             program: Arc::default(),
@@ -350,6 +322,7 @@ impl App {
             recordings: Default::default(),
             multi_outputs: Default::default(),
             multi_output_failed: [false; OUTPUT_COUNT],
+            decklink_outputs: Default::default(),
             multi: Default::default(),
             browse_rx: None,
             browse_kind: media::PickKind::Video,
@@ -359,6 +332,10 @@ impl App {
             multi_started: Default::default(),
             scopes: Default::default(),
             next_wave: 0.0,
+            scope_frame: Default::default(),
+            scope_key: (None, 0, false),
+            scope_jobs,
+            scope_images,
         }
     }
 
@@ -417,6 +394,12 @@ impl App {
                     // Which reader this input needs; a different key restarts the reader.
                     let (src, key, is_file, is_device) = match &inp.kind {
                         // The chosen camera mode is part of the key: picking another restarts it.
+                        Kind::Device { link, .. } if decklink::device_index(link).is_some() => (
+                            media::Source::DeckLink(decklink::CaptureConfig {
+                                device: decklink::device_index(link).unwrap(), port: inp.decklink_port, mode: inp.decklink_mode,
+                            }),
+                            format!("{link}|{}|{}", inp.decklink_port, inp.decklink_mode), false, true,
+                        ),
                         Kind::Device { link, .. } => (
                             media::Source::Device(link.clone(), inp.cam_mode.clone()),
                             format!("{link}|{}", inp.cam_mode.as_ref().map(|m| m.code()).unwrap_or_default()),
@@ -578,8 +561,11 @@ impl App {
     fn update_recording(&mut self, now: f64) {
         if self.composed_recordings().next().is_none() {
             let (w, h) = self.s.cfg.out_dims();
-            self.record_format = ([w, h], f64::from(self.s.cfg.frame_rate()));
-            self.next_record_frame = now;
+            let format = ([w, h], f64::from(self.s.cfg.frame_rate()));
+            if self.record_format != format || self.decklink_outputs.iter().all(Option::is_none) {
+                self.record_format = format;
+                self.next_record_frame = now;
+            }
         }
         let ([w, h], fps) = self.record_format;
         let options = |mbps, format, hw| media::RecOpts { mbps, size: Some((w, h)), fps: fps as f32, hw, format };
@@ -662,25 +648,99 @@ impl App {
         }
     }
 
+    fn update_scopes(&mut self, ctx: &egui::Context, now: f64) {
+        let key = (self.s.preview, self.s.cfg.wave_type, self.s.cfg.vs_zoom);
+        if key != self.scope_key {
+            self.scope_key = key;
+            self.next_wave = now;
+            self.s.scope_tex.clear();
+        }
+        let frame = self.scope_frame.lock().unwrap().take();
+        if let Some(frame) = frame.filter(|frame| frame.key == key && key.1 != 0) {
+            let _ = self.scope_jobs.try_send(frame);
+        }
+        let images = self.scope_images.lock().unwrap().take();
+        if let Some((_, images)) = images.filter(|(frame_key, _)| *frame_key == key && key.1 != 0) {
+            let mut ids = Vec::new();
+            for (kind, image) in images {
+                let tex = self.scopes.entry(kind).or_insert_with(|| {
+                    ctx.load_texture(format!("scope-{kind}"), egui::ColorImage::new([1, 1], Color32::TRANSPARENT), egui::TextureOptions::LINEAR)
+                });
+                tex.set(image, egui::TextureOptions::LINEAR);
+                ids.push((kind, tex.id()));
+            }
+            self.s.scope_tex = ids;
+        }
+    }
+
+    fn update_decklink_outputs(&mut self) {
+        for channel in 0..OUTPUT_COUNT {
+            let route = self.s.cfg.decklink_outputs[channel];
+            let wanted = route.device.filter(|_| self.s.decklink_active[channel]).map(|device| decklink::OutputConfig {
+                device, mode: route.mode, port: route.port,
+                size: self.s.cfg.out_dims(), fps: self.s.cfg.frame_rate(), interlaced: self.s.cfg.interlaced,
+            });
+            let slot = &mut self.decklink_outputs[channel];
+            if slot.as_ref().map(|(cfg, _)| *cfg) != wanted {
+                if let Some((_, sink)) = slot {
+                    sink.stop();
+                    if !sink.finished() {
+                        continue;
+                    }
+                }
+                *slot = None;
+                if let Some(cfg) = wanted {
+                    *slot = Some((cfg, decklink::OutputSink::start(cfg)));
+                }
+            }
+            if let Some((_, sink)) = slot {
+                if let Some(error) = sink.error() {
+                    self.s.decklink_status[channel] = error.clone();
+                    self.s.decklink_active[channel] = false;
+                    self.s.notice(&format!("DeckLink Output {}: {error}", channel + 1));
+                } else {
+                    self.s.decklink_status[channel] = if sink.frames() > 0 {
+                        "Sending video".into()
+                    } else {
+                        "Starting DeckLink output…".into()
+                    };
+                }
+            } else if self.s.decklink_active[channel] {
+                self.s.decklink_active[channel] = false;
+            }
+        }
+    }
+
     /// Capture the Program when due and record the elapsed time at the end of drawing.
     fn finish_frame(&mut self, ctx: &egui::Context, now: f64, started: Instant) {
-        let (available, pending) = {
+        let (available, scopes_available, pending) = {
             let state = self.program.lock().unwrap();
-            (state.error.is_none(), state.target.as_ref().is_some_and(program::Target::has_pending))
+            (state.error.is_none(), state.scope_error.is_none(),
+                state.target.as_ref().is_some_and(program::Target::has_pending)
+                || state.scope_target.as_ref().is_some_and(program::Target::has_pending))
         };
         let mut frames = Vec::new();
-        if available && now >= self.next_record_frame && self.composed_recordings().next().is_some() {
+        let any_hardware = self.decklink_outputs.iter().any(Option::is_some);
+        if available && now >= self.next_record_frame && (any_hardware || self.composed_recordings().next().is_some()) {
             self.advance_record_clock(now);
             let size = self.record_format.0;
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
             let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("program-offscreen"));
-            let mut groups: Vec<(OutputRoute, Vec<Arc<media::Recorder>>)> = Vec::new();
+            let mut groups: Vec<(OutputRoute, program::Destinations)> = Vec::new();
             for recording in self.composed_recordings() {
                 let route = self.s.cfg.outputs[recording.channel];
-                if let Some((_, recorders)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
-                    recorders.push(Arc::clone(&recording.recorder));
+                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                    destinations.recorders.push(Arc::clone(&recording.recorder));
                 } else {
-                    groups.push((route, vec![Arc::clone(&recording.recorder)]));
+                    groups.push((route, program::Destinations { recorders: vec![Arc::clone(&recording.recorder)], ..Default::default() }));
+                }
+            }
+            for (channel, (_, sink)) in self.decklink_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))) {
+                let route = self.s.cfg.outputs[channel];
+                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                    destinations.decklinks.push(sink.clone());
+                } else {
+                    groups.push((route, program::Destinations { decklinks: vec![sink.clone()], ..Default::default() }));
                 }
             }
             let captured_at = Instant::now();
@@ -691,6 +751,23 @@ impl App {
                 });
                 frames.push((size, ctx.tessellate(shapes, 1.0), captured_at, recorders));
             }
+        }
+        if scopes_available && self.scope_key.1 != 0 && now >= self.next_wave {
+            self.next_wave = now + 0.1;
+            let size = [320, 180];
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("scopes-offscreen"));
+            let painter = egui::Painter::new(ctx.clone(), layer, rect);
+            if let Some(input) = self.scope_key.0.and_then(|id| self.s.input(id)) {
+                draw_source(&painter, rect, input, 1.0, now, &self.s.inputs);
+            }
+            draw_overlay_channels(&painter, rect, &self.s, now, true);
+            let shapes = ctx.graphics_mut(|graphics| {
+                std::mem::take(graphics.entry(layer)).all_entries().cloned().collect()
+            });
+            frames.push((size, ctx.tessellate(shapes, 1.0), Instant::now(), program::Destinations {
+                scope: Some((self.scope_key, Arc::clone(&self.scope_frame))), ..Default::default()
+            }));
         }
         let program = Arc::clone(&self.program);
         let peak = Arc::clone(&self.performance.render_peak);
@@ -705,19 +782,34 @@ impl App {
                                 if let Some(target) = state.target.as_mut() {
                                     target.collect(painter.gl())?;
                                 }
-                                for (size, meshes, captured_at, recorders) in &frames {
+                                if let Some(target) = state.scope_target.as_mut() {
+                                    if let Err(error) = target.collect(painter.gl()) {
+                                        state.scope_error = Some(error);
+                                    }
+                                }
+                                for (size, meshes, captured_at, destinations) in &frames {
+                                    if destinations.scope.is_some() {
+                                        let capture = (|| {
+                                            if state.scope_target.is_none() {
+                                                state.scope_target = Some(program::Target::new(painter.gl())?);
+                                            }
+                                            state.scope_target.as_mut().unwrap().capture(painter, *size, meshes, *captured_at, destinations)
+                                        })();
+                                        if let Err(error) = capture { state.scope_error = Some(error); }
+                                        continue;
+                                    }
                                     if state.target.is_none() {
                                         state.target = Some(program::Target::new(painter.gl())?);
                                     }
-                                    state.target.as_mut().unwrap().capture(painter, *size, meshes, *captured_at, recorders)?;
+                                    state.target.as_mut().unwrap().capture(painter, *size, meshes, *captured_at, destinations)?;
                                 }
                                 Ok::<(), String>(())
                             })()
                         };
                         if let Err(error) = result {
                             state.error = Some(error);
-                            for (_, _, _, recorders) in &frames {
-                                for recorder in recorders { recorder.note_dropped_frames(1); }
+                            for (_, _, _, destinations) in &frames {
+                                for recorder in &destinations.recorders { recorder.note_dropped_frames(1); }
                             }
                         }
                     }
@@ -746,19 +838,12 @@ impl App {
         } else {
             Vec::new()
         };
-        let sample_wave = got.is_some() && std::mem::take(&mut self.shot_wave);
         let record_due = self.composed_recordings().any(|r| self.can_capture_from_window(r)) && now >= self.next_record_frame
             && self.program.lock().unwrap().error.is_some();
-        // Waveform: a fresh look at the Preview five times a second.
-        let wave_due = self.s.cfg.wave_type != 0 && now >= self.next_wave;
-        let want = record_due || (got.is_none() && (check_due || self.s.snapshot_req || wave_due));
+        let want = record_due || (got.is_none() && (check_due || self.s.snapshot_req));
         if want && !self.shot_pending {
             self.shot_pending = true;
             self.shot_recording = record_due.then_some(now);
-            self.shot_wave = wave_due;
-            if wave_due {
-                self.next_wave = now + 0.2;
-            }
             if record_due {
                 self.advance_record_clock(now);
             }
@@ -782,21 +867,6 @@ impl App {
             }
             (out, w, h)
         };
-        let pv = self.s.preview_rect;
-        if sample_wave && self.s.cfg.wave_type != 0 && pv.is_positive() {
-            let (px, w, h) = crop(pv);
-            if w > 0 && h > 0 {
-                // One picture per scope the chosen layout shows.
-                let mut ids = Vec::new();
-                for (kind, _) in scope_layout(self.s.cfg.wave_type).1 {
-                    let img = waveform_image(&px, w, h, kind, self.s.cfg.vs_zoom);
-                    let tex = self.scopes.entry(kind).or_insert_with(|| ctx.load_texture(format!("preview-scope-{kind}"), egui::ColorImage::new([1, 1], Color32::TRANSPARENT), egui::TextureOptions::LINEAR));
-                    tex.set(img, egui::TextureOptions::LINEAR);
-                    ids.push((kind, tex.id()));
-                }
-                self.s.scope_tex = ids;
-            }
-        }
         let out_rect = self.s.output_rect;
         if out_rect.is_positive() && (self.s.snapshot_req || !recorders.is_empty()) {
             let (px, w, h) = crop(out_rect);
@@ -850,8 +920,19 @@ impl App {
         }
         if let Some(rx) = &self.browse_rx {
             if let Ok(res) = rx.try_recv() {
+                let waiting = self.s.new_step == NewStep::WaitingForSave
+                    && self.browse_kind == media::PickKind::PresetSave;
+                if waiting {
+                    self.s.new_step = NewStep::Idle;
+                }
                 if let Some(p) = res {
                     match (self.browse_kind, self.s.browse_for) {
+                        (media::PickKind::PresetOpen, _) => self.s.load_preset_from(std::path::Path::new(&p)),
+                        (media::PickKind::PresetSave, _) => {
+                            if self.s.save_preset_to(std::path::Path::new(&p)) && waiting {
+                                self.s.new_step = NewStep::Format;
+                            }
+                        }
                         // Recording Setup "Browse" / MultiCorder "Change Recording Folder".
                         (media::PickKind::Folder, 1) => self.s.cfg.rec_folder = p,
                         (media::PickKind::Folder, 2) => self.s.cfg.mc_folder = p,
@@ -874,9 +955,12 @@ impl App {
         let d = &self.s.add_dialog;
         if self.s.refresh_devices || (d.open && d.kind.uses_device() && !d.devices_loaded) {
             self.s.refresh_devices = false;
-            self.s.add_dialog.devices = media::list_devices()
+            let decklinks = decklink::refresh_devices();
+            self.s.add_dialog.devices = decklinks.into_iter().filter(|device| device.capture)
+                .map(|device| DeviceChoice { name: device.name, link: format!("decklink:{}", device.index), blackmagic: true })
+                .chain(media::list_devices()
                 .into_iter()
-                .map(|x| DeviceChoice { name: x.name, link: x.link, blackmagic: x.blackmagic })
+                .map(|x| DeviceChoice { name: x.name, link: x.link, blackmagic: x.blackmagic }))
                 .collect();
             self.s.add_dialog.devices_loaded = true;
             self.s.add_dialog.device = 0;
@@ -970,6 +1054,10 @@ fn shortcuts(ctx: &egui::Context, s: &mut Switcher) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.applied_theme != self.s.cfg.theme {
+            self.applied_theme = self.s.cfg.theme;
+            apply_style(ctx, self.applied_theme);
+        }
         let now = Instant::now();
         self.performance.update(now, || {
             self.program.lock().unwrap().target.as_ref().map_or(0, program::Target::transfer_bytes)
@@ -990,6 +1078,8 @@ impl eframe::App for App {
         self.handle_requests();
         self.update_media(ctx);
         self.update_recording(t);
+        self.update_decklink_outputs();
+        self.update_scopes(ctx, t);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.s.fullscreen = false;
@@ -1006,8 +1096,6 @@ impl eframe::App for App {
         if self.s.show_mixer {
             mixer_panel(ctx, &mut self.s, t);
         }
-        // Filled in again by the Preview input's box when it is drawn.
-        self.s.preview_tile_rect = egui::Rect::NOTHING;
         inputs_panel(ctx, &mut self.s, t);
         let encoder = if self.recordings.iter().all(Option::is_none) {
             "Start recording to identify the encoder".into()
@@ -1040,8 +1128,17 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
-        if let (Some(gl), Some(target)) = (gl, self.program.lock().unwrap().target.take()) {
-            unsafe { target.destroy(gl) };
+        for (_, sink) in self.decklink_outputs.iter().flatten() {
+            sink.stop();
+        }
+        if let Some(gl) = gl {
+            let mut capture = self.program.lock().unwrap();
+            if let Some(target) = capture.target.take() {
+                unsafe { target.destroy(gl) };
+            }
+            if let Some(target) = capture.scope_target.take() {
+                unsafe { target.destroy(gl) };
+            }
         }
     }
 }
@@ -1054,7 +1151,7 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
     egui::TopBottomPanel::top("top")
         .exact_height(30.0)
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(WINDOW).inner_margin(egui::Margin::symmetric(4, 3)))
+        .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::symmetric(4, 3)))
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -1062,24 +1159,24 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
                 if bar_btn(ui, "New", s.new_step != NewStep::Idle).on_hover_text("Start a new blank preset with a video format you choose").clicked() {
                     s.press_new();
                 }
-                if bar_btn(ui, "Open", false).on_hover_text("Open the saved preset").clicked() {
+                if bar_btn(ui, "Open", false).on_hover_text("Choose a vMix preset file").clicked() {
                     if s.outputs_busy() {
                         s.notice(STOP_OUTPUTS_MSG);
                     } else {
-                        s.load_preset();
+                        s.browse_req = Some(media::PickKind::PresetOpen);
                     }
                 }
                 if bar_btn(ui, "Save", false).on_hover_text("Save changes to currently open Preset file (Ctrl+S)").clicked() {
                     s.save_preset();
                 }
                 if bar_btn(ui, "Save As", false).on_hover_text("Save to a new Preset file").clicked() {
-                    s.save_preset();
+                    s.browse_req = Some(media::PickKind::PresetSave);
                 }
                 if bar_btn(ui, "Last", false).on_hover_text("Open the last preset").clicked() {
                     if s.outputs_busy() {
                         s.notice(STOP_OUTPUTS_MSG);
                     } else {
-                        s.load_preset();
+                        s.load_last_preset();
                     }
                 }
                 let screen_w = ctx.screen_rect().width();
@@ -1100,11 +1197,11 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher, fps: f32) {
                 }
                 // External Output indicator beside Fullscreen (lit while the External window is on).
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::click());
-                let on = s.external[0].open;
+                let on = s.external[0].open || s.decklink_active[0];
                 ui.painter().rect_filled(r, 2.0, if on { ACTIVE_RED } else { BTN_DARK });
                 ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "EXT", egui::FontId::proportional(12.0), if on { Color32::WHITE } else { TEXT_DIM });
                 if resp.on_hover_text(if on { "External Output is on — click to turn it off" } else { "External Output is off — click to turn it on" }).clicked() {
-                    s.toggle_external(0);
+                    s.toggle_external_route(0);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
@@ -1131,7 +1228,7 @@ fn status_bar(ctx: &egui::Context, s: &Switcher, fps: f32, stats: &performance::
     egui::TopBottomPanel::bottom("status")
         .exact_height(22.0)
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(WINDOW).inner_margin(egui::Margin::symmetric(8, 2)))
+        .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::symmetric(8, 2)))
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(RichText::new(s.cfg.format_label()).strong().size(12.0).color(Color32::from_rgb(0x3c, 0xe0, 0x50)));
@@ -1197,7 +1294,7 @@ fn monitors(ctx: &egui::Context, s: &mut Switcher, t: f64) {
     let panel_h = mon_h + 26.0 + 24.0;
     egui::TopBottomPanel::top("monitors")
         .exact_height(panel_h)
-        .frame(egui::Frame::new().fill(PANEL))
+        .frame(egui::Frame::new().fill(ctx.style().visuals.panel_fill))
         .show_separator_line(false)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -1221,48 +1318,6 @@ fn draw_safe_areas(p: &egui::Painter, r: egui::Rect, kind: u16) {
 /// One scope in its place: black behind it (or the picture showing through when it lies over
 /// the whole Preview), lines at 0/25/50/75/100 % for the waveforms (parade split in thirds), a
 /// circle and cross for the vectorscope.
-fn draw_scope(p: &egui::Painter, r: egui::Rect, tex: Option<egui::TextureId>, kind: u8, over: bool) {
-    let p = p.with_clip_rect(r);
-    p.rect_filled(r, 0.0, if over { Color32::from_black_alpha(110) } else { Color32::BLACK });
-    let faint = Stroke::new(1.0_f32, Color32::from_white_alpha(45));
-    let plot = r.shrink2(Vec2::new(4.0, 6.0));
-    if kind == SCOPE_VECTOR {
-        let sq = egui::Rect::from_center_size(plot.center(), Vec2::splat(plot.width().min(plot.height())));
-        p.circle_stroke(sq.center(), sq.width() / 2.0 * 0.9, faint);
-        p.line_segment([sq.center_top(), sq.center_bottom()], faint);
-        p.line_segment([sq.left_center(), sq.right_center()], faint);
-        if let Some(t) = tex {
-            p.image(t, sq, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-        }
-    } else {
-        let plot = egui::Rect::from_min_max(plot.min + Vec2::new(22.0, 0.0), plot.max);
-        for k in 0..=4 {
-            let y = plot.bottom() - plot.height() * k as f32 / 4.0;
-            p.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], faint);
-            p.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, format!("{}", k * 25), egui::FontId::proportional(9.0), Color32::from_white_alpha(150));
-        }
-        if kind == SCOPE_PARADE {
-            for k in 1..3 {
-                let x = plot.left() + plot.width() * k as f32 / 3.0;
-                p.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], faint);
-            }
-        }
-        if let Some(t) = tex {
-            p.image(t, plot, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-        }
-    }
-    let name = match kind {
-        SCOPE_RGB => "Waveform RGB",
-        SCOPE_Y => "Waveform Y",
-        SCOPE_PARADE => "Parade RGB",
-        _ => "Vectorscope",
-    };
-    p.text(r.right_top() + Vec2::new(-6.0, 4.0), egui::Align2::RIGHT_TOP, name, egui::FontId::proportional(10.0), Color32::from_white_alpha(150));
-    if tex.is_none() {
-        p.text(r.center(), egui::Align2::CENTER_CENTER, "…", egui::FontId::proportional(14.0), Color32::from_white_alpha(150));
-    }
-}
-
 fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32, h: f32) {
     ui.vertical(|ui| {
         ui.set_width(w);
@@ -1273,9 +1328,14 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
         let (bar, _) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::hover());
         let col = if is_output { OUTPUT } else { PREVIEW };
         ui.painter().rect_filled(bar, 0.0, col);
-        let num_txt = if num > 0 { num.to_string() } else { "–".into() };
-        ui.painter().text(bar.left_center() + Vec2::new(10.0, 0.0), egui::Align2::LEFT_CENTER, num_txt, egui::FontId::proportional(13.0), Color32::WHITE);
-        ui.painter().text(bar.left_center() + Vec2::new(32.0, 0.0), egui::Align2::LEFT_CENTER, &title, egui::FontId::proportional(13.0), Color32::WHITE);
+        let heading = if is_output { "Output" } else { "Preview" };
+        let caption = if num > 0 { format!("{num} · {title}") } else { "—".into() };
+        let left = bar.left_center() + Vec2::new(10.0, 0.0);
+        let label = ui.painter().text(left, egui::Align2::LEFT_CENTER, heading, egui::FontId::proportional(14.0), Color32::WHITE);
+        let right = bar.right() - if is_output { 94.0 } else { 67.0 };
+        let clip = egui::Rect::from_min_max(egui::pos2(label.right() + 10.0, bar.top()), egui::pos2(right, bar.bottom()));
+        ui.painter().with_clip_rect(clip).text(egui::pos2(clip.left(), left.y), egui::Align2::LEFT_CENTER,
+            caption, egui::FontId::proportional(12.0), Color32::from_white_alpha(218));
         if !is_output {
             // Preview tools, right of the title bar as in the original: waveform and safe areas.
             let mut x = bar.right() - 6.0;
@@ -1375,18 +1435,11 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
                     draw_safe_areas(&pp, pr, s.cfg.safe_type);
                 }
             }
-            // The scopes measure the picture itself when nothing covers it (the "+ Preview"
-            // layouts), otherwise the Preview input's own box picture.
-            s.preview_rect = match pic {
-                Some(f) if f != [0.0, 0.0, 1.0, 1.0] => place(f),
-                Some(_) if scopes.is_empty() => rect,
-                _ => s.preview_tile_rect,
-            };
             for (kind, f) in &scopes {
                 // Alone over the picture the scope keeps it visible underneath.
                 let over = pic == Some([0.0, 0.0, 1.0, 1.0]);
                 let tex = s.scope_tex.iter().find(|(k, _)| k == kind).map(|(_, t)| *t);
-                draw_scope(&painter, place(*f), tex, *kind, over);
+                scopes::draw(&painter, place(*f), tex, *kind, over);
             }
         }
         if resp.double_clicked() && is_output {
@@ -1496,15 +1549,17 @@ fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32) {
         let shown = if s.cfg.show_trans24 { 4 } else { 1 };
         for k in 0..shown {
             let tr = s.transitions[k];
+            let title = if tr.stinger.is_some() { format!("Stinger {}", k + 1) } else { tr.effect.name().into() };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
                 ui.add_space(13.0);
                 if ui
-                    .add_sized([bw - 17.0, bh], egui::Button::new(RichText::new(tr.effect.name()).strong()))
-                    .on_hover_text(format!("{} — {} ms", tr.effect.name(), tr.ms))
+                    .add_sized([bw - 17.0, bh], egui::Button::new(RichText::new(title).strong()))
+                    .on_hover_text(tr.stinger.and_then(|id| s.input(id)).map(|input| input.title.clone())
+                        .unwrap_or_else(|| format!("{} — {} ms", tr.effect.name(), tr.ms)))
                     .clicked()
                 {
-                    s.start_transition(tr.effect, tr.ms);
+                    s.start_transition_button(k);
                 }
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(16.0, bh), Sense::click());
                 ui.painter().rect_filled(r, 2.0, if resp.hovered() { BTN_HOVER } else { BTN });
@@ -1518,12 +1573,24 @@ fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32) {
                     ui.set_min_width(170.0);
                     ui.horizontal(|ui| {
                         ui.label("Duration");
-                        ui.add(egui::DragValue::new(&mut s.transitions[k].ms).range(1..=9999).speed(10.0).suffix(" ms"));
+                        if tr.stinger.is_some() {
+                            ui.label("From GT storyboard");
+                        } else {
+                            ui.add(egui::DragValue::new(&mut s.transitions[k].ms).range(1..=9999).speed(10.0).suffix(" ms"));
+                        }
                     });
                     ui.separator();
                     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                         for e in ALL_EFFECTS {
-                            ui.selectable_value(&mut s.transitions[k].effect, e, e.name());
+                            if ui.selectable_label(tr.stinger.is_none() && tr.effect == e, e.name()).clicked() {
+                                s.transitions[k].stinger = None;
+                                s.transitions[k].effect = e;
+                            }
+                        }
+                        ui.separator();
+                        ui.label("GT Stinger");
+                        for input in s.inputs.iter().filter(|input| input.kind.gt_seconds(false).is_some() && input.kind.gt_seconds(true).is_some()) {
+                            ui.selectable_value(&mut s.transitions[k].stinger, Some(input.id), &input.title);
                         }
                     });
                 });
@@ -1617,12 +1684,12 @@ fn draw_overlay_channels(painter: &egui::Painter, rect: egui::Rect, s: &Switcher
 
 fn draw_output_opts(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64, overlays: bool) {
     match &s.trans {
-        Some(tr) => {
+        Some(tr) if tr.stinger.is_none() => {
             let a = tr.from.and_then(|i| s.input(i));
             let b = s.input(tr.to);
             draw_transition(painter, rect, a, b, tr.effect, tr.progress / FULL, t, &s.inputs);
         }
-        None => {
+        _ => {
             if let Some(inp) = s.output.and_then(|i| s.input(i)) {
                 draw_source(painter, rect, inp, 1.0, t, &s.inputs);
             }
@@ -1630,6 +1697,18 @@ fn draw_output_opts(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: 
     }
     if overlays {
         draw_overlay_channels(painter, rect, s, t, false);
+    }
+    if let Some(tr) = &s.trans {
+        if let Some(stinger) = &tr.stinger {
+            if let Some(input) = s.input(stinger.input) {
+                let cue = if tr.progress < stinger.cut {
+                    gt::Cue::In((tr.progress / stinger.cut).clamp(0.0, 1.0))
+                } else {
+                    gt::Cue::Out(((tr.progress - stinger.cut) / (FULL - stinger.cut)).clamp(0.0, 1.0))
+                };
+                draw_gt_stinger(painter, rect, input, t, &s.inputs, cue);
+            }
+        }
     }
     if s.ftb_level > 0.0 {
         painter.rect_filled(rect, 0.0, Color32::from_black_alpha(s.ftb_level.clamp(0.0, FULL) as u8));
@@ -1871,7 +1950,7 @@ fn output_window(ctx: &egui::Context, s: &mut Switcher, t: f64, channel: usize) 
 
 fn inputs_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(6)))
+        .frame(egui::Frame::new().fill(ctx.style().visuals.panel_fill).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             // Category filter: coloured squares as in the original (first = all inputs).
             ui.horizontal(|ui| {
@@ -2175,10 +2254,6 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
         let tw = pic_w;
         let th = pic_h;
         let (r, resp) = ui.allocate_exact_size(Vec2::new(tw, th), Sense::click());
-        if s.preview == Some(id) {
-            // The scopes measure this picture when the Preview monitor is covered by them.
-            s.preview_tile_rect = r;
-        }
         let painter = ui.painter_at(r);
         if let Some(inp) = s.input(id) {
             if inp.kind.transparent() {
@@ -2297,7 +2372,7 @@ fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
     egui::SidePanel::right("mixer")
         .exact_width(330.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(WINDOW).inner_margin(egui::Margin::same(6)))
+        .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             ui.label(RichText::new("Audio Mixer").strong().color(Color32::WHITE));
             ui.add_space(2.0);
@@ -2370,7 +2445,7 @@ fn bottom_bar(ctx: &egui::Context, s: &mut Switcher, t: f64) {
     egui::TopBottomPanel::bottom("bottom")
         .exact_height(40.0)
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(WINDOW).inner_margin(egui::Margin::symmetric(2, 4)))
+        .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::symmetric(2, 4)))
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -2396,8 +2471,8 @@ fn bottom_bar(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                 }
                 ui.add_space(14.0);
                 external_menu(ui, s);
-                if big_btn(ui, "External", s.external[0].open, Some(red)).on_hover_text("Start or stop External Output 1").clicked() {
-                    s.toggle_external(0);
+                if big_btn(ui, "External", s.external[0].open || s.decklink_active[0], Some(red)).on_hover_text("Start or stop External Output 1").clicked() {
+                    s.toggle_external_route(0);
                 }
                 ui.add_space(14.0);
                 if gear_btn(ui, s.stream_setup, "Configure Streaming settings").clicked() {
@@ -2595,7 +2670,21 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input) {
             ui.label(RichText::new(f).size(11.0).color(TEXT_DIM));
             ui.end_row();
         }
-        if matches!(inp.kind, Kind::Device { .. }) {
+        let decklink = match &inp.kind {
+            Kind::Device { link, .. } => decklink::device_index(link),
+            _ => None,
+        };
+        if let Some(device) = decklink {
+            ui.label("Connector");
+            decklink_connector(ui, "decklink-capture-port", &mut inp.decklink_port);
+            ui.end_row();
+            ui.label("Video format");
+            decklink_mode_picker(ui, "input-decklink-mode", device, false, &mut inp.decklink_mode);
+            ui.end_row();
+            ui.label("Detected mode");
+            ui.label(inp.cam_current.as_ref().map(|mode| mode.label()).unwrap_or_else(|| inp.status.clone()));
+            ui.end_row();
+        } else if matches!(inp.kind, Kind::Device { .. }) {
             camera_mode_rows(ui, inp);
         }
         if let Kind::Title { text, sub } = &mut inp.kind {
@@ -2620,6 +2709,11 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input) {
                 ui.label(format!("{field}.Text"));
                 let mut value = texts.get(field).unwrap_or(default).clone();
                 if ui.add(egui::TextEdit::multiline(&mut value).desired_rows(1)).changed() {
+                    let now = ui.input(|i| i.time);
+                    let previous = inp.gt_change.as_ref().filter(|change| {
+                        matches!(document.data_cue((now - change.started) as f32, &change.field), Some(gt::Cue::DataOut(_, _)))
+                    }).map(|change| change.previous.clone()).unwrap_or_else(|| texts.clone());
+                    inp.gt_change = Some(gt::DataChange { started: now, field: field.clone(), previous });
                     if &value == default {
                         texts.remove(field);
                     } else {
@@ -2851,6 +2945,15 @@ fn external_menu_items(ui: &mut egui::Ui, s: &mut Switcher) {
                 s.toggle_external(channel);
                 ui.close_menu();
             }
+            if s.cfg.decklink_outputs[channel].device.is_some() {
+                if ui.button(if s.decklink_active[channel] { "Stop DeckLink output" } else { "Start DeckLink output" }).clicked() {
+                    s.toggle_external_route(channel);
+                    ui.close_menu();
+                }
+                if !s.decklink_status[channel].is_empty() {
+                    ui.label(&s.decklink_status[channel]);
+                }
+            }
             if ui.checkbox(&mut s.cfg.outputs[channel].overlays, "Overlays").changed() {
                 s.save_settings();
             }
@@ -2871,12 +2974,89 @@ fn external_menu_items(ui: &mut egui::Ui, s: &mut Switcher) {
         });
     }
     ui.separator();
-    for (page, label) in [(1, "Outputs / NDI / SRT…"), (6, "External Window Settings…")] {
+    for (page, label) in [(1, "Outputs / NDI / SRT…"), (6, "External Output Settings…")] {
         if ui.button(label).clicked() {
             s.settings_open = true;
             s.cfg.page = page;
             ui.close_menu();
         }
+    }
+}
+
+fn decklink_connector(ui: &mut egui::Ui, id: impl std::hash::Hash, port: &mut u32) {
+    egui::ComboBox::from_id_salt(id).selected_text(decklink::connection_name(*port)).show_ui(ui, |ui| {
+        for (label, value) in decklink::CONNECTIONS {
+            ui.selectable_value(port, value, label);
+        }
+    });
+}
+
+fn decklink_mode_picker(ui: &mut egui::Ui, id: &str, device: usize, playback: bool, mode: &mut u32) {
+    let modes_key = ui.id().with((id, device));
+    let modes = ui.data(|d| d.get_temp::<Vec<decklink::Mode>>(modes_key)).unwrap_or_else(|| {
+        let modes = decklink::display_modes(device, playback);
+        ui.data_mut(|d| d.insert_temp(modes_key, modes.clone()));
+        modes
+    });
+    let auto = if playback { "Auto (project format)" } else { "Auto (detect signal)" };
+    let selected = modes.iter().find(|m| m.mode == *mode).map(|m| m.label())
+        .unwrap_or_else(|| if *mode == 0 { auto.into() } else { "Unavailable mode".into() });
+    egui::ComboBox::from_id_salt(id).selected_text(selected).show_ui(ui, |ui| {
+        ui.selectable_value(mode, 0, auto);
+        for m in &modes {
+            ui.selectable_value(mode, m.mode, m.label());
+        }
+    });
+}
+
+fn decklink_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
+    ui.strong("DeckLink output");
+    let key = ui.id().with("decklink-output-channel");
+    let mut channel = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(OUTPUT_COUNT - 1);
+    ui.horizontal(|ui| {
+        for index in 0..OUTPUT_COUNT {
+            ui.selectable_value(&mut channel, index, format!("Output {}", index + 1));
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(key, channel));
+    if ui.button("Refresh DeckLink devices").clicked() {
+        let devices = decklink::refresh_devices();
+        for device in devices {
+            let modes = ui.id().with(("decklink-output-mode", device.index));
+            ui.data_mut(|d| d.remove::<Vec<decklink::Mode>>(modes));
+        }
+    }
+    let devices = decklink::devices_cached();
+    let route = &mut s.cfg.decklink_outputs[channel];
+    let before = route.device;
+    let name = before.map_or_else(|| "None".into(), |index| {
+        devices.iter().find(|d| d.index == index).map(|d| d.name.clone()).unwrap_or_else(|| format!("Device {} unavailable", index + 1))
+    });
+    egui::ComboBox::from_id_salt("decklink-output-device").selected_text(name).show_ui(ui, |ui| {
+        ui.selectable_value(&mut route.device, None, "None");
+        for device in devices.iter().filter(|device| device.playback) {
+            ui.selectable_value(&mut route.device, Some(device.index), &device.name);
+        }
+    });
+    if before != route.device {
+        route.mode = 0;
+        route.port = 0;
+        s.decklink_active[channel] = false;
+        s.decklink_status[channel].clear();
+    }
+    if let Some(device) = route.device {
+        ui.horizontal(|ui| {
+            ui.label("Connector");
+            decklink_connector(ui, "decklink-output-port", &mut route.port);
+            ui.label("Mode");
+            decklink_mode_picker(ui, "decklink-output-mode", device, true, &mut route.mode);
+        });
+        if ui.button(if s.decklink_active[channel] { "Stop DeckLink output" } else { "Start DeckLink output" }).clicked() {
+            s.toggle_external_route(channel);
+        }
+        ui.label(&s.decklink_status[channel]);
+    } else if !devices.iter().any(|device| device.playback) {
+        ui.label("No DeckLink playback device detected.");
     }
 }
 
@@ -2999,7 +3179,12 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
                 ui.label(RichText::new("DarkGreen").color(Color32::from_rgb(0x30, 0xc0, 0x30)));
                 ui.end_row();
                 ui.label("Theme:");
-                ui.label("Charcoal");
+                egui::ComboBox::from_id_salt("interface-theme")
+                    .selected_text(if s.cfg.theme == InterfaceTheme::Modern { "Modern" } else { "Classic" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.cfg.theme, InterfaceTheme::Classic, "Classic");
+                        ui.selectable_value(&mut s.cfg.theme, InterfaceTheme::Modern, "Modern");
+                    });
                 ui.end_row();
             });
             ui.add_space(6.0);
@@ -3133,7 +3318,9 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
             ui.label(RichText::new("Each output can open a separate local window. NDI and SRT transmission are unavailable in this build.").size(11.0).color(TEXT_DIM));
         }
         6 => {
-            ui.label("These options apply to all four local External windows.");
+            decklink_output_settings(ui, s);
+            ui.separator();
+            ui.strong("Local External windows");
             ui.label("Drag a window to a second screen and double-click to enter fullscreen. Press Esc to leave fullscreen.");
             ui.add_space(6.0);
             egui::Grid::new("set-ext").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -3226,12 +3413,39 @@ fn new_file_every(ui: &mut egui::Ui, id: &str, v: &mut u32) -> bool {
     *v != before
 }
 
-fn recording_format_picker(ui: &mut egui::Ui, id: &str, format: &mut media::RecordFormat) -> bool {
-    let label = |format: media::RecordFormat| format!("{} ({})", format.extension().to_ascii_uppercase(), format.codec());
+fn recording_format_tabs(ui: &mut egui::Ui, format: &mut media::RecordFormat, multi: bool) -> bool {
+    use media::RecordFormat::{H264, Hevc, Wmv};
+    let tabs: &[(&str, Option<media::RecordFormat>)] = if multi {
+        &[("AVI", None), ("vMix AVI", None), ("MKV", None), ("MP4", Some(H264)),
+          ("FFMPEG", None), ("MPEG-2 TS", None), ("WMV", Some(Wmv))]
+    } else {
+        &[("AVI", None), ("MPEG-2", None), ("WMV", Some(Wmv)), ("WMV Streaming", None),
+          ("MP4", Some(H264)), ("FFMPEG", None), ("vMix AVI", None)]
+    };
     let before = *format;
-    egui::ComboBox::from_id_salt(id).selected_text(label(*format)).show_ui(ui, |ui| {
-        for choice in media::RecordFormat::ALL {
-            ui.selectable_value(format, choice, label(choice));
+    ui.horizontal_wrapped(|ui| {
+        for &(name, choice) in tabs {
+            let active = choice == Some(*format) || (choice == Some(H264) && *format == Hevc);
+            let button = egui::Button::new(name).fill(if active { OUTPUT } else { BTN_DARK })
+                .min_size(Vec2::new(59.0, 24.0));
+            let response = ui.add_enabled(choice.is_some(), button);
+            if response.clicked() && !active {
+                if let Some(choice) = choice {
+                    *format = choice;
+                }
+            } else if choice.is_none() {
+                response.on_disabled_hover_text("This format requires an encoder that LiveMix does not yet support.");
+            }
+        }
+    });
+    *format != before
+}
+
+fn recording_profile(ui: &mut egui::Ui, id: &str, format: &mut media::RecordFormat) -> bool {
+    let before = *format;
+    egui::ComboBox::from_id_salt(id).width(140.0).selected_text(format.codec()).show_ui(ui, |ui| {
+        for codec in [media::RecordFormat::H264, media::RecordFormat::Hevc] {
+            ui.selectable_value(format, codec, codec.codec());
         }
     });
     *format != before
@@ -3251,17 +3465,21 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
 
     if s.rec_setup {
         let mut open = true;
-        egui::Window::new("Recording Setup").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+        egui::Window::new("Recording Setup").open(&mut open).collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(590.0).show(ctx, |ui| {
             let tab_id = ui.id().with("recording-slot");
             let mut secondary = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut secondary, false, "1");
-                ui.selectable_value(&mut secondary, true, "2");
+                ui.selectable_value(&mut secondary, false, "Recording 1");
+                ui.selectable_value(&mut secondary, true, "Recording 2");
                 if secondary {
                     changed |= ui.checkbox(&mut s.cfg.rec_second, "Enabled").changed();
                 }
             });
             ui.data_mut(|d| d.insert_temp(tab_id, secondary));
+            let codec = if secondary { &mut s.cfg.rec_second_codec } else { &mut s.cfg.rec_codec };
+            changed |= recording_format_tabs(ui, codec, false);
+            ui.separator();
             let output_names: Vec<_> = s.cfg.outputs.iter().enumerate()
                 .map(|(n, route)| format!("Output {} · {}", n + 1, src_name(s, route.source))).collect();
             let name = safe_name(&s.cfg.rec_name);
@@ -3300,9 +3518,11 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                     });
                 changed |= *source != before;
                 ui.end_row();
-                ui.label("Codec:");
-                changed |= recording_format_picker(ui, "rec-format", codec);
-                ui.end_row();
+                if *codec != media::RecordFormat::Wmv {
+                    ui.label("Profile:");
+                    changed |= recording_profile(ui, "rec-profile", codec);
+                    ui.end_row();
+                }
                 ui.label("Bit Rate:");
                 changed |= ui.add(egui::DragValue::new(mbps).range(1..=100).suffix(" Mbps")).changed();
                 ui.end_row();
@@ -3379,52 +3599,65 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
     if s.mc_setup {
         let mut open = true;
         let t = ctx.input(|i| i.time);
-        egui::Window::new("MultiCorder").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label("Each selected camera or Output is recorded to its own file.");
-            ui.add_space(4.0);
+        egui::Window::new("MultiCorder").open(&mut open).collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(620.0).show(ctx, |ui| {
             let cams: Vec<(u32, String)> = s.inputs.iter().filter(|i| matches!(i.kind, Kind::Device { .. })).map(|i| (i.id, format!("{} {}", s.number_of(i.id), i.title))).collect();
-            for channel in 0..OUTPUT_COUNT {
-                let source = src_name(s, s.cfg.outputs[channel].source);
-                changed |= ui.checkbox(&mut s.cfg.mc_outputs[channel], format!("Output {} · {source}", channel + 1)).changed();
-            }
-            for (id, name) in cams {
-                let mut on = !s.mc_off.contains(&id);
-                if ui.checkbox(&mut on, name).changed() {
-                    if on {
-                        s.mc_off.remove(&id);
+            let running = s.multicorder.is_some();
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    changed |= recording_format_tabs(ui, &mut s.cfg.mc_codec, true);
+                    egui::Grid::new("mc-setup").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                        if s.cfg.mc_codec != media::RecordFormat::Wmv {
+                            ui.label("Profile:");
+                            changed |= recording_profile(ui, "mc-profile", &mut s.cfg.mc_codec);
+                            ui.end_row();
+                        }
+                        ui.label("Video Bit Rate:");
+                        changed |= ui.add(egui::DragValue::new(&mut s.cfg.mc_mbps).range(1..=100).suffix(" Mbps")).changed();
+                        ui.end_row();
+                        ui.label("New File Every:");
+                        ui.horizontal(|ui| {
+                            changed |= new_file_every(ui, "mc-restart", &mut s.cfg.mc_split_min);
+                            ui.label("Minutes");
+                        });
+                        ui.end_row();
+                    });
+                });
+                if ui.add_sized([86.0, 78.0], egui::Button::new(if running { "Stop" } else { "Start" }).fill(BTN)).clicked() {
+                    if running && s.cfg.recording_confirm {
+                        s.confirm_stop = Some("MultiCorder");
                     } else {
-                        s.mc_off.insert(id);
+                        s.multicorder = if running { None } else { Some(t) };
                     }
                 }
-            }
+            });
             ui.separator();
-            egui::Grid::new("mc-setup").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Folder:");
-                ui.horizontal(|ui| {
-                    folder_line(ui, &s.cfg.mc_folder);
-                    if ui.button("Change Recording Folder").clicked() {
-                        s.browse_for = 2;
-                        s.browse_req = Some(media::PickKind::Folder);
+            egui::ScrollArea::vertical().max_height(240.0).min_scrolled_height(146.0).show(ui, |ui| {
+                egui::Grid::new("mc-sources").num_columns(2).min_col_width(240.0)
+                    .striped(true).spacing([10.0, 5.0]).show(ui, |ui| {
+                    ui.strong("Input");
+                    ui.strong("Folder");
+                    ui.end_row();
+                    for (id, name) in cams {
+                        let mut on = !s.mc_off.contains(&id);
+                        if ui.checkbox(&mut on, name).changed() {
+                            if on { s.mc_off.remove(&id); } else { s.mc_off.insert(id); }
+                        }
+                        folder_line(ui, &s.cfg.mc_folder);
+                        ui.end_row();
+                    }
+                    for channel in 0..OUTPUT_COUNT {
+                        let source = src_name(s, s.cfg.outputs[channel].source);
+                        changed |= ui.checkbox(&mut s.cfg.mc_outputs[channel], format!("Output {} · {source}", channel + 1)).changed();
+                        folder_line(ui, &s.cfg.mc_folder);
+                        ui.end_row();
                     }
                 });
-                ui.end_row();
-                ui.label("Codec:");
-                changed |= recording_format_picker(ui, "mc-format", &mut s.cfg.mc_codec);
-                ui.end_row();
-                ui.label("Video Bit Rate:");
-                ui.add(egui::DragValue::new(&mut s.cfg.mc_mbps).range(1..=100).suffix(" Mbps"));
-                ui.end_row();
-                ui.label("New File Every:");
-                ui.horizontal(|ui| {
-                    new_file_every(ui, "mc-restart", &mut s.cfg.mc_split_min);
-                    ui.label("Minutes");
-                });
-                ui.end_row();
             });
-            ui.horizontal(|ui| {
-                let running = s.multicorder.is_some();
-                if ui.button(if running { "Stop" } else { "Start" }).clicked() {
-                    s.multicorder = if running { None } else { Some(t) };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Change Recording Folder").clicked() {
+                    s.browse_for = 2;
+                    s.browse_req = Some(media::PickKind::Folder);
                 }
                 if ui.button("Close").clicked() {
                     s.mc_setup = false;
@@ -3491,7 +3724,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
 /// current format — frmNewPreset::d @0x259698 — then OK / Cancel).
 fn new_preset_windows(ctx: &egui::Context, s: &mut Switcher) {
     match s.new_step {
-        NewStep::Idle => {}
+        NewStep::Idle | NewStep::WaitingForSave => {}
         NewStep::SaveChanges => {
             let mut next = None;
             egui::Window::new("LiveMix").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
@@ -3515,7 +3748,13 @@ fn new_preset_windows(ctx: &egui::Context, s: &mut Switcher) {
             match next {
                 Some(1) => {
                     // Go on only when the preset was saved (sr::c → sr::zw).
-                    s.new_step = if s.save_preset() { NewStep::Format } else { NewStep::Idle };
+                    s.new_step = if s.save_preset() {
+                        NewStep::Format
+                    } else if s.browse_req == Some(media::PickKind::PresetSave) {
+                        NewStep::WaitingForSave
+                    } else {
+                        NewStep::Idle
+                    };
                 }
                 Some(2) => s.new_step = NewStep::Format,
                 Some(_) => s.new_step = NewStep::Idle,
@@ -3606,7 +3845,8 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
     if s.add_dialog.open {
         let mut open = true;
         let mut done = false;
-        egui::Window::new("Input Select").open(&mut open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
+        egui::Window::new("Input Select").open(&mut open).collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(650.0).show(ctx, |ui| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     // The original's input list (frmInput.tMenu), then this app's extras.
@@ -3621,12 +3861,21 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                         } else {
                             RichText::new(k.label()).color(TEXT_DIM.gamma_multiply(0.7)).italics()
                         };
-                        ui.selectable_value(&mut s.add_dialog.kind, k, label);
+                        let active = s.add_dialog.kind == k;
+                        if ui.add_sized([156.0, 19.0], egui::Button::new(label)
+                            .fill(if active { OUTPUT } else { BTN_DARK })).clicked()
+                        {
+                            if !s.add_dialog.kind.uses_device() || !k.uses_device() {
+                                s.add_dialog.device = 0;
+                            }
+                            s.add_dialog.kind = k;
+                            s.dialog_error.clear();
+                        }
                     }
                 });
                 ui.separator();
                 ui.vertical(|ui| {
-                    ui.set_width(290.0);
+                    ui.set_width(440.0);
                     ui.label(RichText::new(s.add_dialog.kind.label()).strong());
                     ui.label(RichText::new(s.add_dialog.kind.help()).color(TEXT_DIM).size(11.0));
                     ui.add_space(6.0);
@@ -3727,17 +3976,33 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                             }
                             ui.horizontal(|ui| {
                                 ui.label("Device");
+                                let previous = s.add_dialog.device;
                                 let sel = list.get(s.add_dialog.device).map(|d| d.name.clone()).unwrap_or_else(|| "— none found —".into());
                                 egui::ComboBox::from_id_salt("device").width(200.0).selected_text(sel).show_ui(ui, |ui| {
                                     for (k, d) in list.iter().enumerate() {
-                                        let label = if d.blackmagic { format!("{}  (Blackmagic)", d.name) } else { d.name.clone() };
+                                        let label = if decklink::device_index(&d.link).is_some() { format!("{}  (DeckLink SDK)", d.name) }
+                                            else if d.blackmagic { format!("{}  (WDM)", d.name) } else { d.name.clone() };
                                         ui.selectable_value(&mut s.add_dialog.device, k, label);
                                     }
                                 });
+                                if previous != s.add_dialog.device {
+                                    s.add_dialog.decklink_mode = 0;
+                                    s.add_dialog.decklink_port = 0;
+                                }
                                 if ui.button("Refresh").clicked() {
                                     s.refresh_devices = true;
                                 }
                             });
+                            if let Some(device) = list.get(s.add_dialog.device).and_then(|d| decklink::device_index(&d.link)) {
+                                ui.horizontal(|ui| {
+                                    ui.label("Connector");
+                                    decklink_connector(ui, "add-decklink-connector", &mut s.add_dialog.decklink_port);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Video format");
+                                    decklink_mode_picker(ui, "add-decklink-mode", device, false, &mut s.add_dialog.decklink_mode);
+                                });
+                            }
                             if s.add_dialog.devices_loaded {
                                 ui.label(RichText::new(format!("{} device(s) found on this computer", list.len())).size(11.0).color(TEXT_DIM));
                             }
@@ -3789,6 +4054,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
     // Set button, its right-click menu, or a double-click on its title or picture.
     if let Some(id) = s.settings_input {
         let mut open = true;
+        let mut close = false;
         // Other inputs, for the Layers section (number, id, title).
         let others: Vec<(usize, u32, String)> =
             s.inputs.iter().enumerate().filter(|(_, i)| i.id != id).map(|(n, i)| (n + 1, i.id, i.title.clone())).collect();
@@ -3803,6 +4069,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                 .collapsible(false)
                 .resizable(false)
                 .default_width(640.0)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.horizontal_top(|ui| {
                         ui.vertical(|ui| {
@@ -3816,10 +4083,11 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                         ui.separator();
                         ui.vertical(|ui| {
                             ui.set_width(460.0);
-                            ui.set_min_height(360.0);
                             ui.label(RichText::new(INPUT_PAGES[page]).strong().size(15.0).color(Color32::WHITE));
                             ui.add_space(6.0);
-                            match page {
+                            let height = (ctx.screen_rect().height() - 155.0).clamp(160.0, 650.0);
+                            egui::ScrollArea::vertical().id_salt(("input-properties", id, page))
+                                .auto_shrink([false, false]).max_height(height).show(ui, |ui| match page {
                                 0 => input_general(ui, inp),
                                 2 => input_colour_key(ui, inp),
                                 5 => {
@@ -3842,8 +4110,14 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                 _ => {
                                     ui.label(RichText::new("This section of the original is not available in this version yet.").color(TEXT_DIM));
                                 }
-                            }
+                            });
                         });
+                    });
+                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
                     });
                 });
         } else {
@@ -3853,7 +4127,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
         if let Some(p) = copy_pos {
             s.position_clipboard = Some(p);
         }
-        if !open {
+        if !open || close {
             s.settings_input = None;
         }
     }

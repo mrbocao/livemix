@@ -1785,6 +1785,7 @@ dependencies = [
  "roxmltree 0.21.2",
  "serde_json",
  "windows",
+ "windows-core",
  "zip",
 ]
 

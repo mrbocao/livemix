@@ -106,6 +106,10 @@ pub fn draw_source(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Inp
     draw_layered(p, r, inp, a, t, all, 0, Cue::Rest);
 }
 
+pub fn draw_gt_stinger(p: &Painter, r: Rect, inp: &Input, t: f64, all: &[Input], cue: Cue<'_>) {
+    draw_layered(p, r, inp, 1.0, t, all, 0, cue);
+}
+
 /// Input box picture with "Disable Effects on Input Previews": the input's own picture only,
 /// without its Position, crop or Layers.
 pub fn draw_plain(p: &Painter, r: Rect, inp: &Input, t: f64) {
@@ -171,7 +175,19 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
         }
         Kind::GtTitle { document, texts, .. } => {
             if let Some(document) = document {
-                document.draw(p, r, a, texts, cue);
+                let mut cue = cue;
+                let mut values = texts;
+                if matches!(cue, Cue::Rest | Cue::In(1.0)) {
+                    if let Some(change) = &inp.gt_change {
+                        if let Some(data_cue) = document.data_cue((t - change.started).max(0.0) as f32, &change.field) {
+                            cue = data_cue;
+                            if matches!(cue, Cue::DataOut(_, _)) {
+                                values = &change.previous;
+                            }
+                        }
+                    }
+                }
+                document.draw(p, r, a, values, cue, t);
             }
         }
         Kind::Title { text, sub } => {

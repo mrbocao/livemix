@@ -212,6 +212,7 @@ pub fn blackmagic_driver_installed() -> bool {
 pub enum Source {
     /// Camera: symbolic link and the chosen mode (None = Auto: best up to 1920x1080).
     Device(String, Option<CamMode>),
+    DeckLink(crate::decklink::CaptureConfig),
     File(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
@@ -225,6 +226,7 @@ pub fn start(src: Source) -> Arc<Shared> {
     sh.set_status("Starting…");
     let s2 = sh.clone();
     std::thread::spawn(move || match src {
+        Source::DeckLink(config) => crate::decklink::run_capture(s2, config),
         Source::Desktop => run_desktop(s2),
         Source::Sequence(folder, fps) => run_pictures(s2, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(s2, folder, false, 0.0, secs),
@@ -673,8 +675,8 @@ impl Recorder {
         self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at: Instant::now(), bgra: false });
     }
 
-    pub fn push_group(recorders: &[Arc<Self>], pixels: Vec<u8>, w: usize, h: usize, captured_at: Instant, bgra: bool) {
-        let frame = RecFrame { pixels: Arc::new(pixels), w, h, captured_at, bgra };
+    pub fn push_group(recorders: &[Arc<Self>], pixels: impl Into<Arc<Vec<u8>>>, w: usize, h: usize, captured_at: Instant, bgra: bool) {
+        let frame = RecFrame { pixels: pixels.into(), w, h, captured_at, bgra };
         for recorder in recorders {
             recorder.enqueue(frame.clone());
         }
@@ -710,8 +712,6 @@ pub enum RecordFormat {
 }
 
 impl RecordFormat {
-    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Wmv];
-
     pub fn parse(value: &str) -> Self {
         match value {
             "hevc" => Self::Hevc,
@@ -944,6 +944,8 @@ pub enum PickKind {
     Video,
     Image,
     Title,
+    PresetOpen,
+    PresetSave,
     /// Several video files (List input); answer is the paths joined by '\n'.
     VideoMany,
     /// A folder (Image Sequence / Photos).
@@ -956,7 +958,21 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let r = (|| -> Res<String> {
-            use windows::Win32::UI::Shell::{FOS_ALLOWMULTISELECT, FOS_PICKFOLDERS};
+            use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, FOS_ALLOWMULTISELECT, FOS_PICKFOLDERS};
+            let name_of = |it: &windows::Win32::UI::Shell::IShellItem| -> Res<String> {
+                let p = it.GetDisplayName(SIGDN_FILESYSPATH)?;
+                let s = p.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(p.0 as *const _));
+                Ok(s)
+            };
+            let preset = COMDLG_FILTERSPEC { pszName: windows::core::w!("vMix Preset (*.vmix)"), pszSpec: windows::core::w!("*.vmix") };
+            if kind == PickKind::PresetSave {
+                let d: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
+                d.SetFileTypes(&[preset])?;
+                d.SetDefaultExtension(windows::core::w!("vmix"))?;
+                d.Show(HWND::default())?;
+                return name_of(&d.GetResult()?);
+            }
             let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
             let video = COMDLG_FILTERSPEC {
                 pszName: windows::core::w!("Video files"),
@@ -965,6 +981,8 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
             let image = COMDLG_FILTERSPEC { pszName: windows::core::w!("Pictures"), pszSpec: windows::core::w!("*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.gif") };
             let all = COMDLG_FILTERSPEC { pszName: windows::core::w!("All files"), pszSpec: windows::core::w!("*.*") };
             match kind {
+                PickKind::PresetOpen => d.SetFileTypes(&[preset, all])?,
+                PickKind::PresetSave => unreachable!(),
                 PickKind::Video => d.SetFileTypes(&[video, all])?,
                 PickKind::Image => d.SetFileTypes(&[image, all])?,
                 PickKind::Title => d.SetFileTypes(&[
@@ -978,12 +996,6 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
                 PickKind::Folder => d.SetOptions(d.GetOptions()? | FOS_PICKFOLDERS)?,
             }
             d.Show(HWND(std::ptr::null_mut()))?;
-            let name_of = |it: &windows::Win32::UI::Shell::IShellItem| -> Res<String> {
-                let p = it.GetDisplayName(SIGDN_FILESYSPATH)?;
-                let s = p.to_string().unwrap_or_default();
-                CoTaskMemFree(Some(p.0 as *const _));
-                Ok(s)
-            };
             if kind == PickKind::VideoMany {
                 let items = d.GetResults()?;
                 let mut out = Vec::new();

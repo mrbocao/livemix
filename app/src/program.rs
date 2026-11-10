@@ -26,7 +26,23 @@ struct Readback {
     fence: glow::Fence,
     size: [u32; 2],
     captured_at: Instant,
-    recorders: Vec<Arc<crate::media::Recorder>>,
+    destinations: Destinations,
+}
+
+#[derive(Clone, Default)]
+pub struct Destinations {
+    pub recorders: Vec<Arc<crate::media::Recorder>>,
+    pub decklinks: Vec<crate::decklink::OutputSink>,
+    pub scope: Option<(ScopeKey, ScopeMailbox)>,
+}
+
+pub type ScopeKey = (Option<u32>, u8, bool);
+pub type ScopeMailbox = Arc<std::sync::Mutex<Option<ScopeFrame>>>;
+
+pub struct ScopeFrame {
+    pub key: ScopeKey,
+    pub size: [u32; 2],
+    pub pixels: Arc<Vec<u8>>,
 }
 
 // SAFETY: the fence is an opaque GL handle. Moving this state does not call GL
@@ -126,7 +142,7 @@ impl Target {
             let buffer = frame.buffer.id;
             self.free_buffers.push(frame.buffer);
             if status == glow::WAIT_FAILED {
-                for recorder in &frame.recorders { recorder.note_dropped_frames(1); }
+                for recorder in &frame.destinations.recorders { recorder.note_dropped_frames(1); }
                 result = Err("Could not wait for the Program readback".into());
                 break;
             }
@@ -135,13 +151,19 @@ impl Target {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
             let data = gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT);
             if data.is_null() {
-                for recorder in &frame.recorders { recorder.note_dropped_frames(1); }
+                for recorder in &frame.destinations.recorders { recorder.note_dropped_frames(1); }
                 result = Err("Could not map the Program readback".into());
                 break;
             }
-            let pixels = std::slice::from_raw_parts(data, len).to_vec();
+            let pixels = Arc::new(std::slice::from_raw_parts(data, len).to_vec());
             gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
-            crate::media::Recorder::push_group(&frame.recorders, pixels, w, h, frame.captured_at, true);
+            for sink in &frame.destinations.decklinks {
+                sink.submit(Arc::clone(&pixels), w, h);
+            }
+            if let Some((key, mailbox)) = frame.destinations.scope {
+                *mailbox.lock().unwrap() = Some(ScopeFrame { key, size: frame.size, pixels: Arc::clone(&pixels) });
+            }
+            crate::media::Recorder::push_group(&frame.destinations.recorders, pixels, w, h, frame.captured_at, true);
         }
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, previous_pack);
         result
@@ -153,13 +175,13 @@ impl Target {
         size: [u32; 2],
         meshes: &[egui::ClippedPrimitive],
         captured_at: Instant,
-        recorders: &[Arc<crate::media::Recorder>],
+        destinations: &Destinations,
     ) -> Result<(), String> {
         let gl = painter.gl();
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
         let previous_pack = gl.get_parameter_buffer(glow::PIXEL_PACK_BUFFER_BINDING);
-        let result = self.render(painter, size, meshes, captured_at, recorders);
+        let result = self.render(painter, size, meshes, captured_at, destinations);
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, previous_pack);
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
@@ -172,12 +194,12 @@ impl Target {
         size: [u32; 2],
         meshes: &[egui::ClippedPrimitive],
         captured_at: Instant,
-        recorders: &[Arc<crate::media::Recorder>],
+        destinations: &Destinations,
     ) -> Result<(), String> {
         let gl = painter.gl();
         let [width, height] = size.map(|dimension| dimension as i32);
         if self.readbacks.len() >= 2 * crate::model::OUTPUT_COUNT {
-            for recorder in recorders { recorder.note_dropped_frames(1); }
+            for recorder in &destinations.recorders { recorder.note_dropped_frames(1); }
             return Ok(());
         }
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
@@ -246,7 +268,7 @@ impl Target {
                 return Err(error);
             }
         };
-        self.readbacks.push_back(Readback { buffer, fence, size, captured_at, recorders: recorders.to_vec() });
+        self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone() });
         gl.flush();
         Ok(())
     }

@@ -235,6 +235,9 @@ pub struct Input {
     /// Camera: the capture mode chosen in Input Settings (None = Auto), every mode the camera
     /// offers and the one in use (filled in from the camera reader).
     pub cam_mode: Option<crate::media::CamMode>,
+    pub decklink_port: u32,
+    pub decklink_mode: u32,
+    pub gt_change: Option<crate::gt::DataChange>,
     pub cam_modes: Vec<crate::media::CamMode>,
     pub cam_current: Option<crate::media::CamMode>,
 }
@@ -275,6 +278,9 @@ impl Input {
             seek_ms: None,
             key: Key::default(),
             cam_mode: None,
+            decklink_port: 0,
+            decklink_mode: 0,
+            gt_change: None,
             cam_modes: Vec::new(),
             cam_current: None,
         }
@@ -285,6 +291,7 @@ impl Input {
 pub struct TransBtn {
     pub effect: Effect,
     pub ms: u32,
+    pub stinger: Option<u32>,
 }
 
 /// A running transition. `progress` is on the original's 0–255 scale (hm::r @0x8b760).
@@ -297,6 +304,13 @@ pub struct Trans {
     pub manual: bool,
     /// Per-input Quick Play / Cut: Output becomes `to`, Preview is kept (ms::w @0x12e904).
     pub direct: bool,
+    pub stinger: Option<Stinger>,
+}
+
+pub struct Stinger {
+    pub input: u32,
+    pub cut: f32,
+    switched: bool,
 }
 
 pub const OVERLAY_CHANNELS: usize = 8;
@@ -354,6 +368,7 @@ pub enum NewStep {
     /// "Do you wish to save changes to the current preset?" (frmCloseConfirm lblMessage:
     /// Save / Discard changes / Cancel).
     SaveChanges,
+    WaitingForSave,
     /// The "New Preset" window (frmNewPreset: Resolution, Frame Rate, OK, Cancel).
     Format,
 }
@@ -712,6 +727,8 @@ pub struct DeviceChoice {
 }
 
 pub struct AddDialog {
+    pub decklink_port: u32,
+    pub decklink_mode: u32,
     pub open: bool,
     pub kind: AddKind,
     pub name: String,
@@ -773,6 +790,7 @@ pub struct Switcher {
     pub play_active: bool,
     pub restart_active: bool,
     pub preset_name: String,
+    pub preset_file: Option<std::path::PathBuf>,
     /// The preset as last saved / opened / made new (None: never saved), for "save changes?".
     pub saved_text: Option<String>,
     /// Where the New button is: asking to save changes, or showing the New Preset window.
@@ -789,13 +807,8 @@ pub struct Switcher {
     // ---- requests from the UI to the app (real media, files, windows) ----
     /// Where the Output monitor is on screen (for snapshots and recording).
     pub output_rect: eframe::egui::Rect,
-    /// Where the scopes measure the Preview picture on screen (the picture itself when it is
-    /// shown uncovered, otherwise the Preview input's box picture).
-    pub preview_rect: eframe::egui::Rect,
-    /// Scope pictures of the Preview by kind (SCOPE_RGB …), made by the app from window pictures.
+    /// Scope pictures of the composed Preview by kind (SCOPE_RGB …).
     pub scope_tex: Vec<(u8, eframe::egui::TextureId)>,
-    /// Where the Preview input's own box picture is (scopes measure it when the picture is covered).
-    pub preview_tile_rect: eframe::egui::Rect,
     /// Interface frame counter (Preview Skip).
     pub ui_frame: u64,
     pub snapshot_req: bool,
@@ -804,6 +817,8 @@ pub struct Switcher {
     pub refresh_devices: bool,
     pub dialog_error: String,
     pub external: [ExternalWindow; OUTPUT_COUNT],
+    pub decklink_active: [bool; OUTPUT_COUNT],
+    pub decklink_status: [String; OUTPUT_COUNT],
     /// Input whose settings window (name, green-screen key) is open.
     pub settings_input: Option<u32>,
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
@@ -828,6 +843,13 @@ pub const OUTPUT_COUNT: usize = 4;
 pub struct ExternalWindow {
     pub open: bool,
     pub fullscreen: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeckLinkRoute {
+    pub device: Option<usize>,
+    pub port: u32,
+    pub mode: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -949,8 +971,16 @@ pub fn mv_title_height(layout: u8) -> f32 {
 }
 
 /// Settings window options. Defaults are the original's config defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InterfaceTheme {
+    #[default]
+    Classic,
+    Modern,
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
+    pub theme: InterfaceTheme,
     /// InputSize = 208x156 (ms::.cctor @0x12e000 falls back to 200x150).
     pub input_w: f32,
     pub input_h: f32,
@@ -982,6 +1012,7 @@ pub struct Settings {
     /// External window source (config OutputsExternal, empty = Output): SRC_OUTPUT, SRC_PREVIEW,
     /// SRC_MV1 / SRC_MV2 (MultiView 1 / 2) or an input id + 1.
     pub outputs: [OutputRoute; OUTPUT_COUNT],
+    pub decklink_outputs: [DeckLinkRoute; OUTPUT_COUNT],
     /// Fullscreen display source (config OutputsFullscreen, empty = Output), same codes.
     pub fs_source: u32,
     pub fs_overlays: bool,
@@ -1056,6 +1087,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            theme: InterfaceTheme::Classic,
             input_w: 208.0,
             input_h: 156.0,
             input_numbers: true,
@@ -1075,6 +1107,7 @@ impl Default for Settings {
             start_external: false,
             start_maximised: true,
             outputs: [OutputRoute::default(); OUTPUT_COUNT],
+            decklink_outputs: [DeckLinkRoute::default(); OUTPUT_COUNT],
             fs_source: SRC_OUTPUT,
             fs_overlays: true,
             fs_display: 1,
@@ -1151,6 +1184,7 @@ impl Switcher {
         let c = &self.cfg;
         let b = |v: bool| if v { "1" } else { "0" };
         let lines = [
+            format!("theme={}", if c.theme == InterfaceTheme::Modern { "modern" } else { "classic" }),
             format!("input_size={}x{}", c.input_w, c.input_h),
             format!("input_numbers={}", b(c.input_numbers)),
             format!("input_close_confirm={}", b(c.input_close_confirm)),
@@ -1169,6 +1203,9 @@ impl Switcher {
             format!("start_external={}", b(c.start_external)),
             format!("start_maximised={}", b(c.start_maximised)),
             format!("ext_source={}", c.outputs[0].source),
+            format!("decklink_outputs={}", c.decklink_outputs.iter().map(|route| {
+                format!("{},{},{}", route.device.map_or(-1, |n| n as i64), route.port, route.mode)
+            }).collect::<Vec<_>>().join(";")),
             format!("ext_overlays={}", b(c.outputs[0].overlays)),
             format!("additional_outputs={}", c.outputs[1..].iter()
                 .map(|out| format!("{},{}", out.source, b(out.overlays))).collect::<Vec<_>>().join(";")),
@@ -1231,6 +1268,7 @@ impl Switcher {
             let on = v == "1";
             let c = &mut self.cfg;
             match k {
+                "theme" => c.theme = if v == "modern" { InterfaceTheme::Modern } else { InterfaceTheme::Classic },
                 "input_size" => {
                     if let Some((w, h)) = v.split_once('x') {
                         c.input_w = w.parse::<f32>().unwrap_or(208.0).clamp(120.0, 480.0);
@@ -1254,6 +1292,16 @@ impl Switcher {
                 "start_external" => c.start_external = on,
                 "start_maximised" => c.start_maximised = on,
                 "ext_source" => c.outputs[0].source = v.parse().unwrap_or(SRC_OUTPUT),
+                "decklink_outputs" => {
+                    for (route, entry) in c.decklink_outputs.iter_mut().zip(v.split(';')) {
+                        let fields: Vec<_> = entry.split(',').collect();
+                        if let [device, port, mode] = fields.as_slice() {
+                            route.device = device.parse().ok();
+                            route.port = port.parse().unwrap_or(0);
+                            route.mode = mode.parse().unwrap_or(0);
+                        }
+                    }
+                }
                 "ext_overlays" => c.outputs[0].overlays = on,
                 "additional_outputs" => {
                     for (out, setting) in c.outputs[1..].iter_mut().zip(v.split(';')) {
@@ -1337,10 +1385,10 @@ const FTB_MS: u32 = 500; // config FTBDuration (read by me::.ctor @0x11edbc)
 const OVERLAY_MS: u32 = 500; // na::.ctor field e
 /// ii::.ctor @0xad634: default transition buttons.
 const DEFAULT_TRANSITIONS: [TransBtn; 4] = [
-    TransBtn { effect: Effect::Fade, ms: 500 },
-    TransBtn { effect: Effect::Merge, ms: 1000 },
-    TransBtn { effect: Effect::Wipe, ms: 1000 },
-    TransBtn { effect: Effect::CubeZoom, ms: 1000 },
+    TransBtn { effect: Effect::Fade, ms: 500, stinger: None },
+    TransBtn { effect: Effect::Merge, ms: 1000, stinger: None },
+    TransBtn { effect: Effect::Wipe, ms: 1000, stinger: None },
+    TransBtn { effect: Effect::CubeZoom, ms: 1000, stinger: None },
 ];
 const DEFAULT_TRANSITION_MS: u32 = 500; // ii::e fallback for an unknown button
 /// PlayList item defaults — PlaylistItem::.ctor (0x06006d87 @0x2c201c): m_Transition = 100
@@ -1350,7 +1398,7 @@ pub const PLAYLIST_TRANSITION_MS: u32 = 500;
 pub const PLAYLIST_DEFAULT_SECS: f32 = 5.0;
 
 impl Switcher {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         let ov = || Overlay { assigned: None, input: None, on: false, level: 0.0, effect: Effect::Fade, ms: OVERLAY_MS, on_preview: false };
         Switcher {
             inputs: Vec::new(),
@@ -1382,6 +1430,8 @@ impl Switcher {
             settings_open: false,
             overlay_dialog: false,
             add_dialog: AddDialog {
+                decklink_port: 0,
+                decklink_mode: 0,
                 open: false,
                 kind: AddKind::Camera,
                 name: String::new(),
@@ -1404,6 +1454,7 @@ impl Switcher {
             restart_active: false,
             preset_name: "Untitled".into(),
             saved_text: None,
+            preset_file: None,
             new_step: NewStep::Idle,
             new_format: (6, 6, true),
             notice: String::new(),
@@ -1413,15 +1464,15 @@ impl Switcher {
             tbar_rest_bottom: true,
             frame_acc: 0.0,
             output_rect: eframe::egui::Rect::NOTHING,
-            preview_rect: eframe::egui::Rect::NOTHING,
             scope_tex: Vec::new(),
-            preview_tile_rect: eframe::egui::Rect::NOTHING,
             ui_frame: 0,
             snapshot_req: false,
             browse_req: None,
             refresh_devices: false,
             dialog_error: String::new(),
             external: [ExternalWindow::default(); OUTPUT_COUNT],
+            decklink_active: [false; OUTPUT_COUNT],
+            decklink_status: Default::default(),
             settings_input: None,
             confirm_stop: None,
             position_clipboard: None,
@@ -1540,12 +1591,42 @@ impl Switcher {
         // Effect 100 (Cut) runs with step 255: it lands on the next output frame.
         let step = if effect == Effect::Cut { FULL } else { step_for(ms) };
         self.on_transition_start(to);
-        self.trans = Some(Trans { from: self.output, to, effect, progress: 0.0, step, manual: false, direct });
+        self.trans = Some(Trans { from: self.output, to, effect, progress: 0.0, step, manual: false, direct, stinger: None });
     }
 
     pub fn start_transition(&mut self, effect: Effect, ms: u32) {
         let Some(to) = self.preview else { return };
         self.begin(to, effect, ms, false);
+    }
+
+    pub fn start_transition_button(&mut self, index: usize) {
+        let button = self.transitions[index];
+        let Some(source) = button.stinger else {
+            self.start_transition(button.effect, button.ms);
+            return;
+        };
+        let Some(to) = self.preview else { return };
+        if self.trans.is_some() {
+            return;
+        }
+        if source == to || self.output == Some(source) {
+            self.notify("Select another input as Preview/Output to use this GT Stinger.");
+            return;
+        }
+        let durations = self.input(source).and_then(|input| {
+            Some((input.kind.gt_seconds(false)?, input.kind.gt_seconds(true)?))
+        });
+        let Some((enter, exit)) = durations else {
+            self.notify("A GT Stinger requires both Transition In and Transition Out.");
+            return;
+        };
+        let frames = |seconds: f32| (seconds * output_fps()).round().max(1.0);
+        let (enter, exit) = (frames(enter), frames(exit));
+        let step = FULL / (enter + exit);
+        self.trans = Some(Trans {
+            from: self.output, to, effect: Effect::Cut, progress: 0.0, step,
+            manual: false, direct: false, stinger: Some(Stinger { input: source, cut: enter * step, switched: false }),
+        });
     }
 
     /// Per-input Quick Play: that input goes to Output with the Quick Play effect; Preview kept.
@@ -1597,7 +1678,7 @@ impl Switcher {
             self.on_transition_start(to);
             // hm::set_s uses the effect of transition 1 (ii::get_a).
             let e = self.transitions[0].effect;
-            self.trans = Some(Trans { from: self.output, to, effect: if e == Effect::Cut { Effect::Fade } else { e }, progress, step: 0.0, manual: true, direct: false });
+            self.trans = Some(Trans { from: self.output, to, effect: if e == Effect::Cut { Effect::Fade } else { e }, progress, step: 0.0, manual: true, direct: false, stinger: None });
         }
         if let Some(t) = &mut self.trans {
             t.progress = progress;
@@ -1704,6 +1785,14 @@ impl Switcher {
     }
 
     pub fn remove_input(&mut self, id: u32) {
+        for button in &mut self.transitions {
+            if button.stinger == Some(id) {
+                button.stinger = None;
+            }
+        }
+        if self.trans.as_ref().and_then(|tr| tr.stinger.as_ref()).is_some_and(|stinger| stinger.input == id) {
+            self.trans = None;
+        }
         self.inputs.retain(|i| i.id != id);
         for mv in &mut self.cfg.mv_boxes {
             for b in mv.iter_mut().filter(|b| **b == id + 1) {
@@ -1749,13 +1838,30 @@ impl Switcher {
     /// One output frame: hm::r @0x8b760 (transition) and rs::t @0x1b0890 (layers).
     fn output_frame(&mut self) {
         let mut done = None;
+        let mut stinger_cut = None;
+        let mut stinger_done = false;
         if let Some(tr) = &mut self.trans {
             if !tr.manual {
                 tr.progress += tr.step;
-                if tr.progress >= FULL {
+                if let Some(stinger) = &mut tr.stinger {
+                    if !stinger.switched && tr.progress + 0.001 >= stinger.cut {
+                        stinger.switched = true;
+                        stinger_cut = Some(tr.to);
+                    }
+                    stinger_done = tr.progress + 0.001 >= FULL;
+                } else if tr.progress >= FULL {
                     done = Some((tr.to, tr.direct));
                 }
             }
+        }
+        if let Some(to) = stinger_cut {
+            let current = self.trans.take();
+            self.on_transition_start(to);
+            self.finish_transition(to, false);
+            self.trans = current;
+        }
+        if stinger_done {
+            self.trans = None;
         }
         if let Some((to, direct)) = done {
             self.finish_transition(to, direct);
@@ -1933,6 +2039,8 @@ impl Switcher {
         };
         let name = if d.name.trim().is_empty() { default_name } else { d.name.trim().to_string() };
         let mut i = Input::new(0, &name, kind);
+        i.decklink_port = d.decklink_port;
+        i.decklink_mode = d.decklink_mode;
         if d.kind == AddKind::TestVideo {
             i.duration = d.length;
         }
@@ -1952,7 +2060,7 @@ impl Switcher {
 
     // ------------------------------------------------------------ presets
 
-    fn preset_path() -> std::path::PathBuf {
+    fn legacy_preset_path() -> std::path::PathBuf {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -1960,15 +2068,39 @@ impl Switcher {
             .join("livemix_preset.txt")
     }
 
-    /// Saves the preset; false when it could not be written (then New stops, as sr::c only goes
-    /// on when sr::zw saved).
+    fn last_preset_path() -> std::path::PathBuf {
+        crate::media::storage_folder().join("last-preset.txt")
+    }
+
+    fn remember_preset(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.preset_name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        self.preset_file = Some(path.to_path_buf());
+        self.saved_text = Some(self.preset_text());
+        crate::preset::write_file(&Self::last_preset_path(), path.to_string_lossy().as_bytes())
+    }
+
     pub fn save_preset(&mut self) -> bool {
-        let out = self.preset_text();
-        match std::fs::write(Self::preset_path(), &out) {
+        match self.preset_file.clone().filter(|path| path.extension().is_some_and(|v| v.eq_ignore_ascii_case("vmix"))) {
+            Some(path) => self.save_preset_to(&path),
+            None => {
+                self.browse_req = Some(crate::media::PickKind::PresetSave);
+                false
+            }
+        }
+    }
+
+    pub fn save_preset_to(&mut self, path: &std::path::Path) -> bool {
+        if !path.extension().is_some_and(|v| v.eq_ignore_ascii_case("vmix")) {
+            self.notify("Save the project with the .vmix extension.");
+            return false;
+        }
+        match crate::preset::encode(self).and_then(|xml| crate::preset::write_file(path, xml.as_bytes())) {
             Ok(_) => {
-                self.preset_name = "livemix_preset".into();
-                self.saved_text = Some(out);
-                self.notify("Preset saved");
+                let last = self.remember_preset(path);
+                self.notify(&match last {
+                    Ok(()) => format!("Preset saved: {}", path.display()),
+                    Err(error) => format!("Preset saved. Could not update Last: {error}"),
+                });
                 true
             }
             Err(e) => {
@@ -1998,7 +2130,15 @@ impl Switcher {
     }
 
     pub fn external_active(&self) -> bool {
-        self.external.iter().any(|window| window.open)
+        self.external.iter().any(|window| window.open) || self.decklink_active.contains(&true)
+    }
+
+    pub fn toggle_external_route(&mut self, channel: usize) {
+        if self.cfg.decklink_outputs[channel].device.is_some() {
+            self.decklink_active[channel] = !self.decklink_active[channel];
+        } else {
+            self.toggle_external(channel);
+        }
     }
 
     pub fn toggle_external(&mut self, channel: usize) {
@@ -2085,11 +2225,16 @@ impl Switcher {
         // Position and layers of each input (by input number).
         let fmt_pos = |p: &Position| format!("{},{},{},{},{},{},{}", p.zoom, p.pan_x, p.pan_y, p.crop[0], p.crop[1], p.crop[2], p.crop[3]);
         for (n, i) in self.inputs.iter().enumerate() {
+            out.push_str(&format!("input_options\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                n + 1, i.collapsed as u8, i.audio_on as u8, i.bus_m as u8, i.bus_a as u8, i.bus_b as u8));
             if i.place != Position::default() {
                 out.push_str(&format!("place\t{}\t{}\n", n + 1, fmt_pos(&i.place)));
             }
             if let Some(m) = &i.cam_mode {
                 out.push_str(&format!("cammode\t{}\t{}\n", n + 1, m.code()));
+            }
+            if i.decklink_port != 0 || i.decklink_mode != 0 {
+                out.push_str(&format!("decklink_port\t{}\t{}\t{}\n", n + 1, i.decklink_port, i.decklink_mode));
             }
             for (k, l) in i.layers.iter().enumerate() {
                 if l.input.is_some() {
@@ -2098,7 +2243,7 @@ impl Switcher {
             }
         }
         for (k, tb) in self.transitions.iter().enumerate() {
-            out.push_str(&format!("transition\t{}\t{}\t{}\n", k, tb.effect.code(), tb.ms));
+            out.push_str(&format!("transition\t{}\t{}\t{}\t{}\n", k, tb.effect.code(), tb.ms, num(tb.stinger)));
         }
         for (channel, overlay) in self.overlays.iter().enumerate() {
             if let Some(source) = overlay.assigned {
@@ -2109,15 +2254,50 @@ impl Switcher {
         out
     }
 
-    pub fn load_preset(&mut self) {
-        let Ok(text) = std::fs::read_to_string(Self::preset_path()) else {
-            self.notify("No saved preset yet — use Save first");
-            return;
-        };
-        self.load_preset_text(&text);
+    pub fn load_last_preset(&mut self) {
+        let path = std::fs::read_to_string(Self::last_preset_path()).ok()
+            .filter(|p| !p.trim().is_empty()).map(std::path::PathBuf::from);
+        let path = path.or_else(|| {
+            let legacy = Self::legacy_preset_path();
+            legacy.is_file().then_some(legacy)
+        });
+        if let Some(path) = path {
+            self.load_preset_from(&path);
+        } else {
+            self.notify("No recent preset yet. Open or save a project first.");
+        }
     }
 
-    fn load_preset_text(&mut self, text: &str) {
+    pub fn load_preset_from(&mut self, path: &std::path::Path) {
+        if self.outputs_busy() {
+            self.notify(STOP_OUTPUTS_MSG);
+            return;
+        }
+        let now = self.now;
+        let result = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|text| {
+            if text.starts_with("livemix-preset 1") {
+                self.load_preset_text(&text);
+                Ok(Vec::new())
+            } else {
+                crate::preset::decode(self, path, &text)
+            }
+        });
+        match result {
+            Ok(warnings) => {
+                self.now = now;
+                let last = self.remember_preset(path);
+                set_output_fps(self.cfg.rate());
+                self.notify(&match (last, warnings.is_empty()) {
+                    (_, false) => format!("Preset opened. Unsupported inputs shown as blank: {}", warnings.join(", ")),
+                    (Err(error), _) => format!("Preset opened. Could not update Last: {error}"),
+                    (Ok(()), _) => format!("Preset opened: {}", path.display()),
+                });
+            }
+            Err(error) => self.notify(&format!("Could not open preset: {error}")),
+        }
+    }
+
+    pub(crate) fn load_preset_text(&mut self, text: &str) {
         let mut s = Self::empty();
         let mut ids = Vec::new();
         for line in text.lines() {
@@ -2177,6 +2357,25 @@ impl Switcher {
                         }
                     }
                 }
+                Some("input_options") if f.len() >= 7 => {
+                    if let Some(i) = f[1].parse::<usize>().ok()
+                        .and_then(|n| n.checked_sub(1)).and_then(|n| ids.get(n)).and_then(|&id| s.input_mut(id))
+                    {
+                        i.collapsed = f[2] == "1";
+                        i.audio_on = f[3] == "1";
+                        i.bus_m = f[4] == "1";
+                        i.bus_a = f[5] == "1";
+                        i.bus_b = f[6] == "1";
+                    }
+                }
+                Some("decklink_port") if f.len() >= 3 => {
+                    if let Some(i) = f[1].parse::<usize>().ok()
+                        .and_then(|n| n.checked_sub(1)).and_then(|n| ids.get(n)).and_then(|&id| s.input_mut(id))
+                    {
+                        i.decklink_port = f[2].parse().unwrap_or(0);
+                        i.decklink_mode = f.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    }
+                }
                 Some("place") if f.len() >= 3 => {
                     let n: usize = f[1].parse().unwrap_or(0);
                     if let (Some(id), Some(p)) = (ids.get(n.wrapping_sub(1)).copied(), parse_pos(f[2])) {
@@ -2207,7 +2406,9 @@ impl Switcher {
                 Some("transition") if f.len() >= 4 => {
                     if let Ok(k) = f[1].parse::<usize>() {
                         if k < 4 {
-                            s.transitions[k] = TransBtn { effect: Effect::from_code(f[2].parse().unwrap_or(0)), ms: f[3].parse().unwrap_or(DEFAULT_TRANSITION_MS) };
+                            let stinger = f.get(4).and_then(|n| n.parse::<usize>().ok()).and_then(|n| n.checked_sub(1))
+                                .and_then(|n| ids.get(n)).copied();
+                            s.transitions[k] = TransBtn { effect: Effect::from_code(f[2].parse().unwrap_or(0)), ms: f[3].parse().unwrap_or(DEFAULT_TRANSITION_MS), stinger };
                         }
                     }
                 }
