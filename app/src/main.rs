@@ -757,7 +757,7 @@ impl App {
                     self.s.notice(&format!("DeckLink Output {}: {error}", channel + 1));
                 } else {
                     self.s.decklink_status[channel] = if sink.frames() > 0 {
-                        "Sending video".into()
+                        "Sending DeckLink output".into()
                     } else {
                         "Starting DeckLink output…".into()
                     };
@@ -3550,6 +3550,9 @@ fn decklink_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
         ui.label(&s.decklink_status[channel]);
     } else if !devices.iter().any(|device| device.playback) {
         ui.label("No DeckLink playback device detected.");
+        if cfg!(target_os = "macos") {
+            ui.label("Install Desktop Video and use a DeckLink-enabled FFmpeg build, then refresh.");
+        }
     }
 }
 

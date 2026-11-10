@@ -17,6 +17,7 @@ pub struct Buffer {
     first: u64,
     data: VecDeque<Stereo>,
     live_end: Option<Instant>,
+    live_latency: i64,
     file_epoch: u64,
 }
 
@@ -32,10 +33,19 @@ impl Buffer {
         if samples.is_empty() { return; }
         let now = Instant::now();
         let duration = sample_duration(samples.len());
-        let end = self.live_end.map(|previous| previous + duration)
-            .filter(|end| signed_frames(*end, now).abs() <= 1920);
+        let end = self.live_end.and_then(|previous| {
+            let predicted = previous + duration;
+            let error = signed_frames(now, predicted);
+            if error.abs() > 5760 { return None; }
+            // Follow slow drift between the device and system clocks while
+            // filtering out callback and network delivery jitter.
+            let correction = (error / 64).clamp(-2, 2);
+            let step = sample_duration(correction.unsigned_abs() as usize);
+            Some(if correction < 0 { predicted - step } else { predicted + step })
+        });
         if end.is_none() { self.data.clear(); }
         self.live_end = Some(end.unwrap_or(now));
+        self.live_latency = (samples.len() as i64).clamp(1440, 5760);
         self.append(samples.iter().copied());
     }
 
@@ -52,7 +62,7 @@ impl Buffer {
         } else {
             let Some(end) = self.live_end else { return };
             // Read slightly behind capture arrival to accommodate packet delivery jitter.
-            let offset = signed_frames(at, end) - 1440;
+            let offset = signed_frames(at, end) - self.live_latency;
             self.data.len() as i64 + offset - frames as i64
         };
         for n in 0..frames {

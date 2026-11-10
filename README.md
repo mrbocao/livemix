@@ -65,6 +65,12 @@ Use **Add Input → Audio Input** for a microphone, audio interface, or the sepa
 
 Program and MultiView routes use the Master mix. Preview and specific-input routes use the corresponding input audio. MP4 and RTMP/SRT carry stereo AAC, NDI and OMT carry stereo audio, and DeckLink carries embedded PCM. MultiCorder uses the audio of each recorded source.
 
+To launch the macOS bundle with a separate DeckLink-enabled FFmpeg executable from Terminal, use the actual paths on your Mac.
+
+```sh
+LIVEMIX_DECKLINK_FFMPEG=/path/to/decklink-ffmpeg /Applications/LiveMix.app/Contents/MacOS/livemix
+```
+
 ## Current limits
 
 LiveMix is in alpha. DeckLink audio and video require testing with physical hardware. On macOS, select the playback connector in Blackmagic Desktop Video Setup. MP4 recording on macOS supports H.264 and HEVC. Windows WMV recording is video-only. GT templates and project presets support a subset of their respective features. Sustained network frame rates depend on the source, encoder, machine, and receiver.
