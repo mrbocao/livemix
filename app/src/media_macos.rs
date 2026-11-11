@@ -1,6 +1,6 @@
 //! Video I/O using FFmpeg's AVFoundation and VideoToolbox backends on macOS.
 pub use crate::media_common::*;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -8,7 +8,11 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-pub fn blackmagic_driver_installed() -> bool { false }
+pub fn blackmagic_driver_installed() -> bool {
+    !crate::decklink::devices_cached().is_empty()
+        || Path::new("/Library/Frameworks/DeckLinkAPI.framework").exists()
+        || Path::new("/Library/Application Support/Blackmagic Design/Blackmagic DeckLink/DeckLinkAPI.bundle").exists()
+}
 
 fn avfoundation_devices() -> Vec<(String, String)> {
     let Ok(list) = crate::stream::command().args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
@@ -29,15 +33,21 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         .collect()
 }
 
-pub fn start(src: Source) -> Arc<Shared> {
+pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
     let shared = Arc::new(Shared::default());
+    shared.paused.store(paused, Relaxed);
     shared.set_status("Starting…");
+    if let Source::File(path) = &src {
+        let (source, path) = (shared.clone(), path.clone());
+        std::thread::spawn(move || crate::audio::play_file(source, path));
+    }
     let worker = shared.clone();
     std::thread::spawn(move || match src {
         Source::DeckLink(config) => crate::decklink::run_capture(worker, config),
         Source::Ndi(name) => crate::ndi::run_capture(worker, &name),
         Source::Omt(name) => crate::omt::run_capture(worker, &name),
         Source::Srt(config) => crate::srt::run_capture(worker, config),
+        Source::AudioDevice(device) => crate::audio::capture_device(worker, &device),
         Source::Sequence(folder, fps) => run_pictures(worker, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(worker, folder, false, 0.0, secs),
         Source::Desktop => {
@@ -54,6 +64,10 @@ pub fn start(src: Source) -> Arc<Shared> {
         Source::File(path) => play(&worker, &path),
     });
     shared
+}
+
+pub fn start_for_gl(src: Source, paused: bool) -> Arc<Shared> {
+    start_with_pause(src, paused)
 }
 
 fn capture(shared: &Shared, index: &str, mode: Option<CamMode>) {
@@ -95,6 +109,7 @@ fn play(shared: &Shared, path: &str) {
     shared.dur_ms.store(duration, Relaxed);
     let mut position = 0;
     while !shared.stop.load(Relaxed) {
+        crate::audio::reset_position(shared);
         let mut cmd = crate::stream::command();
         cmd.args(["-re", "-ss", &format!("{:.3}", position as f64 / 1000.0), "-i", path]);
         let mut count = 0_u64;
@@ -108,7 +123,9 @@ fn play(shared: &Shared, path: &str) {
                 return false;
             }
             publish(shared, frame);
-            shared.pos_ms.store(position + (count as f64 * 1000.0 / fps) as u64, Relaxed);
+            let ms = position + (count as f64 * 1000.0 / fps) as u64;
+            shared.pos_ms.store(ms, Relaxed);
+            crate::audio::mark_position(shared, ms);
             count += 1;
             true
         });
@@ -172,7 +189,7 @@ fn read_video(shared: &Shared, mut cmd: Command, mut consume: impl FnMut(Frame) 
     read
 }
 
-fn publish(shared: &Shared, mut frame: Frame) {
+pub(crate) fn publish(shared: &Shared, mut frame: Frame) {
     let key = shared.key.load(Relaxed);
     if key != 0 {
         let rgb = [(key >> 16) as u8, (key >> 8) as u8, key as u8];
@@ -209,10 +226,8 @@ fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecO
     let (n, d) = rate_fraction(opts.fps);
     let size = opts.size.unwrap_or((first.w as u32, first.h as u32));
     let mut cmd = crate::stream::command();
-    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "rawvideo",
-        "-pixel_format", if first.bgra { "bgra" } else { "rgba" },
-        "-video_size", &format!("{}x{}", first.w, first.h), "-framerate", &format!("{n}/{d}"), "-i", "pipe:0",
-        "-vf", &format!("scale={}:{}", size.0, size.1), "-an", "-pix_fmt", "yuv420p",
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "matroska", "-i", "pipe:0",
+        "-vf", &format!("scale={}:{}", size.0, size.1), "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
         "-c:v", encoder, "-b:v", &format!("{}M", opts.mbps.clamp(1, 100))]);
     if opts.hw { cmd.args(["-allow_sw", "1"]); }
     if opts.format == RecordFormat::Hevc { cmd.args(["-tag:v", "hvc1"]); }
@@ -220,25 +235,30 @@ fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecO
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         .map_err(|e| format!("Could not start FFmpeg: {e}"))?;
     *status.lock().unwrap() = encoder.into();
-    let mut pipe = child.stdin.take().unwrap();
     let write_result = (|| {
-        let start = first.captured_at;
+        let start = first.timeline_origin.unwrap_or(first.captured_at);
         let dimensions = (first.w, first.h, first.bgra);
+        let mut pipe = crate::audio::AvPipe::new(child.stdin.take().unwrap(), first.w as u32, first.h as u32, n, d)?;
         let mut next = 0_u64;
-        let mut previous = first.pixels.clone();
+        let mut previous: Option<Arc<Vec<u8>>> = None;
         for frame in std::iter::once(first).chain(rx) {
             if (frame.w, frame.h, frame.bgra) != dimensions { continue; }
             let slot = (frame.captured_at.saturating_duration_since(start).as_secs_f64()
                 * f64::from(n) / f64::from(d)).round() as u64;
             if slot < next { continue; }
-            for _ in 0..(slot - next).min(u64::from(n / d).max(1)) { pipe.write_all(&previous)?; }
-            pipe.write_all(&frame.pixels)?;
-            previous = frame.pixels;
+            let mut pixels = frame.pixels;
+            if !frame.bgra {
+                for pixel in Arc::make_mut(&mut pixels).chunks_exact_mut(4) { pixel.swap(0, 2); }
+            }
+            if let Some(previous) = &previous {
+                for _ in 0..(slot - next).min(u64::from(n / d).max(1)) { pipe.frame(previous, &[])?; }
+            }
+            pipe.frame(&pixels, &frame.audio)?;
+            previous = Some(pixels);
             next = slot + 1;
         }
         Ok::<(), std::io::Error>(())
     })();
-    drop(pipe);
     let exit = child.wait().map_err(|e| e.to_string())?;
     if write_result.is_err() || !exit.success() { return Err(format!("FFmpeg could not complete the {encoder} recording")); }
     Ok(())
@@ -357,6 +377,8 @@ fn ffmpeg_video_roundtrip() {
     let origin = Instant::now();
     for i in 0..12 {
         recorder.tx.send(RecFrame {
+            timeline_origin: None,
+            audio: crate::audio::test_tone(1920),
             pixels: Arc::new([180, 55, 20, 255].repeat(64 * 48)),
             w: 64, h: 48, bgra: false, captured_at: origin + Duration::from_millis(i * 40),
         }).unwrap();
@@ -365,11 +387,14 @@ fn ffmpeg_video_roundtrip() {
     writer.join().unwrap();
     let error = error.lock().unwrap().clone();
     assert!(error.is_empty(), "{error}");
-    let shared = start(Source::File(path.clone()));
+    crate::audio::assert_audio_file(Path::new(&path));
+    let shared = start_with_pause(Source::File(path.clone()), true);
     let deadline = Instant::now() + Duration::from_secs(5);
     while shared.seq.load(Relaxed) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(shared.seq.load(Relaxed), 1, "paused clip must show and hold its first frame");
     shared.stop.store(true, Relaxed);
     let frame = shared.frame.lock().unwrap().take();
     let _ = std::fs::remove_file(path);

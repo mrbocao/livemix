@@ -45,10 +45,11 @@ jobs:
       run: |
         cargo build --locked --release
         cargo test --locked --release
-    - name: Test FFmpeg video recording and playback
+    - name: Test FFmpeg audio and video
       run: |
         command -v ffmpeg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg
         cargo test --locked --release ffmpeg_video_roundtrip -- --ignored
+        cargo test --locked --release ffmpeg_pipe_decodes -- --ignored
     - name: Package LiveMix.app
       run: |
         mkdir -p dist/LiveMix.app/Contents/MacOS

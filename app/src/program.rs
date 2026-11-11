@@ -15,7 +15,10 @@ pub struct Target {
     readbacks: VecDeque<Readback>,
     free_buffers: Vec<PackBuffer>,
     cpu_frames: Vec<Arc<Vec<u8>>>,
+    readback_bytes: u64,
     ndi_pack: Option<Result<NdiPack, String>>,
+    #[cfg(windows)]
+    dx_bridge: Option<Result<crate::dx_interop::Bridge, String>>,
 }
 
 struct PackBuffer {
@@ -34,6 +37,7 @@ struct Readback {
 
 #[derive(Clone, Default)]
 pub struct Destinations {
+    pub audio: crate::audio::Packet,
     pub recorders: Vec<Arc<crate::media::Recorder>>,
     pub decklinks: Vec<crate::decklink::OutputSink>,
     pub streams: Vec<crate::stream::Output>,
@@ -219,6 +223,9 @@ impl Target {
         Ok(Self {
             framebuffer, color, shader, vao, vertices, indices, size_uniform, size: [0, 0],
             readbacks: VecDeque::new(), free_buffers: Vec::new(), cpu_frames: Vec::new(), ndi_pack: None,
+            readback_bytes: 0,
+            #[cfg(windows)]
+            dx_bridge: None,
         })
     }
 
@@ -229,6 +236,15 @@ impl Target {
     pub fn transfer_bytes(&self) -> u64 {
         self.free_buffers.iter().chain(self.readbacks.iter().map(|frame| &frame.buffer))
             .map(|buffer| buffer.bytes as u64).sum()
+    }
+
+    pub fn readback_bytes(&self) -> u64 {
+        self.readback_bytes
+    }
+
+    #[cfg(windows)]
+    pub fn interop_error(&self) -> Option<&str> {
+        self.dx_bridge.as_ref()?.as_ref().err().map(String::as_str)
     }
 
     fn copy_readback(&mut self, source: &[u8]) -> Arc<Vec<u8>> {
@@ -278,22 +294,22 @@ impl Target {
             let pixels = self.copy_readback(std::slice::from_raw_parts(data, len));
             gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
             for sink in &frame.destinations.decklinks {
-                sink.submit(Arc::clone(&pixels), w, h);
+                sink.submit(Arc::clone(&pixels), w, h, frame.destinations.audio.clone());
             }
             let network_frame = NetworkFrame { pixels: Arc::clone(&pixels), width: w, height: h };
             for sink in &frame.destinations.streams {
-                sink.submit(network_frame.clone());
+                sink.submit_audio(network_frame.clone(), frame.destinations.audio.clone(), frame.captured_at);
             }
             for sink in &frame.destinations.ndi {
-                sink.submit_pixels(network_frame.clone(), frame.uyvy);
+                sink.submit_pixels(network_frame.clone(), frame.uyvy, frame.destinations.audio.clone());
             }
             for sink in &frame.destinations.omt {
-                sink.submit(network_frame.clone());
+                sink.submit(network_frame.clone(), frame.destinations.audio.clone());
             }
             if let Some((key, mailbox)) = frame.destinations.scope {
                 *mailbox.lock().unwrap() = Some(ScopeFrame { key, size: frame.size, pixels: Arc::clone(&pixels) });
             }
-            crate::media::Recorder::push_group(&frame.destinations.recorders, pixels, w, h, frame.captured_at, true);
+            crate::media::Recorder::push_group_audio(&frame.destinations.recorders, pixels, w, h, frame.captured_at, true, frame.destinations.audio);
         }
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, previous_pack);
         result
@@ -379,6 +395,27 @@ impl Target {
             gl.draw_elements(glow::TRIANGLES, mesh.indices.len() as i32, glow::UNSIGNED_INT, 0);
         }
 
+        #[cfg(windows)]
+        if width % 2 == 0 && height % 2 == 0 && self.readbacks.is_empty()
+            && !destinations.recorders.is_empty() && destinations.recorders.iter().all(|recorder| recorder.accepts_surface())
+            && destinations.decklinks.is_empty() && destinations.streams.is_empty()
+            && destinations.ndi.is_empty() && destinations.omt.is_empty() && destinations.scope.is_none()
+        {
+            let bridge = self.dx_bridge.get_or_insert_with(|| crate::dx_interop::Bridge::new(gl));
+            if let Ok(interop) = bridge {
+                match interop.copy(gl, self.framebuffer, size) {
+                    Ok(surface) => {
+                        crate::media::Recorder::push_surface_group(&destinations.recorders, surface, size,
+                            captured_at, destinations.audio.clone());
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let failed = std::mem::replace(bridge, Err(error));
+                        if let Ok(failed) = failed { failed.close(); }
+                    }
+                }
+            }
+        }
         let mut buffer = match self.free_buffers.pop() {
             Some(buffer) => buffer,
             None => PackBuffer { id: gl.create_buffer()?, bytes: 0 },
@@ -406,11 +443,14 @@ impl Target {
             }
         };
         self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone(), uyvy });
+        self.readback_bytes = self.readback_bytes.saturating_add(len as u64);
         gl.flush();
         Ok(())
     }
 
     pub unsafe fn destroy(mut self, gl: &glow::Context) {
+        #[cfg(windows)]
+        if let Some(Ok(bridge)) = self.dx_bridge.take() { bridge.close(); }
         if self.has_pending() {
             gl.finish();
             let _ = self.collect(gl);

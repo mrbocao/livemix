@@ -1,8 +1,8 @@
 // Drawing of inputs, transitions, overlays and meters.
 
 use crate::gt::Cue;
-use crate::model::{Effect, FULL, Input, Kind, Overlay, Position};
-use eframe::egui::{self, pos2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Vec2};
+use crate::model::{Effect, FULL, Input, Kind, Overlay, Position, Telestroke};
+use eframe::egui::{self, pos2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 
 // Colours sampled from the screenshot of the running original (reference/picture-1.png).
 // (The blue values in the layout code — 26,60,117 / 40,81,155 — are design-time defaults that
@@ -92,7 +92,7 @@ pub fn place_rect(r: Rect, pos: &Position) -> Rect {
 }
 
 /// The visible part of a placed picture after cropping.
-fn crop_rect(sr: Rect, pos: &Position) -> Rect {
+pub fn crop_rect(sr: Rect, pos: &Position) -> Rect {
     let [x1, y1, x2, y2] = pos.crop;
     Rect::from_min_max(
         sr.min + Vec2::new(x1.min(x2) * sr.width(), y1.min(y2) * sr.height()),
@@ -133,7 +133,31 @@ fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input]
         if lc.width() > 0.0 && lc.height() > 0.0 {
             draw_layered(&p.with_clip_rect(lc), lr, li, a, t, all, depth + 1, Cue::Rest);
         }
+        // Layer Designer > Border: a frame around the layer's visible rectangle.
+        if l.border && l.border_width > 0.0 && lc.width() > 0.0 && lc.height() > 0.0 {
+            let [cr, cg, cb] = l.border_colour;
+            let width = (lc.width() * l.border_width).clamp(1.0, lc.width() * 0.5);
+            let border = p.clip_rect().intersect(lc);
+            if border.width() > 0.0 && border.height() > 0.0 {
+                p.rect_stroke(border, 0.0, egui::Stroke::new(width, fade(Color32::from_rgb(cr, cg, cb), a)),
+                    egui::StrokeKind::Inside);
+            }
+        }
     }
+}
+
+/// Letterboxes `r` to a display aspect ratio (Input Settings > General > Aspect Ratio).
+fn fit_aspect(r: Rect, ar: f32) -> Rect {
+    if !(ar.is_finite() && ar > 0.05) {
+        return r;
+    }
+    let mut w = r.width();
+    let mut h = w / ar;
+    if h > r.height() {
+        h = r.height();
+        w = h * ar;
+    }
+    Rect::from_center_size(r.center(), Vec2::new(w, h))
 }
 
 /// Draws the input's own picture filling `r` with opacity `a`.
@@ -141,6 +165,8 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
     if a <= 0.0 {
         return;
     }
+    // cboAspectRatio: force the picture's display shape inside its position rectangle.
+    let r = if inp.aspect > 0.0 { fit_aspect(r, inp.aspect) } else { r };
     let h = r.height();
     let w = r.width();
     match &inp.kind {
@@ -245,7 +271,7 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             }
             p.text(r.center(), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.11).max(6.0)), fade(Color32::from_white_alpha(230), a));
         }
-        Kind::Device { .. } | Kind::VideoFile { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } => {
+        Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::VideoDelay { .. } => {
             let keyed = inp.key.on || matches!(inp.kind, Kind::ImageFile { .. } | Kind::ImageSequence { .. });
             match inp.tex {
                 Some((tex, [tw, th])) if tw > 0 && th > 0 => {
@@ -260,7 +286,11 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
                         }
                         Rect::from_center_size(r.center(), Vec2::new(fw, fh))
                     };
-                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    let uv = if inp.mirror {
+                        Rect::from_min_max(pos2(1.0, 0.0), pos2(0.0, 1.0))
+                    } else {
+                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
+                    };
                     if !keyed {
                         p.rect_filled(r, 0.0, fade(Color32::BLACK, a));
                     }
@@ -278,7 +308,13 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
                 }
                 _ => {
                     p.rect_filled(r, 0.0, fade(Color32::from_rgb(0x0c, 0x14, 0x26), a));
-                    let msg = if inp.status.is_empty() { "Starting…".to_string() } else { inp.status.clone() };
+                    let msg = if !inp.status.is_empty() { &inp.status } else if matches!(&inp.kind,
+                        Kind::Device { link, .. } if link.starts_with("audio:"))
+                    {
+                        "Audio Input"
+                    } else if matches!(&inp.kind, Kind::Replay { .. }) {
+                        "No replay event yet"
+                    } else { "Starting…" };
                     p.text(r.center() - Vec2::new(0.0, h * 0.06), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.08).max(7.0)), fade(Color32::WHITE, a));
                     p.text(r.center() + Vec2::new(0.0, h * 0.06), Align2::CENTER_CENTER, msg, FontId::proportional((h * 0.05).max(6.0)), fade(TEXT_DIM, a));
                 }
@@ -296,6 +332,31 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             let band = Rect::from_min_max(pos2(r.left(), r.top() + h * 0.08), pos2(r.right(), r.top() + h * 0.22));
             p.rect_filled(band, 0.0, fade(Color32::from_rgba_unmultiplied(0, 0, 0, 90), a));
             p.text(band.center(), Align2::CENTER_CENTER, "We'll be right back", FontId::proportional((h * 0.07).max(5.0)), fade(Color32::WHITE, a));
+        }
+        Kind::Telestrator { strokes } => {
+            // Transparent drawing layer: only the strokes are painted, so the input can be used
+            // as an overlay like the original's browser Telestrator.
+            draw_strokes(p, r, strokes, a);
+        }
+    }
+}
+
+/// Paints the Telestrator's freehand lines into `r` (points are 0..1 in the frame).
+pub fn draw_strokes(p: &Painter, r: Rect, strokes: &[Telestroke], a: f32) {
+    for stroke in strokes {
+        let colour = fade(Color32::from_rgb(stroke.colour[0], stroke.colour[1], stroke.colour[2]), a);
+        let width = (stroke.width * r.height()).max(1.0);
+        let at = |point: &[f32; 2]| pos2(r.left() + point[0] * r.width(), r.top() + point[1] * r.height());
+        if stroke.points.len() == 1 {
+            p.circle_filled(at(&stroke.points[0]), width / 2.0, colour);
+            continue;
+        }
+        for pair in stroke.points.windows(2) {
+            p.line_segment([at(&pair[0]), at(&pair[1])], Stroke::new(width, colour));
+        }
+        // Round joints so fast strokes do not show gaps.
+        for point in &stroke.points[1..stroke.points.len() - 1] {
+            p.circle_filled(at(point), width / 2.0, colour);
         }
     }
 }

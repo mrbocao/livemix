@@ -1,5 +1,5 @@
 use crate::program::NetworkFrame;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -35,12 +35,12 @@ pub const COUNT: usize = 3;
 pub const HARDWARE_ENCODER_LABEL: &str = if cfg!(target_os = "macos") {
     "Use Apple VideoToolbox when available"
 } else {
-    "Use NVIDIA NVENC when available"
+    "Use NVIDIA NVENC, AMD AMF or Intel Quick Sync when available"
 };
 
 #[derive(Clone)]
 pub struct Output {
-    frames: mpsc::SyncSender<NetworkFrame>,
+    frames: mpsc::SyncSender<(NetworkFrame, crate::audio::Packet, std::time::Instant)>,
     state: Arc<Mutex<State>>,
 }
 
@@ -51,7 +51,7 @@ struct State {
     failed: bool,
 }
 
-fn publish_url(dest: &Destination) -> Result<String, String> {
+pub(crate) fn publish_url(dest: &Destination) -> Result<String, String> {
     let url = dest.url.trim();
     let (_, host) = url.split_once("://").filter(|(scheme, _)| matches!(*scheme, "rtmp" | "rtmps"))
         .ok_or("Enter an rtmp:// or rtmps:// server URL")?;
@@ -83,10 +83,20 @@ pub(crate) fn command() -> Command {
 }
 
 impl Output {
-    pub fn start(dest: Destination, size: [u32; 2], fps: f64) -> Result<Self, String> {
-        let url = publish_url(&dest)?;
+    pub fn start_group(destinations: &[&Destination], size: [u32; 2], fps: f64) -> Result<Self, String> {
+        let dest = destinations.first().ok_or("No streaming destinations")?;
+        let urls = destinations.iter().map(|dest| publish_url(dest)).collect::<Result<Vec<_>, _>>()?;
+        let (muxer, url) = if urls.len() == 1 {
+            ("flv", urls.into_iter().next().unwrap())
+        } else {
+            let slaves = urls.iter().map(|url| {
+                let escaped = url.replace('\\', "\\\\").replace('\'', "\\'").replace('|', "\\|");
+                format!("[f=flv:onfail=ignore:flvflags=no_duration_filesize]{escaped}")
+            }).collect::<Vec<_>>().join("|");
+            ("tee", slaves)
+        };
         let (height, mbps) = [(720, 3), (1080, 6), (1080, 9)][usize::from(dest.quality).min(2)];
-        Ok(Self::start_encoder(Encoding { url, muxer: "flv", height: Some(height), kbps: mbps * 1000,
+        Ok(Self::start_encoder(Encoding { url, muxer, height: Some(height), kbps: mbps * 1000,
             audio_kbps: 128, gop_seconds: 2, hardware: dest.hardware, hevc: false }, size, fps))
     }
 
@@ -117,8 +127,8 @@ impl Output {
         Self { frames, state }
     }
 
-    pub fn submit(&self, frame: NetworkFrame) {
-        let _ = self.frames.try_send(frame);
+    pub fn submit_audio(&self, frame: NetworkFrame, audio: crate::audio::Packet, captured: std::time::Instant) {
+        let _ = self.frames.try_send((frame, audio, captured));
     }
 
     pub fn status(&self) -> (String, bool) {
@@ -146,7 +156,7 @@ struct Encoding {
     hevc: bool,
 }
 
-fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encoding: &Encoding,
+fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<(NetworkFrame, crate::audio::Packet, std::time::Instant)>, encoding: &Encoding,
     [w, h]: [u32; 2], fps: f64) -> Result<(), String>
 {
     let (n, d) = crate::media::rate_fraction(fps as f32);
@@ -158,16 +168,26 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encodin
         (false, true) => ("hevc_nvenc", "libx265"),
         (false, false) => ("h264_nvenc", "libx264"),
     };
-    let encoder = if encoding.hardware && hardware_encoder_available(gpu) { gpu } else { cpu };
+    let amd = if encoding.hevc { "hevc_amf" } else { "h264_amf" };
+    let intel = if encoding.hevc { "hevc_qsv" } else { "h264_qsv" };
+    let encoder = if !encoding.hardware {
+        cpu
+    } else if hardware_encoder_available(gpu) {
+        gpu
+    } else if cfg!(windows) && hardware_encoder_available(amd) {
+        amd
+    } else if cfg!(windows) && hardware_encoder_available(intel) {
+        intel
+    } else {
+        cpu
+    };
     let bitrate = format!("{}k", encoding.kbps.clamp(100, 100_000));
     let mut state_lock = state.lock().unwrap();
     if state_lock.stop { return Ok(()); }
     let mut cmd = command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-nostdin"])
-        .args(["-f", "rawvideo", "-pixel_format", "bgra", "-video_size", &format!("{w}x{h}"),
-            "-framerate", &format!("{n}/{d}"), "-i", "pipe:0"])
-        .args(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
-        .args(["-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", encoder]);
+        .args(["-probesize", "32", "-analyzeduration", "1", "-f", "matroska", "-i", "pipe:0"])
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-c:v", encoder]);
     if encoder == cpu {
         cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
     }
@@ -175,13 +195,14 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encodin
         let width = height * 16 / 9;
         cmd.args(["-vf", &format!("scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")]);
     }
+    if encoding.muxer == "tee" { cmd.args(["-flags", "+global_header", "-use_fifo", "1"]); }
     cmd.args(["-pix_fmt", "yuv420p", "-b:v", &bitrate, "-maxrate", &bitrate, "-bufsize", &bitrate,
         "-g", &(fps * f64::from(encoding.gop_seconds.clamp(1, 10))).round().to_string(), "-bf", "0",
         "-c:a", "aac", "-b:a", &format!("{}k", encoding.audio_kbps.clamp(32, 384)),
         "-rw_timeout", "5000000", "-flush_packets", "1", "-f", encoding.muxer, &encoding.url]);
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().map_err(|e| format!("Could not start FFmpeg: {e}. Set LIVEMIX_FFMPEG or install FFmpeg."))?;
-    let mut input = child.stdin.take().unwrap();
+    let input = child.stdin.take().unwrap();
     let progress = child.stdout.take().unwrap();
     state_lock.child = Some(child);
     drop(state_lock);
@@ -193,7 +214,7 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encodin
             if !live && line.strip_prefix("frame=").and_then(|n| n.trim().parse::<u64>().ok()).is_some_and(|n| n > 0) {
                 let mut state = progress_state.lock().unwrap();
                 if !state.stop && !state.failed {
-                    state.status = format!("Live · {encoder} · video with silent AAC");
+                    state.status = format!("Live · {encoder} · stereo AAC");
                 }
                 live = true;
             }
@@ -202,11 +223,24 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<NetworkFrame>, encodin
 
     let failure = if srt { "SRT disconnected. Check mode, host, port, passphrase and encoder." }
         else { "FFmpeg exited. Check the server, key and encoder." };
+    let mut input = crate::audio::AvPipe::new(input, w, h, n, d).map_err(|_| failure)?;
+    let mut start = None;
+    let mut next = 0_u64;
+    let mut previous: Option<NetworkFrame> = None;
     loop {
         if state.lock().unwrap().stop { return Ok(()); }
         match receive.recv_timeout(Duration::from_millis(100)) {
-            Ok(frame) if frame.width == w as usize && frame.height == h as usize => {
-                input.write_all(&frame.pixels).map_err(|_| failure)?;
+            Ok((frame, audio, at)) if frame.width == w as usize && frame.height == h as usize => {
+                let slot = (at.saturating_duration_since(*start.get_or_insert(at)).as_secs_f64() * fps).round() as u64;
+                if slot < next { continue; }
+                if let Some(previous) = &previous {
+                    for _ in 0..(slot - next).min(fps.ceil() as u64) {
+                        input.frame(&previous.pixels, &[]).map_err(|_| failure)?;
+                    }
+                }
+                input.frame(&frame.pixels, &audio).map_err(|_| failure)?;
+                previous = Some(frame);
+                next = slot + 1;
             }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -230,30 +264,49 @@ fn hardware_encoder_available(encoder: &str) -> bool {
 #[test]
 #[ignore = "requires an FFmpeg build with RTMP listen support"]
 fn ffmpeg_rtmp_loopback() {
+    rtmp_loopback(1);
+    rtmp_loopback(2);
+}
+
+#[cfg(test)]
+fn rtmp_loopback(count: usize) {
     use std::net::TcpListener;
     use std::time::Instant;
-    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = socket.local_addr().unwrap().port();
-    drop(socket);
-    let url = format!("rtmp://127.0.0.1:{port}/live/test");
-    let path = std::env::temp_dir().join(format!("livemix-rtmp-test-{}.flv", std::process::id()));
-    let mut server = command().args(["-hide_banner", "-loglevel", "error", "-y", "-listen", "1", "-i", &url,
-        "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-t", "1", "-f", "flv"])
-        .arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut servers = Vec::new();
+    let mut destinations = Vec::new();
+    for index in 0..count {
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        let url = format!("rtmp://127.0.0.1:{port}/live/test");
+        let path = std::env::temp_dir().join(format!("livemix-rtmp-test-{}-{index}.flv", std::process::id()));
+        let server = command().args(["-hide_banner", "-loglevel", "error", "-y", "-listen", "1", "-i", &url,
+            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-t", "1", "-f", "flv"])
+            .arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        servers.push((server, path));
+        destinations.push(Destination { url, quality: 0, ..Default::default() });
+    }
     std::thread::sleep(Duration::from_millis(250));
-    let output = Output::start(Destination { url, quality: 0, ..Default::default() }, [320, 180], 25.0).unwrap();
+    let destinations: Vec<_> = destinations.iter().collect();
+    let output = Output::start_group(&destinations, [320, 180], 25.0).unwrap();
     let frame = NetworkFrame { pixels: Arc::new([20, 55, 180, 255].repeat(320 * 180)), width: 320, height: 180 };
     let deadline = Instant::now() + Duration::from_secs(12);
+    let packet = crate::audio::test_tone(1920);
     let received = loop {
-        if let Some(exit) = server.try_wait().unwrap() { break exit.success(); }
+        if servers.iter_mut().all(|(server, _)| server.try_wait().unwrap().is_some_and(|exit| exit.success())) {
+            break true;
+        }
         if Instant::now() >= deadline || output.status().1 { break false; }
-        output.submit(frame.clone());
+        output.submit_audio(frame.clone(), packet.clone(), Instant::now());
         std::thread::sleep(Duration::from_millis(40));
     };
     output.stop();
-    let _ = server.kill();
-    let server = server.wait_with_output().unwrap();
-    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-    let _ = std::fs::remove_file(path);
-    assert!(received && bytes > 500, "publisher {:?}, receiver {}", output.status(), String::from_utf8_lossy(&server.stderr));
+    for (mut server, path) in servers {
+        let _ = server.kill();
+        let server = server.wait_with_output().unwrap();
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        assert!(received && bytes > 500, "publisher {:?}, receiver {}", output.status(), String::from_utf8_lossy(&server.stderr));
+        crate::audio::assert_audio_file(&path);
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -11,6 +11,17 @@ pub struct Frame {
 
 #[derive(Default)]
 pub struct Shared {
+    #[cfg(windows)]
+    pub(crate) gpu_frame: Mutex<Option<crate::dx_interop::Picture>>,
+    #[cfg(windows)]
+    pub(crate) gpu_playback: AtomicBool,
+    #[cfg(windows)]
+    pub(crate) cpu_colour: AtomicBool,
+    pub video_adapter: Mutex<Option<String>>,
+    pub audio: Mutex<crate::audio::Buffer>,
+    /// Smoothed mapping between the system clock and the file's media position.
+    pub audio_position: Mutex<Option<crate::audio::AudioClock>>,
+    pub audio_epoch: AtomicU64,
     pub frame: Mutex<Option<Frame>>,
     pub seq: AtomicU64,
     pub status: Mutex<String>,
@@ -95,6 +106,7 @@ pub enum Source {
     Omt(String),
     Srt(crate::srt::Connection),
     File(String),
+    AudioDevice(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
     Sequence(String, f32),
@@ -104,10 +116,14 @@ pub enum Source {
 
 #[derive(Clone)]
 pub(crate) struct RecFrame {
+    #[cfg(windows)]
+    pub(crate) surface: Option<Arc<crate::dx_interop::Surface>>,
+    pub(crate) audio: crate::audio::Packet,
     pub(crate) pixels: Arc<Vec<u8>>,
     pub(crate) w: usize,
     pub(crate) h: usize,
     pub(crate) captured_at: Instant,
+    pub(crate) timeline_origin: Option<Instant>,
     pub(crate) bgra: bool,
 }
 
@@ -118,6 +134,9 @@ pub struct Recorder {
     pub error: Arc<Mutex<String>>,
     encoder: Arc<Mutex<String>>,
     dropped: AtomicU64,
+    timeline: Option<Arc<std::sync::OnceLock<Instant>>>,
+    #[cfg(windows)]
+    gpu: Arc<AtomicBool>,
 }
 
 impl Recorder {
@@ -135,27 +154,66 @@ impl Recorder {
     }
 
     pub(crate) fn spawn_writer(path: String, opts: RecOpts) -> (Recorder, std::thread::JoinHandle<()>) {
+        Self::spawn_writer_with_timeline(path, opts, None)
+    }
+
+    pub(crate) fn spawn_writer_with_timeline(path: String, opts: RecOpts,
+        timeline: Option<Arc<std::sync::OnceLock<Instant>>>) -> (Recorder, std::thread::JoinHandle<()>)
+    {
         // Keep the UI responsive and bound memory if the encoder falls behind.
         let (tx, rx) = sync_channel(3);
         let error = Arc::new(Mutex::new(String::new()));
         let encoder = Arc::new(Mutex::new("Waiting for first frame".into()));
         let (p2, e2) = (path.clone(), error.clone());
         let encoder_status = Arc::clone(&encoder);
-        let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts));
-        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0) }, worker)
+        #[cfg(windows)]
+        let gpu = Arc::new(AtomicBool::new(opts.hw && opts.format != RecordFormat::Wmv));
+        #[cfg(windows)]
+        let gpu_worker = gpu.clone();
+        let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts,
+            #[cfg(windows)]
+            gpu_worker,
+        ));
+        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0), timeline,
+            #[cfg(windows)]
+            gpu,
+        }, worker)
     }
-    pub fn push(&self, rgba: Vec<u8>, w: usize, h: usize) {
-        self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at: Instant::now(), bgra: false });
+    pub fn push_audio(&self, rgba: Vec<u8>, w: usize, h: usize, captured_at: Instant, audio: crate::audio::Packet) {
+        self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at, timeline_origin: None, bgra: false, audio,
+            #[cfg(windows)]
+            surface: None,
+        });
     }
 
-    pub fn push_group(recorders: &[Arc<Self>], pixels: impl Into<Arc<Vec<u8>>>, w: usize, h: usize, captured_at: Instant, bgra: bool) {
-        let frame = RecFrame { pixels: pixels.into(), w, h, captured_at, bgra };
+    pub fn push_group_audio(recorders: &[Arc<Self>], pixels: impl Into<Arc<Vec<u8>>>, w: usize, h: usize, captured_at: Instant, bgra: bool, audio: crate::audio::Packet) {
+        let frame = RecFrame { pixels: pixels.into(), w, h, captured_at, timeline_origin: None, bgra, audio,
+            #[cfg(windows)]
+            surface: None,
+        };
         for recorder in recorders {
             recorder.enqueue(frame.clone());
         }
     }
 
-    fn enqueue(&self, frame: RecFrame) {
+    #[cfg(windows)]
+    pub(crate) fn accepts_surface(&self) -> bool {
+        self.gpu.load(Ordering::Acquire)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn push_surface_group(recorders: &[Arc<Self>], surface: crate::dx_interop::Surface,
+        [w, h]: [u32; 2], captured_at: Instant, audio: crate::audio::Packet)
+    {
+        let frame = RecFrame { surface: Some(Arc::new(surface)), pixels: Arc::default(),
+            w: w as usize, h: h as usize, captured_at, timeline_origin: None, bgra: true, audio };
+        for recorder in recorders { recorder.enqueue(frame.clone()); }
+    }
+
+    fn enqueue(&self, mut frame: RecFrame) {
+        if let Some(timeline) = &self.timeline {
+            frame.timeline_origin = Some(*timeline.get_or_init(|| frame.captured_at));
+        }
         if matches!(self.tx.try_send(frame), Err(std::sync::mpsc::TrySendError::Full(_))) {
             self.note_dropped_frames(1);
         }

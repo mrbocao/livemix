@@ -22,6 +22,8 @@
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>LiveMix uses the camera as a live video input.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>LiveMix uses the microphone and audio interfaces as live audio inputs.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>LiveMix discovers and exchanges live video with devices on your local network.</string>
 </dict>
