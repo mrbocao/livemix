@@ -12,9 +12,11 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, GUID, HSTRING, PROPVARIANT, PWSTR};
+use windows::core::{AgileReference, Interface, GUID, HSTRING, PROPVARIANT, PWSTR};
 use windows::Win32::Foundation::{E_FAIL, HWND};
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIFactory6,
+    DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE};
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -126,8 +128,24 @@ pub fn blackmagic_driver_installed() -> bool {
         || std::path::Path::new(&root).join("System32").join("DeckLinkAPI.dll").exists()
 }
 
+#[cfg(test)]
 pub fn start(src: Source) -> Arc<Shared> {
+    start_with_pause(src, false)
+}
+
+#[cfg(test)]
+pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
+    start_reader(src, paused, false)
+}
+
+pub fn start_for_gl(src: Source, paused: bool) -> Arc<Shared> {
+    start_reader(src, paused, true)
+}
+
+fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
     let sh = Arc::new(Shared::default());
+    sh.gpu_playback.store(gpu_playback, Ordering::Relaxed);
+    sh.paused.store(paused, Ordering::Relaxed);
     sh.set_status("Starting…");
     if let Source::File(path) = &src {
         let (source, path) = (sh.clone(), path.clone());
@@ -148,11 +166,117 @@ pub fn start(src: Source) -> Arc<Shared> {
     sh
 }
 
-unsafe fn video_device_manager() -> Res<IMFDXGIDeviceManager> {
+unsafe fn gpu_picture(sample: &IMFSample, dims: &Dims) -> Res<crate::dx_interop::Picture> {
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM};
+    let buffer = sample.GetBufferByIndex(0)?.cast::<IMFDXGIBuffer>()?;
+    let mut resource = std::ptr::null_mut();
+    buffer.GetResource(&ID3D11Texture2D::IID, &mut resource)?;
+    if resource.is_null() { return Err(windows::core::Error::from(E_FAIL)); }
+    let texture = ID3D11Texture2D::from_raw(resource);
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    texture.GetDesc(&mut desc);
+    if !matches!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8X8_UNORM)
+        || dims.ox + dims.w > desc.Width as usize || dims.oy + dims.h > desc.Height as usize
+        || desc.SampleDesc.Count != 1
+    {
+        return Err(windows::core::Error::from(E_FAIL));
+    }
+    let device = texture.GetDevice()?;
+    let subresource = buffer.GetSubresourceIndex()?;
+    if desc.MipLevels != 1 { return Err(windows::core::Error::from(E_FAIL)); }
+    let crop = D3D11_BOX {
+        left: dims.ox as u32, top: dims.oy as u32, front: 0,
+        right: (dims.ox + dims.w) as u32, bottom: (dims.oy + dims.h) as u32, back: 1,
+    };
+    desc.Width = dims.w as u32;
+    desc.Height = dims.h as u32;
+    desc.ArraySize = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    let mut copy = None;
+    device.CreateTexture2D(&desc, None, Some(&mut copy))?;
+    let copy = copy.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+    // Make an owned GPU copy so the decoder can recycle its sample immediately.
+    device.GetImmediateContext()?.CopySubresourceRegion(&copy, 0, 0, 0, 0, &texture, subresource, Some(&crop));
+    Ok(crate::dx_interop::Picture { surface: crate::dx_interop::Surface(copy), size: [dims.w, dims.h] })
+}
+
+#[derive(Default)]
+struct VideoDeviceSelection {
+    preference: String,
+    device: Option<(AgileReference<IMFDXGIDeviceManager>, String)>,
+}
+
+static VIDEO_DEVICE: std::sync::LazyLock<Mutex<VideoDeviceSelection>> =
+    std::sync::LazyLock::new(|| Mutex::new(VideoDeviceSelection::default()));
+
+pub fn select_video_adapter(preference: &str) {
+    let mut selection = VIDEO_DEVICE.lock().unwrap();
+    if selection.preference != preference {
+        selection.preference = preference.to_owned();
+        selection.device = None;
+    }
+}
+
+fn video_adapters() -> Vec<(IDXGIAdapter1, String)> {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else { return Vec::new() };
+    let preferred = factory.cast::<IDXGIFactory6>().ok();
+    (0..).map_while(|index| unsafe {
+        match &preferred {
+            Some(factory) => factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE).ok(),
+            None => factory.EnumAdapters1(index).ok(),
+        }
+    }).filter_map(|adapter| {
+        let desc = unsafe { adapter.GetDesc1().ok()? };
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 { return None; }
+        let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+        Some((adapter, name))
+    }).collect()
+}
+
+pub fn video_adapter_names() -> Vec<String> {
+    video_adapters().into_iter().map(|(_, name)| name).collect()
+}
+
+pub(crate) fn renderer_matches_adapter(renderer: &str, adapter: &str) -> bool {
+    !adapter.is_empty() && renderer.to_ascii_lowercase().contains(&adapter.to_ascii_lowercase())
+}
+
+unsafe fn video_device_manager() -> Res<(IMFDXGIDeviceManager, String)> {
+    let mut selection = VIDEO_DEVICE.lock().unwrap();
+    if let Some((manager, adapter)) = &selection.device {
+        return Ok((manager.resolve()?, adapter.clone()));
+    }
+    let (manager, adapter) = create_video_device_manager(&selection.preference)?;
+    selection.device = Some((AgileReference::new(&manager)?, adapter.clone()));
+    Ok((manager, adapter))
+}
+
+pub(crate) unsafe fn shared_d3d11_device() -> Res<windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+    if !mf_init() { return Err(windows::core::Error::from(E_FAIL)); }
+    let (manager, _) = video_device_manager()?;
+    let handle = manager.OpenDeviceHandle()?;
+    let mut device = std::ptr::null_mut();
+    let result = manager.GetVideoService(handle, &ID3D11Device::IID, &mut device);
+    let _ = manager.CloseDeviceHandle(handle);
+    result?;
+    if device.is_null() { return Err(windows::core::Error::from(E_FAIL)); }
+    Ok(ID3D11Device::from_raw(device))
+}
+
+unsafe fn create_video_device_manager(preference: &str) -> Res<(IMFDXGIDeviceManager, String)> {
+    let adapter = if preference.is_empty() { None } else {
+        video_adapters().into_iter().find(|(_, name)| preference == "@high" || preference == name)
+            .map(|(adapter, _)| adapter)
+    };
     let mut device = None;
     D3D11CreateDevice(
-        None,
-        D3D_DRIVER_TYPE_HARDWARE,
+        adapter.as_deref(),
+        if adapter.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE },
         None,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         None,
@@ -169,7 +293,9 @@ unsafe fn video_device_manager() -> Res<IMFDXGIDeviceManager> {
     MFCreateDXGIDeviceManager(&mut token, &mut manager)?;
     let manager = manager.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
     manager.ResetDevice(&device, token)?;
-    Ok(manager)
+    let desc = device.cast::<IDXGIDevice>()?.GetAdapter()?.GetDesc()?;
+    let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+    Ok((manager, name))
 }
 
 unsafe fn reader_attrs(manager: Option<&IMFDXGIDeviceManager>) -> Res<IMFAttributes> {
@@ -304,8 +430,17 @@ struct Dims {
 }
 
 unsafe fn copy_rows(p0: *const u8, pitch: isize, w: usize, h: usize, out: &mut [u8], key: u64) {
+    if key == 0 {
+        for (y, dst) in out.chunks_exact_mut(w * 4).take(h).enumerate() {
+            let src = std::slice::from_raw_parts(p0.offset(y as isize * pitch), w * 4);
+            for (pixel, bgra) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                pixel.copy_from_slice(&[bgra[2], bgra[1], bgra[0], 255]);
+            }
+        }
+        return;
+    }
     let (kr, kg, kb, tol) = ((key >> 16) & 255, (key >> 8) & 255, key & 255, (key >> 24) & 255);
-    let keyed = key != 0;
+    let t = tol as f32 * 1.7;
     for y in 0..h {
         let row = p0.offset(y as isize * pitch);
         for x in 0..w {
@@ -316,13 +451,12 @@ unsafe fn copy_rows(p0: *const u8, pitch: isize, w: usize, h: usize, out: &mut [
             out[d + 1] = g;
             out[d + 2] = b;
             out[d + 3] = 255;
-            if keyed {
+            {
                 // Simple colour-distance chroma key with a soft edge.
                 let dr = r as i32 - kr as i32;
                 let dg = g as i32 - kg as i32;
                 let db = b as i32 - kb as i32;
                 let d2 = (dr * dr + dg * dg + db * db) as f32;
-                let t = tol as f32 * 1.7;
                 if d2 < t * t {
                     out[d + 3] = 0;
                 } else if d2 < (t + 40.0) * (t + 40.0) {
@@ -336,7 +470,11 @@ unsafe fn copy_rows(p0: *const u8, pitch: isize, w: usize, h: usize, out: &mut [
 
 unsafe fn copy_sample(s: &IMFSample, d: &Dims, key: u64) -> Res<Vec<u8>> {
     let (w, h) = (d.w, d.h);
-    let buf = s.ConvertToContiguousBuffer()?;
+    let buf = if s.GetBufferCount()? == 1 {
+        s.GetBufferByIndex(0)?
+    } else {
+        s.ConvertToContiguousBuffer()?
+    };
     let mut out = vec![0u8; w * h * 4];
     if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
         let mut p: *mut u8 = std::ptr::null_mut();
@@ -387,6 +525,7 @@ fn run(sh: Arc<Shared>, src: Source) {
     let mut last_frame_ts = None;
     let mut resume_at = None;
     let mut seek_to = None;
+    let mut needs_picture = true;
     while !sh.stop.load(Ordering::Relaxed) {
         if sh.restart.swap(false, Ordering::Relaxed) {
             need_open = true;
@@ -397,12 +536,15 @@ fn run(sh: Arc<Shared>, src: Source) {
         if need_open {
             reader = None;
             let r = unsafe {
-                open(&src, manager.as_ref(), &sh).or_else(|e| {
+                open(&src, manager.as_ref().map(|(manager, _)| manager), &sh).or_else(|e| {
                     if manager.take().is_some() { open(&src, None, &sh) } else { Err(e) }
                 })
             };
             match r {
                 Ok((r, d)) => {
+                    *sh.video_adapter.lock().unwrap() = if is_file {
+                        Some(manager.as_ref().map_or_else(|| "System-memory reader".into(), |(_, name)| name.clone()))
+                    } else { None };
                     if let Some(ts) = resume_at {
                         // Seeking may land on an earlier keyframe. Skip it below.
                         let _ = unsafe { r.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(ts)) };
@@ -420,6 +562,7 @@ fn run(sh: Arc<Shared>, src: Source) {
                 }
             }
             need_open = false;
+            needs_picture = true;
             if is_file { crate::audio::reset_position(&sh); }
             t0 = Instant::now();
             base_ts = -1;
@@ -448,7 +591,7 @@ fn run(sh: Arc<Shared>, src: Source) {
         }
         if is_file {
             // Pause / end of file: hold the last frame.
-            while seek_to.is_none() && (sh.paused.load(Ordering::Relaxed) || sh.ended.load(Ordering::Relaxed))
+            while seek_to.is_none() && ((!needs_picture && sh.paused.load(Ordering::Relaxed)) || sh.ended.load(Ordering::Relaxed))
                 && !sh.stop.load(Ordering::Relaxed)
                 && !sh.restart.load(Ordering::Relaxed)
                 && sh.seek_ms.load(Ordering::Relaxed) == 0
@@ -535,7 +678,20 @@ fn run(sh: Arc<Shared>, src: Source) {
             continue;
         }
         let key = sh.key.load(Ordering::Relaxed);
+        if is_file && key == 0 && sh.gpu_playback.load(Ordering::Acquire) && !sh.cpu_colour.load(Ordering::Acquire) {
+            if let Ok(picture) = unsafe { gpu_picture(&s, &dims) } {
+                *sh.frame.lock().unwrap() = None;
+                *sh.gpu_frame.lock().unwrap() = Some(picture);
+                sh.seq.fetch_add(1, Ordering::Release);
+                needs_picture = false;
+                last_frame_ts = Some(ts);
+                seek_to = None;
+                continue;
+            }
+        }
         if let Ok(rgba) = unsafe { copy_sample(&s, &dims, key) } {
+            *sh.gpu_frame.lock().unwrap() = None;
+            needs_picture = false;
             *sh.frame.lock().unwrap() = Some(Frame { w, h, rgba });
             sh.seq.fetch_add(1, Ordering::Relaxed);
             last_frame_ts = Some(ts);
@@ -559,12 +715,15 @@ impl RecordFormat {
     }
 }
 
-unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts) -> Res<(IMFSinkWriter, u32, Option<u32>)> {
+unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Option<&IMFDXGIDeviceManager>) -> Res<(IMFSinkWriter, u32, Option<u32>)> {
     let bitrate = opts.mbps.clamp(1, 100) * 1_000_000;
     let mut a: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut a, 1)?;
+    MFCreateAttributes(&mut a, 2)?;
     let a = a.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
     a.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, opts.hw as u32)?;
+    if let Some(manager) = manager {
+        a.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, manager)?;
+    }
     let wr = MFCreateSinkWriterFromURL(&HSTRING::from(path), None::<&IMFByteStream>, &a)?;
     let size = ((w as u64) << 32) | h as u64;
     let (rn, rd) = rate_fraction(opts.fps);
@@ -647,7 +806,9 @@ unsafe fn encoder_name(writer: &IMFSinkWriter, stream: u32, format: RecordFormat
     unknown
 }
 
-pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, encoder: Arc<Mutex<String>>, opts: RecOpts) {
+pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, encoder: Arc<Mutex<String>>, opts: RecOpts,
+    gpu: Arc<std::sync::atomic::AtomicBool>)
+{
     if !mf_init() {
         *err.lock().unwrap() = "Media Foundation not available".into();
         return;
@@ -656,13 +817,19 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
     let mut first_frame = None;
     let mut last_t: i64 = -1;
     let mut next_audio_slot = 0;
+    let mut wrote_video = false;
     let (rn, rd) = rate_fraction(opts.fps);
     let frame_dur = (10_000_000u64 * u64::from(rd) / u64::from(rn.max(1))) as i64;
-    while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, bgra, audio }) = rx.recv() {
+    while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, timeline_origin, bgra, audio, surface }) = rx.recv() {
+        if surface.is_some() && !gpu.load(Ordering::Acquire) { continue; }
         // Scale the picture to the project's Output Size.
         if let Some((tw, th)) = opts.size {
             let (tw, th) = ((tw as usize & !1).max(2), (th as usize & !1).max(2));
             if (fw, fh) != (tw, th) && fw > 0 && fh > 0 {
+                if surface.is_some() {
+                    gpu.store(false, Ordering::Release);
+                    continue;
+                }
                 let Some(img) = image::RgbaImage::from_raw(fw as u32, fh as u32, Arc::unwrap_or_clone(pixels)) else { continue };
                 pixels = Arc::new(image::imageops::resize(&img, tw as u32, th as u32, image::imageops::FilterType::Triangle).into_raw());
                 fw = tw;
@@ -672,12 +839,33 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
         if writer.is_none() {
             let w = (fw & !1).max(2);
             let h = (fh & !1).max(2);
-            match unsafe { make_writer(&path, w as u32, h as u32, &opts) } {
+            let manager = if opts.hw && opts.format != RecordFormat::Wmv {
+                unsafe { video_device_manager().ok() }
+            } else {
+                None
+            };
+            let opened = unsafe { make_writer(&path, w as u32, h as u32, &opts, manager.as_ref().map(|(manager, _)| manager)) };
+            let opened = if manager.is_some() && opened.is_err() {
+                unsafe { make_writer(&path, w as u32, h as u32, &opts, None) }
+            } else { opened };
+            match opened {
                 Ok((wr, idx, audio_idx)) => {
-                    *encoder.lock().unwrap() = unsafe { encoder_name(&wr, idx, opts.format) };
+                    let name = unsafe { encoder_name(&wr, idx, opts.format) };
+                    if !name.ends_with("(hardware)") {
+                        gpu.store(false, Ordering::Release);
+                        if surface.is_some() {
+                            let _ = unsafe { wr.Finalize() };
+                            continue;
+                        }
+                    }
+                    *encoder.lock().unwrap() = name;
                     writer = Some((wr, idx, audio_idx, w, h));
                 }
                 Err(e) => {
+                    if surface.is_some() {
+                        gpu.store(false, Ordering::Release);
+                        continue;
+                    }
                     *err.lock().unwrap() = format!("Could not start {} recording: {}", opts.format.codec(), e.message());
                     return;
                 }
@@ -686,14 +874,22 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
         let Some((wr, idx, audio_idx, w, h)) = writer.as_ref() else { continue };
         let (w, h) = (*w, *h);
         let len = w * h * 4;
-        let start = *first_frame.get_or_insert(captured_at);
-        let mut t = (captured_at.duration_since(start).as_nanos() / 100) as i64;
+        let start = *first_frame.get_or_insert(timeline_origin.unwrap_or(captured_at));
+        let mut t = (captured_at.saturating_duration_since(start).as_nanos() / 100) as i64;
         if t <= last_t {
             t = last_t + 1;
         }
         last_t = t;
+        let mut wrote_this_frame = false;
         let r = unsafe {
             (|| -> Res<()> {
+                let buf = if let Some(surface) = &surface {
+                    use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+                    if (fw, fh) != (w, h) { return Err(windows::core::Error::from(E_FAIL)); }
+                    let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &surface.0, 0, false)?;
+                    buffer.SetCurrentLength(len as u32)?;
+                    buffer
+                } else {
                 let buf = MFCreateMemoryBuffer(len as u32)?;
                 let mut p: *mut u8 = std::ptr::null_mut();
                 buf.Lock(&mut p, None, None)?;
@@ -716,11 +912,22 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 }
                 buf.Unlock()?;
                 buf.SetCurrentLength(len as u32)?;
+                buf
+                };
                 let s = MFCreateSample()?;
                 s.AddBuffer(&buf)?;
                 s.SetSampleTime(t)?;
                 s.SetSampleDuration(frame_dur)?;
                 wr.WriteSample(*idx, &s)?;
+                wrote_this_frame = true;
+                wrote_video = true;
+                if surface.is_some() {
+                    let mut status = encoder.lock().unwrap();
+                    if !status.ends_with(" · D3D11 input") { status.push_str(" · D3D11 input"); }
+                } else {
+                    let mut status = encoder.lock().unwrap();
+                    if let Some(name) = status.strip_suffix(" · D3D11 input") { *status = name.to_owned(); }
+                }
                 if let Some(index) = *audio_idx {
                     let slot = ((t + frame_dur / 2) / frame_dur) as u64;
                     let slot = slot.max(next_audio_slot);
@@ -747,6 +954,15 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
             })()
         };
         if let Err(e) = r {
+            if surface.is_some() && !wrote_this_frame {
+                gpu.store(false, Ordering::Release);
+                if !wrote_video {
+                    if let Some((failed, ..)) = writer.take() {
+                        let _ = unsafe { failed.Finalize() };
+                    }
+                }
+                continue;
+            }
             *err.lock().unwrap() = format!("Recording error: {}", e.message());
         }
     }
@@ -1000,6 +1216,71 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a hardware D3D11 adapter"]
+    fn decoder_and_recorder_workers_resolve_the_same_video_manager() {
+        let resolve = || {
+            assert!(mf_init());
+            let (manager, adapter) = unsafe { video_device_manager() }.unwrap();
+            let identity = manager.cast::<windows::core::IUnknown>().unwrap();
+            (identity.as_raw() as usize, adapter)
+        };
+        let decoder = std::thread::spawn(resolve).join().unwrap();
+        let recorder = std::thread::spawn(resolve).join().unwrap();
+        assert_eq!(decoder, recorder);
+    }
+
+    #[test]
+    #[ignore = "requires a D3D11 hardware encoder"]
+    fn hardware_recorder_accepts_d3d11_surfaces() {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+        select_video_adapter("@high");
+        let device = unsafe { shared_d3d11_device() }.unwrap();
+        let path = std::env::temp_dir().join(format!("livemix-d3d11-{}.mp4", std::process::id()));
+        let (recorder, worker) = Recorder::spawn_writer(path.to_string_lossy().into_owned(), RecOpts { hw: true, ..Default::default() });
+        let recorder = Arc::new(recorder);
+        let descriptor = D3D11_TEXTURE2D_DESC {
+            Width: 320, Height: 180, MipLevels: 1, ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        for frame in 0..12 {
+            let mut surface = None;
+            unsafe { device.CreateTexture2D(&descriptor, None, Some(&mut surface)) }.unwrap();
+            Recorder::push_surface_group(std::slice::from_ref(&recorder), crate::dx_interop::Surface(surface.unwrap()),
+                [320, 180], start + Duration::from_millis(frame * 33), Default::default());
+            std::thread::sleep(Duration::from_millis(34));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recorder.diagnostics().starts_with("Waiting") && recorder.accepts_surface() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let diagnostics = recorder.diagnostics();
+        let error = recorder.error.clone();
+        drop(recorder);
+        worker.join().unwrap();
+        let size = std::fs::metadata(&path).map_or(0, |file| file.len());
+        let decoded = start_for_gl(Source::File(path.to_string_lossy().into_owned()), true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while decoded.seq.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let picture = decoded.gpu_frame.lock().unwrap().take();
+        decoded.stop.store(true, Ordering::Release);
+        let _ = std::fs::remove_file(path);
+        let error = error.lock().unwrap().clone();
+        println!("{diagnostics}");
+        assert!(diagnostics.contains("D3D11 input") && size > 1000 && error.is_empty(),
+            "{diagnostics}, {size} bytes, {error}");
+        assert_eq!(picture.map(|picture| picture.size), Some([320, 180]),
+            "Hardware-decoded MP4 should publish a GPU texture: {}", decoded.status.lock().unwrap());
+    }
+
+    #[test]
     fn records_mp4_and_plays_it_back() {
         let dir = std::env::current_dir().unwrap().join("target").join("media-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1021,6 +1302,8 @@ mod tests {
                     }
                 }
                 let mut frame = RecFrame {
+                    timeline_origin: None,
+                    surface: None,
                     audio: crate::audio::test_tone(1600),
                     pixels: Arc::new(px), w, h, bgra: false,
                     captured_at: first_capture + Duration::from_millis(33 * u64::from(f)),
@@ -1054,7 +1337,14 @@ mod tests {
         if crate::stream::command().arg("-version").output().is_ok_and(|output| output.status.success()) {
             crate::audio::assert_audio_file(std::path::Path::new(&path));
         }
-        let sh = start(Source::File(path.clone()));
+        let sh = start_with_pause(Source::File(path.clone()), true);
+        let first_deadline = Instant::now() + Duration::from_secs(5);
+        while sh.seq.load(Ordering::Relaxed) == 0 && Instant::now() < first_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(sh.seq.load(Ordering::Relaxed), 1, "paused clip must show and hold its first frame");
+        sh.paused.store(false, Ordering::Relaxed);
         let t = Instant::now();
         while sh.seq.load(Ordering::Relaxed) < 5 && t.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(50));

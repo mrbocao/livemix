@@ -33,8 +33,9 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         .collect()
 }
 
-pub fn start(src: Source) -> Arc<Shared> {
+pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
     let shared = Arc::new(Shared::default());
+    shared.paused.store(paused, Relaxed);
     shared.set_status("Starting…");
     if let Source::File(path) = &src {
         let (source, path) = (shared.clone(), path.clone());
@@ -63,6 +64,10 @@ pub fn start(src: Source) -> Arc<Shared> {
         Source::File(path) => play(&worker, &path),
     });
     shared
+}
+
+pub fn start_for_gl(src: Source, paused: bool) -> Arc<Shared> {
+    start_with_pause(src, paused)
 }
 
 fn capture(shared: &Shared, index: &str, mode: Option<CamMode>) {
@@ -231,7 +236,7 @@ fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecO
         .map_err(|e| format!("Could not start FFmpeg: {e}"))?;
     *status.lock().unwrap() = encoder.into();
     let write_result = (|| {
-        let start = first.captured_at;
+        let start = first.timeline_origin.unwrap_or(first.captured_at);
         let dimensions = (first.w, first.h, first.bgra);
         let mut pipe = crate::audio::AvPipe::new(child.stdin.take().unwrap(), first.w as u32, first.h as u32, n, d)?;
         let mut next = 0_u64;
@@ -372,6 +377,7 @@ fn ffmpeg_video_roundtrip() {
     let origin = Instant::now();
     for i in 0..12 {
         recorder.tx.send(RecFrame {
+            timeline_origin: None,
             audio: crate::audio::test_tone(1920),
             pixels: Arc::new([180, 55, 20, 255].repeat(64 * 48)),
             w: 64, h: 48, bgra: false, captured_at: origin + Duration::from_millis(i * 40),
@@ -382,11 +388,13 @@ fn ffmpeg_video_roundtrip() {
     let error = error.lock().unwrap().clone();
     assert!(error.is_empty(), "{error}");
     crate::audio::assert_audio_file(Path::new(&path));
-    let shared = start(Source::File(path.clone()));
+    let shared = start_with_pause(Source::File(path.clone()), true);
     let deadline = Instant::now() + Duration::from_secs(5);
     while shared.seq.load(Relaxed) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(shared.seq.load(Relaxed), 1, "paused clip must show and hold its first frame");
     shared.stop.store(true, Relaxed);
     let frame = shared.frame.lock().unwrap().take();
     let _ = std::fs::remove_file(path);

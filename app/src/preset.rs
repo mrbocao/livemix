@@ -73,6 +73,14 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 pub fn encode(s: &Switcher) -> Result<String, String> {
     let mut out = String::from("<XML>\n  <Version>9</Version>\n  <ZoomManager />\n");
+    if !s.script.is_empty() { writeln!(out, "  <LiveMixScript>{}</LiveMixScript>", xml(&s.script)).unwrap(); }
+    let replay_angles = s.replay_angles.map(|source| {
+        if matches!(source, SRC_OUTPUT | MV_AUTO) { return source; }
+        s.inputs.iter().position(|input| input.id + 1 == source)
+            .map_or(MV_AUTO, |index| index as u32 + 1)
+    });
+    let replay_angles = serde_json::to_string(&replay_angles).map_err(|error| error.to_string())?;
+    writeln!(out, "  <LiveMixReplayAngles>{replay_angles}</LiveMixReplayAngles>").unwrap();
     for i in &s.inputs {
         let (kind, filename, colour, bars) = match &i.kind {
             Kind::VideoFile { path } => (0, path.as_str(), None, false),
@@ -81,6 +89,8 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
             Kind::ImageSequence { folder } => (21, folder.as_str(), None, false),
             Kind::GtTitle { path, .. } => (9000, path.as_str(), None, false),
             Kind::VideoList { .. } => (14, "", None, false),
+            Kind::VideoDelay { .. } => (10, "", None, false),
+            Kind::Telestrator { .. } => (5001, "", None, false),
             Kind::Device { .. } => (5, "", None, false),
             Kind::Colour(c) => (12, "", Some(*c), false),
             Kind::Bars => (12, "", Some(Color32::BLACK), true),
@@ -94,6 +104,33 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         attr(&mut out, "Title", &i.title);
         attr(&mut out, "Loop", tf(i.loop_on));
         attr(&mut out, "VolumeF", i.volume / 100.0);
+        if !i.ptz_address.is_empty() { attr(&mut out, "LiveMixPtzAddress", &i.ptz_address); }
+        if !i.on_program.is_empty() { attr(&mut out, "LiveMixOnProgram", &i.on_program); }
+        // Input Settings > General / Colour Correction / Tally Lights / Advanced.
+        let flags: [(&str, bool); 9] = [
+            ("LiveMixMirror", i.mirror), ("LiveMixSharpen", i.sharpen),
+            ("LiveMixDeinterlace", i.deinterlace), ("LiveMixPlayActive", i.play_active),
+            ("LiveMixPausePreview", i.pause_preview), ("LiveMixRestartActive", i.restart_active),
+            ("LiveMixAutoMixAudio", i.auto_mix_audio), ("LiveMixRec601", i.rec601),
+            ("LiveMixPremultiplied", i.premultiplied),
+        ];
+        for (name, on) in flags {
+            if on { attr(&mut out, name, "True"); }
+        }
+        if i.aspect != 0.0 { attr(&mut out, "LiveMixAspectRatio", i.aspect); }
+        if let Some([r, g, b]) = i.tally_colour { attr(&mut out, "LiveMixTallyColour", format!("{r},{g},{b}")); }
+        if i.flatten { attr(&mut out, "LiveMixFlatten", "True"); }
+        if i.effects_source { attr(&mut out, "LiveMixUseSourceEffects", "True"); }
+        if i.click_action != 0 { attr(&mut out, "LiveMixClickAction", i.click_action); }
+        if i.delay_frames != 0 { attr(&mut out, "LiveMixDelayFrames", i.delay_frames); }
+        if i.colour_adjust != ColourAdjust::default() {
+            if let Ok(value) = serde_json::to_string(&i.colour_adjust) { attr(&mut out, "LiveMixColourAdjust", value); }
+        }
+        if i.audio_effects != crate::audio::Effects::default() {
+            if let Ok(effects) = serde_json::to_string(&i.audio_effects) {
+                attr(&mut out, "LiveMixAudioEffects", effects);
+            }
+        }
         attr(&mut out, "Muted", tf(!i.audio_on));
         attr(&mut out, "BusMaster", tf(i.bus_m));
         attr(&mut out, "Collapsed", tf(i.collapsed));
@@ -118,6 +155,18 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         }
         if let Kind::Device { link, .. } = &i.kind {
             attr(&mut out, "CapturePath", capture_path(link));
+        }
+        if let Kind::VideoDelay { source, seconds, resolution } = &i.kind {
+            if let Some(number) = source.and_then(|id| s.number_of(id).checked_sub(1)) {
+                attr(&mut out, "LiveMixDelaySource", number + 1);
+            }
+            attr(&mut out, "LiveMixDelaySeconds", seconds);
+            attr(&mut out, "LiveMixDelayResolution", format!("{}x{}", resolution[0], resolution[1]));
+        }
+        if let Kind::Telestrator { strokes } = &i.kind {
+            if let Ok(value) = serde_json::to_string(strokes) {
+                attr(&mut out, "LiveMixTelestrator", value);
+            }
         }
         if i.place != Position::default() {
             let p = i.place;
@@ -201,6 +250,33 @@ fn bool_value(text: Option<&str>) -> bool {
     text.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+pub struct ImportReport {
+    pub path: std::path::PathBuf,
+    pub inputs: usize,
+    pub unsupported: Vec<String>,
+    pub missing: Vec<(String, String)>,
+}
+
+impl ImportReport {
+    pub fn collect(path: &Path, inputs: &[Input], unsupported: Vec<String>) -> Self {
+        let mut missing = Vec::new();
+        for input in inputs {
+            let paths: &[String] = match &input.kind {
+                Kind::VideoFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. } => std::slice::from_ref(path),
+                Kind::Photos { folder } | Kind::ImageSequence { folder } => std::slice::from_ref(folder),
+                Kind::VideoList { paths, .. } => paths,
+                _ => &[],
+            };
+            for asset in paths {
+                if !Path::new(asset).exists() {
+                    missing.push((input.title.clone(), asset.clone()));
+                }
+            }
+        }
+        Self { path: path.to_owned(), inputs: inputs.len(), unsupported, missing }
+    }
+}
+
 fn recording_slot<'a>(root: Node<'a, '_>, tag: &str) -> Option<(RecordFormat, usize, u32, u32, &'a str)> {
     let node = child(root, tag)?;
     let read = |tag| child(node, tag).and_then(|n| n.text());
@@ -263,6 +339,21 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
                     paths: node.attribute("Videos").unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).map(resolve).collect(),
                     idx: 0,
                 },
+                "10" => {
+                    let resolution = node.attribute("LiveMixDelayResolution").and_then(|v| {
+                        let (w, h) = v.split_once('x')?;
+                        Some([w.parse().ok()?, h.parse().ok()?])
+                    }).unwrap_or(crate::model::DELAY_RESOLUTIONS[3]);
+                    Kind::VideoDelay {
+                        source: None,
+                        seconds: node.attribute("LiveMixDelaySeconds").and_then(|v| v.parse().ok()).unwrap_or(1.0),
+                        resolution,
+                    }
+                }
+                "5001" => Kind::Telestrator {
+                    strokes: node.attribute("LiveMixTelestrator")
+                        .and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default(),
+                },
                 "9000" => Kind::GtTitle { path: resolve(file), texts: title_texts(node), document: None },
                 "12" if bool_value(node.attribute("ColourBars")) => Kind::Bars,
                 "12" => {
@@ -306,6 +397,48 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             let selected = |key| state.attribute(key).and_then(|v| v.parse::<usize>().ok())
                 .and_then(|index| imported.inputs.get(index)).map(|i| i.id);
             (imported.output, imported.preview) = (selected("Main"), selected("Preview"));
+        }
+    }
+
+    let input_ids: Vec<u32> = imported.inputs.iter().map(|input| input.id).collect();
+    for (input, node) in imported.inputs.iter_mut().zip(root.children().filter(|node| node.has_tag_name("Input"))) {
+        input.ptz_address = node.attribute("LiveMixPtzAddress").unwrap_or_default().into();
+        input.on_program = node.attribute("LiveMixOnProgram").unwrap_or_default().into();
+        input.mirror = bool_value(node.attribute("LiveMixMirror"));
+        input.sharpen = bool_value(node.attribute("LiveMixSharpen"));
+        input.deinterlace = bool_value(node.attribute("LiveMixDeinterlace"));
+        input.play_active = bool_value(node.attribute("LiveMixPlayActive"));
+        input.pause_preview = bool_value(node.attribute("LiveMixPausePreview"));
+        input.restart_active = bool_value(node.attribute("LiveMixRestartActive"));
+        input.auto_mix_audio = bool_value(node.attribute("LiveMixAutoMixAudio"));
+        input.rec601 = bool_value(node.attribute("LiveMixRec601"));
+        input.premultiplied = bool_value(node.attribute("LiveMixPremultiplied"));
+        input.flatten = bool_value(node.attribute("LiveMixFlatten"));
+        input.effects_source = bool_value(node.attribute("LiveMixUseSourceEffects"));
+        input.aspect = node.attribute("LiveMixAspectRatio").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        input.click_action = node.attribute("LiveMixClickAction").and_then(|v| v.parse().ok()).unwrap_or(0);
+        input.delay_frames = node.attribute("LiveMixDelayFrames").and_then(|v| v.parse().ok()).unwrap_or(0);
+        input.tally_colour = node.attribute("LiveMixTallyColour").and_then(|v| {
+            let c: Vec<u8> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            (c.len() == 3).then(|| [c[0], c[1], c[2]])
+        });
+        input.colour_adjust = node.attribute("LiveMixColourAdjust")
+            .and_then(|value| serde_json::from_str(value).ok()).unwrap_or_default();
+        if let Some(effects) = node.attribute("LiveMixAudioEffects")
+            .and_then(|value| serde_json::from_str::<crate::audio::Effects>(value).ok())
+        {
+            input.audio_effects = effects.normalized();
+        }
+        if let Kind::VideoDelay { source, seconds, resolution } = &mut input.kind {
+            *source = node.attribute("LiveMixDelaySource").and_then(|v| v.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1)).and_then(|n| input_ids.get(n)).copied();
+            *seconds = node.attribute("LiveMixDelaySeconds").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            if let Some(size) = node.attribute("LiveMixDelayResolution").and_then(|v| {
+                let (w, h) = v.split_once('x')?;
+                Some([w.parse().ok()?, h.parse().ok()?])
+            }) {
+                *resolution = size;
+            }
         }
     }
 
@@ -375,6 +508,16 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
         imported.cfg.mc_codec = RecordFormat::parse(&codec);
         imported.cfg.mc_outputs = outputs;
     }
+    imported.script = child(root, "LiveMixScript").and_then(|node| node.text()).unwrap_or_default().into();
+    if let Some(angles) = child(root, "LiveMixReplayAngles").and_then(|node| node.text())
+        .and_then(|value| serde_json::from_str::<[u32; REPLAY_ANGLES]>(value).ok())
+    {
+        imported.replay_angles = angles.map(|source| {
+            if matches!(source, SRC_OUTPUT | MV_AUTO) { return source; }
+            imported.inputs.get((source - 1) as usize).map_or(MV_AUTO, |input| input.id + 1)
+        });
+    }
+    imported.remote = s.remote.take();
     *s = imported;
     Ok(warnings)
 }
@@ -492,12 +635,22 @@ mod tests {
         let id = s.inputs[0].id;
         s.remove_input(id);
         s.cfg.outputs[1].source = s.inputs[0].id + 1;
+        s.replay_angles[1] = s.inputs[0].id + 1;
+        s.script = "Preview 1\nWait 100\nCut".into();
+        s.inputs[0].on_program = "Wait 20\nPreview 1".into();
+        s.inputs[0].ptz_address = "192.0.2.1:52381".into();
+        s.inputs[0].colour_adjust.saturation = -0.5;
         s.assign_overlay(7, s.inputs[0].id, true);
         let saved = encode(&s).unwrap();
         let mut reopened = Switcher::empty();
         decode(&mut reopened, path, &saved).unwrap();
         assert_eq!(reopened.inputs[0].title, s.inputs[0].title);
+        assert_eq!(reopened.script, s.script);
+        assert_eq!(reopened.inputs[0].on_program, s.inputs[0].on_program);
+        assert_eq!(reopened.inputs[0].ptz_address, s.inputs[0].ptz_address);
+        assert_eq!(reopened.inputs[0].colour_adjust, s.inputs[0].colour_adjust);
         assert_eq!(reopened.cfg.outputs[1].source, reopened.inputs[0].id + 1);
+        assert_eq!(reopened.replay_angles[1], reopened.inputs[0].id + 1);
         assert_eq!(reopened.overlays[7].assigned.map(|source| source.input), Some(reopened.inputs[0].id));
         let mut native_only = Switcher::empty();
         let start = saved.find("<!--").unwrap();

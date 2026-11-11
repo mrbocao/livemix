@@ -12,8 +12,55 @@ pub type Packet = Arc<[Stereo]>;
 const HISTORY: usize = RATE as usize * 2;
 const BLOCK: usize = 480;
 
+/// Where the file's audio is at a given instant. The media position advances in
+/// real time from `stamp`, and `ms` is smoothed so video delivery jitter does not
+/// move it backwards and forwards (which skipped or repeated samples).
+#[derive(Clone, Copy, Debug)]
+pub struct AudioClock {
+    pub ms: u64,
+    pub stamp: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Effects {
+    pub channel: u8,
+    pub gate_threshold: f32,
+    pub comp_threshold: f32,
+    pub comp_ratio: f32,
+    pub eq: [f32; 10],
+    pub gain_db: f32,
+    pub delay_ms: f32,
+    /// Stereo balance, -1 fully left, 0 centre, +1 fully right (original's Pan knob).
+    #[serde(default)]
+    pub pan: f32,
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self { channel: 0, gate_threshold: -90.0, comp_threshold: -18.0, comp_ratio: 1.0,
+            eq: [0.0; 10], gain_db: 0.0, delay_ms: 0.0, pan: 0.0 }
+    }
+}
+
+impl Effects {
+    pub fn normalized(mut self) -> Self {
+        self.channel = self.channel.min(2);
+        self.gate_threshold = self.gate_threshold.clamp(-90.0, 0.0);
+        self.comp_threshold = self.comp_threshold.clamp(-60.0, 0.0);
+        self.comp_ratio = self.comp_ratio.clamp(1.0, 20.0);
+        self.eq = self.eq.map(|gain| gain.clamp(-18.0, 18.0));
+        self.gain_db = self.gain_db.clamp(-24.0, 24.0);
+        self.delay_ms = self.delay_ms.clamp(0.0, 1000.0);
+        self.pan = self.pan.clamp(-1.0, 1.0);
+        self
+    }
+}
+
 #[derive(Default)]
 pub struct Buffer {
+    effects: Effects,
+    chain: crate::dsp::Chain,
+    scratch: Vec<f32>,
     first: u64,
     data: VecDeque<Stereo>,
     live_end: Option<Instant>,
@@ -22,8 +69,24 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    pub fn set_effects(&mut self, effects: &Effects) {
+        if self.effects != *effects {
+            self.effects = effects.clone();
+            self.chain = Default::default();
+        }
+    }
+
     fn append(&mut self, samples: impl IntoIterator<Item = Stereo>) {
-        self.data.extend(samples);
+        if self.effects == Effects::default() {
+            self.data.extend(samples);
+        } else {
+            self.scratch.clear();
+            self.scratch.extend(samples.into_iter().flatten().map(|sample| f32::from(sample) / 32768.0));
+            self.chain.process(&mut self.scratch, &self.effects);
+            self.data.extend(self.scratch.chunks_exact(2).map(|pair| {
+                [(pair[0] * 32768.0).round() as i16, (pair[1] * 32768.0).round() as i16]
+            }));
+        }
         let excess = self.data.len().saturating_sub(HISTORY);
         self.data.drain(..excess);
         self.first += excess as u64;
@@ -54,11 +117,11 @@ impl Buffer {
     {
         let index = if file {
             let Ok(transport) = shared.audio_position.try_lock() else { return };
-            let Some((position, stamp)) = *transport else { return };
+            let Some(clock) = *transport else { return };
             if self.file_epoch != shared.audio_epoch.load(Relaxed)
                 || shared.paused.load(Relaxed) || shared.ended.load(Relaxed) { return; }
-            let offset = signed_frames(at, stamp).clamp(-4800, 2400);
-            (position * u64::from(RATE) / 1000) as i64 + offset - frames as i64 - self.first as i64
+            let offset = signed_frames(at, clock.stamp).clamp(-4800, 2400);
+            (clock.ms * u64::from(RATE) / 1000) as i64 + offset - frames as i64 - self.first as i64
         } else {
             let Some(end) = self.live_end else { return };
             // Read slightly behind capture arrival to accommodate packet delivery jitter.
@@ -83,7 +146,21 @@ pub fn sample_duration(frames: usize) -> Duration {
 }
 
 pub fn mark_position(shared: &crate::media::Shared, ms: u64) {
-    *shared.audio_position.lock().unwrap() = Some((ms, Instant::now()));
+    let mut position = shared.audio_position.lock().unwrap();
+    *position = Some(smooth_clock(*position, ms, Instant::now()));
+}
+
+/// Advances the audio anchor to `ms`. Small deviations from the predicted
+/// position (video delivery jitter) are corrected gradually; a large one is a
+/// seek, a loop or a new file and is followed at once.
+fn smooth_clock(previous: Option<AudioClock>, ms: u64, now: Instant) -> AudioClock {
+    let smoothed = previous.and_then(|clock| {
+        let elapsed = now.saturating_duration_since(clock.stamp).as_secs_f64() * 1000.0;
+        let predicted = clock.ms as f64 + elapsed;
+        let error = ms as f64 - predicted;
+        (error.abs() <= 120.0).then(|| (predicted + error * 0.125).max(0.0) as u64)
+    });
+    AudioClock { ms: smoothed.unwrap_or(ms), stamp: now }
 }
 
 pub fn reset_position(shared: &crate::media::Shared) {
@@ -263,11 +340,20 @@ where
     let error = error.clone();
     let channels = usize::from(config.channels);
     let rate = config.sample_rate.0 as usize;
+    // Kept so a rare lock miss repeats the previous block instead of dropping to
+    // silence, which is heard as a click.
+    let mut last: Option<Packet> = None;
     device.build_output_stream(&config, move |data: &mut [T], _| {
         let frames = (data.len() / channels * RATE as usize).div_ceil(rate);
-        let packet = sources.try_lock().ok().map(|sources| {
-            mix(sources.iter().map(|(source, file, gain)| (&**source, *file, *gain)), Instant::now(), frames)
-        });
+        let packet = match sources.try_lock() {
+            Ok(sources) => {
+                let packet = mix(sources.iter().map(|(source, file, gain)| (&**source, *file, *gain)),
+                    Instant::now(), frames);
+                last = Some(packet.clone());
+                Some(packet)
+            }
+            Err(_) => last.clone(),
+        };
         for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
             let [l, r] = packet.as_ref().and_then(|p| p.get(i * RATE as usize / rate)).copied().unwrap_or_default();
             frame.fill(T::from_sample(0));
@@ -286,9 +372,9 @@ pub fn play_file(shared: Arc<crate::media::Shared>, path: String) {
     while !shared.stop.load(Relaxed) {
         let (position, epoch) = {
             let position = shared.audio_position.lock().unwrap();
-            (*position, shared.audio_epoch.load(Relaxed))
+            (position.map(|clock| clock.ms), shared.audio_epoch.load(Relaxed))
         };
-        let Some((position, _)) = position.filter(|_| Some(epoch) != last_epoch) else {
+        let Some(position) = position.filter(|_| Some(epoch) != last_epoch) else {
             std::thread::sleep(Duration::from_millis(30));
             continue;
         };
@@ -301,6 +387,7 @@ pub fn play_file(shared: Arc<crate::media::Shared>, path: String) {
             buffer.data.clear();
             buffer.first = cursor;
             buffer.file_epoch = epoch;
+            buffer.chain = Default::default();
         }
         read_pcm(&shared, command, |samples| {
             while cursor > (shared.pos_ms.load(Relaxed) + 650) * u64::from(RATE) / 1000 {
@@ -408,6 +495,33 @@ mod tests {
     fn audio_clock_keeps_fractional_video_rates() {
         let counts: usize = (0..60_000).map(|slot| frames_for_slot(slot, 60_000, 1001)).sum();
         assert_eq!(counts, 48_048_000);
+    }
+
+    #[test]
+    fn audio_clock_filters_video_delivery_jitter() {
+        // A 59.94 Hz file whose frames are delivered a few milliseconds early or
+        // late: the audio position must still advance smoothly, never backwards.
+        let base = Instant::now();
+        let frame = 1000.0 / 59.94;
+        let jitter = [3.0, -2.0, 5.0, -4.0, 0.0, 2.0, -5.0, 1.0];
+        let mut clock = None;
+        let mut positions = Vec::new();
+        for n in 0..240 {
+            let scheduled = n as f64 * frame;
+            let stamp = base + Duration::from_secs_f64((scheduled + jitter[n % jitter.len()]) / 1000.0);
+            clock = Some(smooth_clock(clock, scheduled.round() as u64, stamp));
+            let at = base + Duration::from_secs_f64(scheduled / 1000.0);
+            let clock = clock.unwrap();
+            // Same mapping the mixer uses to find the sample to output.
+            positions.push(clock.ms as f64
+                + signed_frames(at, clock.stamp) as f64 * 1000.0 / f64::from(RATE));
+        }
+        for (i, pair) in positions[120..].windows(2).enumerate() {
+            let step = pair[1] - pair[0];
+            assert!((step - frame).abs() < 1.5,
+                "position step {step:.3} ms is not {frame:.3} ms at {i} ({:.3} -> {:.3})",
+                pair[0], pair[1]);
+        }
     }
 
     #[test]

@@ -2,79 +2,32 @@
 
 [![Rust CI](https://github.com/mrbocao/livemix/actions/workflows/rust.yml/badge.svg)](https://github.com/mrbocao/livemix/actions/workflows/rust.yml)
 
-LiveMix is an experimental live video production switcher built in Rust for Windows and Apple Silicon Macs. It brings cameras, clips, desktop capture, graphics, and network feeds into a Preview and Program workflow for live events and studio productions. The interface uses egui and offers Classic and Modern themes.
+LiveMix is a Rust live video production switcher for Windows and Apple Silicon Macs. It combines camera feeds, clips, desktop capture, network video, graphics and stereo audio in a Preview and Program workflow. Operators can prepare a shot in Preview, switch it to Program, and send independently routed feeds to local displays, recorders and network receivers. The egui interface offers Classic and Modern themes.
 
-![LiveMix showing the Preview and Program monitors, transitions, overlay controls, and demo inputs](docs/screenshots/switcher.png)
+![LiveMix Preview and Program monitors, transition controls and demo inputs](docs/screenshots/switcher.png)
 
-## What you can do
+## Start here
 
-- Switch live sources with Cut, timed transitions, a manual T-bar, GT stingers, and eight overlay channels. Open a larger preview from any input card.
-- Build scenes with picture-in-picture layers, crop, position, and chroma key. Load supported GT Designer `.gtzip` titles, edit text fields, and use template clocks.
-- Check the picture with safe areas, waveform, RGB parade, and vectorscope. The status bar reports the measured project cadence separately from interface repaints.
-- Route Program, Preview, MultiView, or an input to four independent outputs. Use local output windows, NDI, OMT, SRT, or supported DeckLink devices.
-- Mix real stereo audio at 48 kHz from microphones, video files, DeckLink, NDI, OMT, and SRT. Monitor Master, A, or B through the system audio output.
-- Record two configurable video outputs, record selected sources with MultiCorder, and stream RTMP/RTMPS through FFmpeg. Save projects as `.vmix` presets for the supported input types.
-
-## Screenshots
-
-The captures show the Windows build with its built-in demo sources.
-
-| Video scopes | Network routing | Input layers |
-| --- | --- | --- |
-| [![Waveform, vectorscope, and safe areas on Preview](docs/screenshots/video-scopes.png)](docs/screenshots/video-scopes.png) | [![Independent NDI, OMT, and SRT settings for four outputs](docs/screenshots/network-outputs.png)](docs/screenshots/network-outputs.png) | [![Input settings with a picture-in-picture layer on Program](docs/screenshots/input-layers.png)](docs/screenshots/input-layers.png) |
-
-## Build on Windows
-
-Install stable Rust and the Visual Studio Build Tools with the Desktop development with C++ workload. From the repository root, run:
-
-```powershell
-cd app
-cargo run --locked --release
-cargo test --locked --release -- --skip first_camera_delivers_frames
-```
-
-The desktop capture test needs an interactive Windows session. The camera test also needs a physical camera. The standard GitHub Actions job skips both.
-
-## Build on macOS
-
-The first Mac build targets **Apple Silicon** with macOS 12 or newer. It shares the switcher, presets, GT titles, and scopes with Windows. FFmpeg provides AVFoundation input for cameras and screen capture, file playback, MP4 recording, RTMP, and SRT. H.264 and HEVC recording can use Apple VideoToolbox. Camera and screen capture require the corresponding macOS permissions.
-
-Install stable Rust and the Xcode Command Line Tools. Install FFmpeg and FFprobe, for example with `brew install ffmpeg`. From the repository root, run:
-
-```sh
-cd app
-cargo run --locked --release
-cargo test --locked --release
-cargo test --locked --release ffmpeg_video_roundtrip -- --ignored
-```
-
-The macOS CI job packages an ad hoc signed development build as `LiveMix-macOS-arm64.zip`. The archive contains `LiveMix.app` and is available in the artifacts section of successful workflow runs. Developer ID signing and notarization are pending. [Rust workflow runs](https://github.com/mrbocao/livemix/actions/workflows/rust.yml)
-
-## Network and capture dependencies
-
-| Feature | Setup |
+| Guide | What it covers |
 | --- | --- |
-| RTMP/RTMPS and SRT | Install FFmpeg or set `LIVEMIX_FFMPEG` to its full path. Verify SRT is listed by `ffmpeg -protocols`. SRT supports Caller and Listener with H.264 or HEVC. |
-| NDI | Install the native NDI runtime for the platform. On macOS, set `LIVEMIX_NDI_DIR` when `libndi.dylib` is outside the standard install locations. |
-| OMT | Provide `libomt.dll` and `libvmx.dll` on Windows, or `libomt.dylib` and `libvmx.dylib` on macOS. Place the pair beside the executable or set `LIVEMIX_OMT_DIR` to their folder. [OMT SDK releases](https://github.com/openmediatransport/libomtnet/releases) |
-| DeckLink | Install Blackmagic Desktop Video. On Windows, LiveMix uses the installed SDK interfaces. On macOS, set `LIVEMIX_DECKLINK_FFMPEG` to an FFmpeg executable built with DeckLink support. Use **Add Input → Blackmagic** for capture and **Settings → External Output** for playback. [FFmpeg DeckLink setup](https://ffmpeg.org/ffmpeg-devices.html#decklink) |
+| [Setup and dependencies](docs/SETUP.md) | Windows and Mac builds, FFmpeg, NDI, OMT, DeckLink, permissions and GPU setup |
+| [Operator guide](docs/OPERATOR.md) | Switching, audio, recording, streaming, replay, telestration and automation |
+| [Changes](CHANGELOG.md) | Implemented changes and the conditions under which they work |
+| [Roadmap](docs/ROADMAP.md) | Open work, hardware validation and performance priorities |
+| [Agent guide](AGENTS.md) | Source map, test commands, safety of project state and contribution workflow |
 
-Discover LAN sources under **Add Input → NDI / OMT / Desktop Capture**, or choose **Stream / SRT** for an SRT input. Configure publishing under **Settings → Outputs / NDI / OMT / SRT**. To run local network checks with the runtimes installed, use `cargo test --locked --release loopback -- --ignored` from `app`.
+## What it does
 
-Use **Add Input → Audio Input** for a microphone, audio interface, or the separate audio endpoint of a USB camera. Allow microphone access in the operating system. Embedded sound from video files uses FFmpeg, including on Windows. **Audio Mixer → Monitor** plays the selected bus through the default audio output. It starts off.
+- **Switch and compose.** Use Cut, timed transitions, T-bar, GT stingers, eight overlay channels, layered inputs, position, crop, chroma key and colour adjustments. Monitor the picture with waveform, RGB parade, vectorscope and safe areas.
+- **Mix stereo audio.** Capture and monitor 48 kHz audio, route it through Master, A and B, and apply per-input EQ, gate, compression, gain and delay.
+- **Record and distribute.** Route four independent outputs to local windows, DeckLink, NDI, OMT or SRT as supported. Record two configured routes or use MultiCorder. Compatible RTMP destinations can share an encoder.
+- **Operate a show.** Select up to eight replay angles, mark events and export an angle to Preview. Draw freehand annotations with the transparent Telestrator input. Use keyboard shortcuts, a local web controller, simple scripts, input triggers and VISCA over UDP.
+- **Move projects between sessions.** Save and reopen LiveMix projects in `.vmix` files. The import report lists missing media and unsupported input types. Compatibility with third-party presets and GT templates is partial.
 
-Program and MultiView routes use the Master mix. Preview and specific-input routes use the corresponding input audio. MP4 and RTMP/SRT carry stereo AAC, NDI and OMT carry stereo audio, and DeckLink carries embedded PCM. MultiCorder uses the audio of each recorded source.
+## Project status
 
-To launch the macOS bundle with a separate DeckLink-enabled FFmpeg executable from Terminal, use the actual paths on your Mac.
+LiveMix is in alpha. Windows can keep compatible decoded clips and eligible hardware recording surfaces on the GPU when OpenGL and D3D11 use the same adapter. Other configurations may use system memory. Apple Silicon has a separate build and media backend. Consult the [roadmap](docs/ROADMAP.md) for the hardware and workflow combinations that still need testing.
 
-```sh
-LIVEMIX_DECKLINK_FFMPEG=/path/to/decklink-ffmpeg /Applications/LiveMix.app/Contents/MacOS/livemix
-```
+The [screenshots](docs/screenshots) show the Windows interface with demo sources. Report bugs with the operating system, GPU and driver, input type, project format, output route and steps to reproduce. [Open an issue](https://github.com/mrbocao/livemix/issues)
 
-## Current limits
-
-LiveMix is in alpha. DeckLink audio and video require testing with physical hardware. On macOS, select the playback connector in Blackmagic Desktop Video Setup. MP4 recording on macOS supports H.264 and HEVC. Windows WMV recording is video-only. GT templates and project presets support a subset of their respective features. Sustained network frame rates depend on the source, encoder, machine, and receiver.
-
-## Contribute
-
-The project welcomes focused fixes and reproducible reports, especially around GPU readback, sustained network output, audio mixing, and capture hardware. Include the operating system, GPU and driver, input types, project format, and steps to reproduce. For performance reports, include the measured project FPS and receiver FPS separately when available. [Open an issue](https://github.com/mrbocao/livemix/issues)
+The DSP and VISCA code adapted from LiveCraft retains its [MIT license and copyright notice](docs/LICENSE-LiveCraft-MIT.txt).

@@ -120,26 +120,64 @@ pub enum Kind {
     ImageFile { path: String },
     /// "List": several video files played one after another (original's Video List input).
     VideoList { paths: Vec<String>, idx: usize },
+    /// "Instant Replay": the selected replay event angle, played like a video file.
+    Replay { path: String },
     /// "NDI / Desktop Capture": the whole Windows desktop.
     Desktop,
     /// "Image Sequence / Stinger": a folder of numbered pictures played as video.
     ImageSequence { folder: String },
     /// "Photos": a slideshow of the pictures in a folder.
     Photos { folder: String },
+    /// "Video Delay" (vMix.VideoType 10): a delayed copy of another input. The original
+    /// buffers the source at the chosen resolution for `seconds` (frmInput tVideoDelay).
+    VideoDelay { source: Option<u32>, seconds: f32, resolution: [u32; 2] },
+    /// "Telestrator" (vMix.VideoType 5001): a transparent drawing layer over the program.
+    Telestrator { strokes: Vec<Telestroke> },
+}
+
+/// One freehand line of a Telestrator input. Points are 0..1 in the frame, like the original's
+/// web page canvases (1920x1080 scaled to the frame).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Telestroke {
+    pub points: Vec<[f32; 2]>,
+    pub colour: [u8; 3],
+    /// Line width as a fraction of the frame height (0.004 = ~4 px at 1080p).
+    pub width: f32,
+}
+
+/// One trigger of Input Settings → Triggers: run an automation script when the input goes
+/// to or leaves Program, after an optional delay. The original's lstTriggers holds these.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InputTrigger {
+    /// 0 = On Transition In, 1 = On Transition Out.
+    pub kind: u8,
+    pub command: String,
+    #[serde(default)]
+    pub delay_ms: u32,
 }
 
 impl Kind {
     pub fn playable(&self) -> bool {
-        matches!(self, Kind::Video { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::ImageSequence { .. } | Kind::Photos { .. })
+        match self {
+            Kind::Replay { path } => !path.is_empty(),
+            _ => matches!(self, Kind::Video { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::ImageSequence { .. } | Kind::Photos { .. }),
+        }
     }
     pub fn has_audio(&self) -> bool {
-        matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. })
+        match self {
+            Kind::Replay { path } => !path.is_empty(),
+            _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. }),
+        }
     }
+    /// The input a Video Delay copies (None for every other kind).
     pub fn transparent(&self) -> bool {
         matches!(self, Kind::Title { .. } | Kind::GtTitle { .. } | Kind::Blank | Kind::ImageFile { .. } | Kind::ImageSequence { .. })
     }
     pub fn keyable(&self) -> bool {
-        matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop)
+        match self {
+            Kind::Replay { path } => !path.is_empty(),
+            _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop),
+        }
     }
 
     pub fn gt_seconds(&self, exiting: bool) -> Option<f32> {
@@ -150,10 +188,13 @@ impl Kind {
     }
     /// Inputs whose picture comes from a media thread (camera, files, desktop…).
     pub fn streamed(&self) -> bool {
-        matches!(
-            self,
-            Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. }
-        )
+        match self {
+            Kind::Replay { path } => !path.is_empty(),
+            _ => matches!(
+                self,
+                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. }
+            ),
+        }
     }
 }
 
@@ -190,16 +231,115 @@ impl Default for Position {
     }
 }
 
+/// Position editor trackbar ranges (ozzzzzq layout code, round 19): Zoom −3990…4000,
+/// Pan X/Y −2000…2000.
+pub const ZOOM_SLIDER: (i32, i32) = (-3990, 4000);
+pub const PAN_SLIDER: (i32, i32) = (-2000, 2000);
+
+/// Zoom trackbar → zoom (ozzzzzq::k 0x060039a4): below centre value/4000 + 1, above centre
+/// value/1000 + 1, so the left half covers 0.0025…1 and the right half 1…5. The original
+/// writes 0 ("unset" = 1) inside the dead band −1…1; here that is zoom 1.
+pub fn zoom_from_slider(v: i32) -> f32 {
+    if v < -1 {
+        v as f32 / 4000.0 + 1.0
+    } else if v > 1 {
+        v as f32 / 1000.0 + 1.0
+    } else {
+        1.0
+    }
+}
+
+/// Zoom → trackbar (ozzzzzq::h 0x060039a1): (z − 1)·4000 below 1, (z − 1)·1000 above, 0 at 1.
+pub fn zoom_to_slider(z: f32) -> i32 {
+    let v = if z < 1.0 {
+        ((z - 1.0) * 4000.0).round() as i32
+    } else if z > 1.0 {
+        ((z - 1.0) * 1000.0).round() as i32
+    } else {
+        0
+    };
+    v.clamp(ZOOM_SLIDER.0, ZOOM_SLIDER.1)
+}
+
+/// Pan trackbar ↔ pan (ozzzzzq::n/o and ::i): value/1000, so ±2000 = ±2 half-frames.
+pub fn pan_from_slider(v: i32) -> f32 {
+    v as f32 / 1000.0
+}
+pub fn pan_to_slider(p: f32) -> i32 {
+    ((p * 1000.0).round() as i32).clamp(PAN_SLIDER.0, PAN_SLIDER.1)
+}
+
 /// One of an input's layers (the original has 10: ShortcutFunction SetLayer1..10Zoom/PanX/…).
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+/// The border is the Layer Designer's Border mode (LayerEditor::LayerBorder): a frame drawn
+/// around the layer's visible rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layer {
     pub on: bool,
     pub input: Option<u32>,
     pub place: Position,
+    pub border: bool,
+    pub border_colour: [u8; 3],
+    /// Border thickness as a fraction of the layer's width (0.02 = 2 %).
+    pub border_width: f32,
+}
+
+impl Default for Layer {
+    fn default() -> Self {
+        Layer { on: false, input: None, place: Position::default(), border: false,
+            border_colour: [0xff, 0xff, 0xff], border_width: 0.02 }
+    }
 }
 
 /// Number of layers per input (ShortcutFunction SetLayer1..SetLayer10).
 pub const LAYERS: usize = 10;
+
+/// Picture treatment of one input. `brightness`/`contrast`/`saturation` are the Colour Adjust
+/// page; `red`/`green`/`blue`/`alpha`/`black`/`white` are the Colour Correction page's
+/// tbRed..tbWhite (the original's -100..100 trackbars, stored as -1..1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ColourAdjust {
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub red: f32,
+    pub green: f32,
+    pub blue: f32,
+    pub alpha: f32,
+    pub black: f32,
+    pub white: f32,
+}
+
+impl ColourAdjust {
+    pub fn apply(self, pixels: &mut [u8]) {
+        if self == Self::default() { return; }
+        let brightness = self.brightness.clamp(-1.0, 1.0);
+        let contrast = 1.0 + self.contrast.clamp(-1.0, 1.0);
+        let saturation = 1.0 + self.saturation.clamp(-1.0, 1.0);
+        let gain = [
+            1.0 + self.red.clamp(-1.0, 1.0),
+            1.0 + self.green.clamp(-1.0, 1.0),
+            1.0 + self.blue.clamp(-1.0, 1.0),
+        ];
+        let black = self.black.clamp(-1.0, 1.0) * 0.5;
+        let white = 1.0 + self.white.clamp(-1.0, 1.0) * 0.5;
+        let span = (white - black).max(0.1);
+        let alpha = 1.0 + self.alpha.clamp(-1.0, 1.0);
+        for pixel in pixels.chunks_exact_mut(4) {
+            let luma = (f32::from(pixel[0]) * 0.2126 + f32::from(pixel[1]) * 0.7152
+                + f32::from(pixel[2]) * 0.0722) / 255.0;
+            for (channel, gain) in pixel[..3].iter_mut().zip(gain) {
+                let mut v = f32::from(*channel) / 255.0;
+                v = luma + (v - luma) * saturation;
+                v = (v - 0.5) * contrast + 0.5 + brightness;
+                v *= gain;
+                v = (v - black) / span;
+                *channel = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+            pixel[3] = (f32::from(pixel[3]) * alpha).clamp(0.0, 255.0).round() as u8;
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Input {
@@ -219,6 +359,35 @@ pub struct Input {
     pub duration: f32,
     pub audio_on: bool,
     pub volume: f32,
+    pub audio_effects: crate::audio::Effects,
+    pub ptz_address: String,
+    pub on_program: String,
+    pub colour_adjust: ColourAdjust,
+    /// Input Settings > General (frmInputSettings chkMirror/chkSharpen/chkDeinterlace).
+    pub mirror: bool,
+    pub sharpen: bool,
+    pub deinterlace: bool,
+    /// Automatically Play / Pause / Restart with Transition (chkPlayActive/chkPausePreview/chkRestart).
+    pub play_active: bool,
+    pub pause_preview: bool,
+    pub restart_active: bool,
+    /// Automatically mix audio (chkAutoMixAudio).
+    pub auto_mix_audio: bool,
+    /// Forced display aspect ratio; 0 = the source's own (cboAspectRatio "Default").
+    pub aspect: f32,
+    /// Tally Lights page: this input's tally colour; None = the default orange.
+    pub tally_colour: Option<[u8; 3]>,
+    /// Colour Correction page: Rec. 601 to 709 and Premultiplied Alpha.
+    pub rec601: bool,
+    pub premultiplied: bool,
+    /// Advanced page: Flatten Layers, Mouse Click Action and video Delay in frames.
+    pub flatten: bool,
+    /// Effects page: chkUseSourceRenderEffects ("Use Source Settings").
+    pub effects_source: bool,
+    pub click_action: u8,
+    pub delay_frames: u32,
+    /// Live dBFS peak, filled in each frame for the Audio page's meter.
+    pub level: f32,
     pub bus_m: bool,
     pub bus_a: bool,
     pub bus_b: bool,
@@ -267,6 +436,26 @@ impl Input {
             duration: 60.0,
             audio_on: true,
             volume: 80.0,
+            audio_effects: Default::default(),
+            ptz_address: String::new(),
+            on_program: String::new(),
+            colour_adjust: Default::default(),
+            mirror: false,
+            sharpen: false,
+            deinterlace: false,
+            play_active: false,
+            pause_preview: false,
+            restart_active: false,
+            auto_mix_audio: false,
+            aspect: 0.0,
+            tally_colour: None,
+            rec601: false,
+            premultiplied: false,
+            flatten: false,
+            effects_source: false,
+            click_action: 0,
+            delay_frames: 0,
+            level: 0.0,
             bus_m: true,
             bus_a: false,
             bus_b: false,
@@ -659,15 +848,12 @@ impl AddKind {
         !matches!(
             self,
             AddKind::Dvd
-                | AddKind::Replay
-                | AddKind::VideoDelay
                 | AddKind::PowerPoint
                 | AddKind::AudioFile
                 | AddKind::VirtualSet
                 | AddKind::WebBrowser
                 | AddKind::VideoCall
                 | AddKind::Zoom
-                | AddKind::Telestrator
         )
     }
     pub fn help(self) -> &'static str {
@@ -688,8 +874,8 @@ impl AddKind {
             AddKind::TestImage => "A drawn stand-in still picture.",
             AddKind::Dvd => "Play a DVD disc — not available in this version.",
             AddKind::StreamSrt => "Receive H.264 or HEVC video from an SRT source.",
-            AddKind::Replay => "Instant Replay with slow motion — not available in this version.",
-            AddKind::VideoDelay => "A delayed copy of another input — not available in this version.",
+            AddKind::Replay => "Show the selected Instant Replay event angle as an input. Configure angles and mark events in the Replay window.",
+            AddKind::VideoDelay => "A delayed copy of another input. Pick the source, the buffer length and the resolution the picture is stored at.",
             AddKind::PowerPoint => "PowerPoint slides — not available in this version (export the slides as pictures and use Photos).",
             AddKind::AudioFile => "An audio file — not available in this version (audio is not built yet).",
             AddKind::AudioInput => "A microphone, USB audio interface or line input.",
@@ -697,22 +883,11 @@ impl AddKind {
             AddKind::WebBrowser => "A web page as an input — not available in this version.",
             AddKind::VideoCall => "Remote guests by video call — not available in this version.",
             AddKind::Zoom => "Zoom meeting participants — not available in this version.",
-            AddKind::Telestrator => "Drawing over video — not available in this version.",
+            AddKind::Telestrator => "Draw over the program from a web browser. Enable the Web Controller and open /telestrator/ on your tablet or phone.",
         }
     }
     pub fn uses_device(self) -> bool {
         matches!(self, AddKind::Camera | AddKind::Blackmagic | AddKind::AudioInput)
-    }
-    /// Needs a file (Some(true) = video, Some(false) = picture).
-    pub fn file_kind(self) -> Option<bool> {
-        match self {
-            AddKind::VideoFile => Some(true),
-            AddKind::ImageFile => Some(false),
-            _ => None,
-        }
-    }
-    pub fn uses_folder(self) -> bool {
-        matches!(self, AddKind::ImageSequence | AddKind::Photos)
     }
 }
 
@@ -749,7 +924,18 @@ pub struct AddDialog {
     pub list: Vec<String>,
     /// Folder of an Image Sequence or Photos input.
     pub folder: String,
+    /// Video Delay: the input copied, the buffer length in seconds and the buffer resolution
+    /// (index into DELAY_RESOLUTIONS, the original's cboVideoDelayResolution).
+    pub delay_source: Option<u32>,
+    pub delay_seconds: f32,
+    pub delay_resolution: usize,
 }
+
+/// cboVideoDelayResolution entries in the original (frmInput tVideoDelay).
+pub const DELAY_RESOLUTIONS: [[u32; 2]; 8] = [
+    [640, 480], [720, 480], [720, 486], [720, 576],
+    [768, 480], [768, 576], [1280, 720], [1920, 1080],
+];
 
 pub struct Switcher {
     pub inputs: Vec<Input>,
@@ -834,6 +1020,22 @@ pub struct Switcher {
     pub srt_setup: Option<usize>,
     /// Input whose settings window (name, green-screen key) is open.
     pub settings_input: Option<u32>,
+    pub import_report: Option<crate::preset::ImportReport>,
+    pub automation: crate::automation::State,
+    pub script: String,
+    pub remote: Option<crate::automation::Remote>,
+    pub replay_open: bool,
+    pub replay_arm: bool,
+    pub replay_angles: [u32; REPLAY_ANGLES],
+    pub replay_mark_in: bool,
+    pub replay_mark: bool,
+    pub replay_add: bool,
+    pub replay_available: bool,
+    pub replay_status: String,
+    pub replay_events: Vec<(String, Vec<String>)>,
+    pub replay_event: usize,
+    pub replay_angle: usize,
+    pub replay_marking: bool,
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
     pub confirm_stop: Option<&'static str>,
     /// Position copied in Input Settings (Copy / Paste buttons of the original).
@@ -851,6 +1053,7 @@ pub const SRC_MV2: u32 = u32::MAX - 2;
 /// MultiView box left on automatic: the next input in list order.
 pub const MV_AUTO: u32 = u32::MAX;
 pub const OUTPUT_COUNT: usize = 4;
+pub const REPLAY_ANGLES: usize = 8;
 
 #[derive(Clone, Copy, Default)]
 pub struct ExternalWindow {
@@ -983,6 +1186,64 @@ pub fn mv_title_height(layout: u8) -> f32 {
     mv_sizes(rows, cols).1 as f32 / MV_H as f32
 }
 
+/// One row of Settings > Shortcuts. The original's `vMix.Shortcut` carries either a
+/// keyboard key (`m_Key`) or MIDI data (`m_MIDIChannel`, `m_MIDINote`, `m_MIDIValue`)
+/// and one action (`m_Function` + input/duration); this keeps both in the same row.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ShortcutBinding {
+    /// Chord written with `egui::Key::name`, e.g. "Q", "PageUp" or "Ctrl+S".
+    /// Empty means keyboard is not bound.
+    pub key: String,
+    /// Action executed by the key or MIDI message (see `Switcher::perform_action`).
+    pub action: String,
+    /// 0 = no MIDI binding, 1..=16 = MIDI channel as shown in the original.
+    pub midi_channel: u8,
+    /// Note number (0..=127). For ControlChange this is the controller number.
+    pub midi_note: u8,
+    /// Optional value match (velocity / controller value).
+    pub midi_value: u8,
+    pub midi_value_enabled: bool,
+    /// `MIDIValueType`: 0 Default, 1 JogWheel, 2..=4 reserved by the original.
+    pub midi_value_type: u8,
+    pub disabled: bool,
+}
+
+impl ShortcutBinding {
+    pub fn has_midi(&self) -> bool {
+        self.midi_channel > 0
+    }
+}
+
+/// The original's "Default Keyboard" shortcut template (36 shortcuts).
+pub fn default_shortcuts() -> Vec<ShortcutBinding> {
+    let mut rows = Vec::new();
+    let mut add = |key: &str, action: String| rows.push(ShortcutBinding {
+        key: key.into(),
+        action,
+        ..Default::default()
+    });
+    add("PageUp", "PreviewPrevious".into());
+    add("PageDown", "PreviewNext".into());
+    add("Period", "Fade 500".into());
+    add("0", "Cut".into());
+    for (key, ms) in [("1", 1000), ("2", 2000), ("3", 3000), ("4", 4000)] {
+        add(key, format!("Fade {ms}"));
+    }
+    add("OpenBracket", "PreviewPrevious".into());
+    add("CloseBracket", "PreviewNext".into());
+    for (n, key) in ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"].into_iter().enumerate() {
+        add(key, format!("Preview {}", n + 1));
+    }
+    for (n, key) in ["A", "S", "D", "F", "G", "H", "J", "K", "L"].into_iter().enumerate() {
+        add(key, format!("CutDirect {}", n + 1));
+    }
+    for (n, key) in ["Z", "X", "C", "V", "B", "N", "M"].into_iter().enumerate() {
+        add(key, format!("FadeDirect {} 1000", n + 1));
+    }
+    rows
+}
+
 /// Settings window options. Defaults are the original's config defaults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InterfaceTheme {
@@ -1085,6 +1346,7 @@ pub struct Settings {
     pub lock_refresh: bool,
     pub no_input_effects: bool,
     pub hw_encoder: bool,
+    pub video_adapter: String,
     pub auto_cam_max_h: u32,
     /// Preview monitor tools: safe area type (SafeAreasType value, 0 = None — see
     /// SAFE_AREAS) and Waveform Monitor choice (value from WAVEFORMS, 0 = None), with the
@@ -1096,6 +1358,12 @@ pub struct Settings {
     pub input_page: usize,
     /// Selected page in the Settings window.
     pub page: usize,
+    /// Settings > Shortcuts (keyboard + MIDI), based on the original's Shortcut list.
+    pub shortcuts: Vec<ShortcutBinding>,
+    /// Settings > Shortcuts > MIDI Input master switch.
+    pub midi_enabled: bool,
+    /// Checked MIDI devices (indexes from `midi::Input::devices`).
+    pub midi_devices: Vec<usize>,
 }
 
 impl Default for Settings {
@@ -1158,12 +1426,16 @@ impl Default for Settings {
             lock_refresh: false,
             no_input_effects: false,
             hw_encoder: true,
+            video_adapter: String::new(),
             auto_cam_max_h: 1080,
             safe_type: 0,
             wave_type: 0,
             vs_zoom: false,
             input_page: 0,
             page: 0,
+            shortcuts: default_shortcuts(),
+            midi_enabled: false,
+            midi_devices: Vec::new(),
         }
     }
 }
@@ -1263,6 +1535,7 @@ impl Switcher {
             format!("lock_refresh={}", b(c.lock_refresh)),
             format!("no_input_effects={}", b(c.no_input_effects)),
             format!("hw_encoder={}", b(c.hw_encoder)),
+            format!("video_adapter={}", c.video_adapter),
             format!("auto_cam_max_h={}", c.auto_cam_max_h),
             format!("safe_type={}", c.safe_type),
             format!("wave_type={}", c.wave_type),
@@ -1274,6 +1547,9 @@ impl Switcher {
             format!("play_active={}", b(self.play_active)),
             format!("restart_active={}", b(self.restart_active)),
             format!("playlist_secs={}", self.playlist_secs),
+            format!("shortcuts={}", serde_json::to_string(&c.shortcuts).unwrap_or_default()),
+            format!("midi_enabled={}", b(c.midi_enabled)),
+            format!("midi_devices={}", serde_json::to_string(&c.midi_devices).unwrap_or_default()),
         ];
         let _ = std::fs::write(Self::settings_path(), lines.join("\n"));
     }
@@ -1395,6 +1671,7 @@ impl Switcher {
                 "lock_refresh" => c.lock_refresh = on,
                 "no_input_effects" => c.no_input_effects = on,
                 "hw_encoder" => c.hw_encoder = on,
+                "video_adapter" => c.video_adapter = v.to_owned(),
                 "auto_cam_max_h" => c.auto_cam_max_h = v.parse().unwrap_or(1080),
                 "safe_type" => c.safe_type = v.parse().ok().filter(|t| SAFE_AREAS.iter().any(|s| s.1 == *t)).unwrap_or(0),
                 "wave_type" => c.wave_type = v.parse().ok().filter(|t| WAVEFORMS.iter().any(|w| w.1 == *t)).unwrap_or(0),
@@ -1415,6 +1692,13 @@ impl Switcher {
                 "play_active" => self.play_active = on,
                 "restart_active" => self.restart_active = on,
                 "playlist_secs" => self.playlist_secs = v.parse().unwrap_or(PLAYLIST_DEFAULT_SECS),
+                "shortcuts" => {
+                    if let Ok(rows) = serde_json::from_str(v) { c.shortcuts = rows; }
+                }
+                "midi_enabled" => c.midi_enabled = on,
+                "midi_devices" => {
+                    if let Ok(devices) = serde_json::from_str(v) { c.midi_devices = devices; }
+                }
                 _ => {}
             }
         }
@@ -1497,6 +1781,9 @@ impl Switcher {
                 colour_mode: 0,
                 list: Vec::new(),
                 folder: String::new(),
+                delay_source: None,
+                delay_seconds: 1.0,
+                delay_resolution: 3,
             },
             filter: None,
             confirm_close: None,
@@ -1532,6 +1819,22 @@ impl Switcher {
             srt_status: Default::default(),
             srt_setup: None,
             settings_input: None,
+            import_report: None,
+            automation: Default::default(),
+            script: String::new(),
+            remote: None,
+            replay_open: false,
+            replay_arm: false,
+            replay_angles: [SRC_OUTPUT, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO],
+            replay_mark_in: false,
+            replay_mark: false,
+            replay_add: false,
+            replay_available: false,
+            replay_status: String::new(),
+            replay_events: Vec::new(),
+            replay_event: 0,
+            replay_angle: 0,
+            replay_marking: false,
             confirm_stop: None,
             position_clipboard: None,
             cfg: Settings::default(),
@@ -1609,13 +1912,18 @@ impl Switcher {
         let (play, restart) = (self.play_active, self.restart_active);
         if let Some(i) = self.input_mut(to) {
             if i.kind.playable() {
-                if restart {
+                if restart || i.restart_active {
                     i.pos = 0.0;
                     i.restart_req = true;
                 }
-                if play {
+                if play || i.play_active {
                     i.playing = true;
                 }
+            }
+            // Input Settings > General: Automatically mix audio.
+            if i.auto_mix_audio {
+                i.audio_on = true;
+                i.bus_m = true;
             }
         }
     }
@@ -1628,12 +1936,21 @@ impl Switcher {
         if !direct {
             self.preview = old.or(Some(to));
         }
+        // Automatically Pause after Transition: the Settings option for every input, or this
+        // input's own Input Settings flag.
         if self.pause_preview {
             if let Some(p) = old {
                 if p != to && (!direct || Some(p) != self.preview) {
                     if let Some(i) = self.input_mut(p) {
                         i.playing = false;
                     }
+                }
+            }
+        } else if let Some(p) = old {
+            let per_input = self.input(p).is_some_and(|i| i.pause_preview);
+            if per_input && p != to && (!direct || Some(p) != self.preview) {
+                if let Some(i) = self.input_mut(p) {
+                    i.playing = false;
                 }
             }
         }
@@ -1713,6 +2030,93 @@ impl Switcher {
         let cur = self.preview.map(|p| self.number_of(p) as i32 - 1).unwrap_or(-1);
         let next = (cur + delta).rem_euclid(n) as usize;
         self.preview = Some(self.inputs[next].id);
+    }
+
+    /// Runs one shortcut / MIDI / Trigger action. Keyboard shortcuts, MIDI notes and
+    /// input Triggers all use these action strings (the original's `Shortcut.Function`
+    /// plus input/duration, e.g. "Preview 1", "CutDirect 2", "FadeDirect 1 500",
+    /// "Fade 500", "SavePreset").
+    pub fn perform_action(&mut self, action: &str, now: f64) -> Result<(), String> {
+        let text = action.trim();
+        if text.is_empty() {
+            return Err("Empty action".into());
+        }
+        if text.len() > 256 {
+            return Err("Action is too long".into());
+        }
+        let fields: Vec<&str> = text.split_whitespace().collect();
+        let op = fields.first().copied().unwrap_or_default().to_ascii_lowercase();
+        let number = |text: &str| text.parse::<usize>().ok().filter(|n| *n >= 1);
+        let duration = |text: &str| text.parse::<u32>().ok().filter(|ms| *ms <= 60_000);
+        let target = |s: &Self, n: usize| s.inputs.get(n - 1).map(|input| input.id);
+        match (op.as_str(), fields.len()) {
+            ("cut", 1) | ("cutpreview", 1) => self.start_transition(Effect::Cut, 0),
+            ("previewnext", 1) | ("previewinputnext", 1) => self.preview_step(1),
+            ("previewprevious", 1) | ("previewinputprevious", 1) => self.preview_step(-1),
+            ("savepreset", 1) => {
+                if !self.save_preset() {
+                    return Err("Preset could not be saved".into());
+                }
+            }
+            ("startrecording", 1) => {
+                if self.rec.is_none() {
+                    self.rec = Some(now);
+                }
+            }
+            ("stoprecording", 1) => self.rec = None,
+            ("startstreaming", 1) => self.stream_active[0] = true,
+            ("stopstreaming", 1) => self.stream_active[0] = false,
+            ("startmulticorder", 1) => {
+                if self.multicorder.is_none() {
+                    self.multicorder = Some(now);
+                }
+            }
+            ("stopmulticorder", 1) => self.multicorder = None,
+            ("fadetoblack", 1) | ("ftb", 1) => self.ftb_on = !self.ftb_on,
+            ("preview", 2) => {
+                let n = number(fields[1]).ok_or_else(|| format!("Invalid input in {text:?}"))?;
+                let id = target(self, n).ok_or_else(|| format!("Input {n} is unavailable"))?;
+                self.preview = Some(id);
+            }
+            ("cutdirect", 2) | ("cut", 2) => {
+                let n = number(fields[1]).ok_or_else(|| format!("Invalid input in {text:?}"))?;
+                if n == 0 {
+                    self.start_transition(Effect::Cut, 0);
+                } else {
+                    let id = target(self, n).ok_or_else(|| format!("Input {n} is unavailable"))?;
+                    self.cut_direct(id);
+                }
+            }
+            ("fade", 2) => {
+                let ms = duration(fields[1]).ok_or_else(|| format!("Invalid duration in {text:?}"))?;
+                self.start_transition(Effect::Fade, ms);
+            }
+            ("fadedirect", 3) | ("fade", 3) => {
+                let n = number(fields[1]).ok_or_else(|| format!("Invalid input in {text:?}"))?;
+                let ms = duration(fields[2]).ok_or_else(|| format!("Invalid duration in {text:?}"))?;
+                if n == 0 {
+                    self.start_transition(Effect::Fade, ms);
+                } else {
+                    let id = target(self, n).ok_or_else(|| format!("Input {n} is unavailable"))?;
+                    self.transition_input(id, Effect::Fade, ms);
+                }
+            }
+            ("overlay", 2) => {
+                let n = number(fields[1]).ok_or_else(|| format!("Invalid overlay in {text:?}"))?;
+                let channel = (n - 1).min(OVERLAY_CHANNELS - 1);
+                self.toggle_overlay_channel(channel);
+            }
+            ("external", 2) => {
+                let n = number(fields[1]).ok_or_else(|| format!("Invalid output in {text:?}"))?;
+                if n <= OUTPUT_COUNT {
+                    self.toggle_external_route(n - 1);
+                } else {
+                    return Err(format!("Output {n} does not exist"));
+                }
+            }
+            _ => return Err(format!("Unknown action {text:?}")),
+        }
+        Ok(())
     }
 
     /// T-bar position as 0..1 for drawing.
@@ -2069,6 +2473,7 @@ impl Switcher {
                 let link = format!("srt:{}", serde_json::to_string(&d.srt).map_err(|e| e.to_string())?);
                 (Kind::Device { link, blackmagic: false }, d.srt.label())
             }
+            AddKind::Replay => (Kind::Replay { path: String::new() }, "Instant Replay".into()),
             AddKind::ImageSequence | AddKind::Photos => {
                 let f = d.folder.trim().to_string();
                 if f.is_empty() || !std::path::Path::new(&f).is_dir() {
@@ -2103,16 +2508,29 @@ impl Switcher {
                 }, name)
             }
             AddKind::Clock => (Kind::Clock, "Production Clock".into()),
+            AddKind::VideoDelay => {
+                let Some(source) = d.delay_source.filter(|id| self.inputs.iter().any(|i| i.id == *id)) else {
+                    return Err("Choose the input the Video Delay copies first.".into());
+                };
+                let resolution = DELAY_RESOLUTIONS[d.delay_resolution.min(DELAY_RESOLUTIONS.len() - 1)];
+                let seconds = d.delay_seconds.clamp(0.0, 120.0);
+                (Kind::VideoDelay { source: Some(source), seconds, resolution },
+                    format!("Video Delay ({seconds:.1}s)"))
+            }
+            AddKind::Telestrator => (Kind::Telestrator { strokes: Vec::new() }, "Telestrator".into()),
             k => return Err(format!("{} is not available in this version yet.", k.label())),
         };
         let name = if d.name.trim().is_empty() { default_name } else { d.name.trim().to_string() };
         let mut i = Input::new(0, &name, kind);
+        if d.kind == AddKind::Replay {
+            i.playing = true;
+        }
         i.decklink_port = d.decklink_port;
         i.decklink_mode = d.decklink_mode;
         if d.kind == AddKind::TestVideo {
             i.duration = d.length;
         }
-        if matches!(d.kind, AddKind::VideoFile | AddKind::List | AddKind::ImageSequence | AddKind::Photos) {
+        if matches!(d.kind, AddKind::VideoFile | AddKind::List | AddKind::Replay | AddKind::ImageSequence | AddKind::Photos) {
             i.duration = 0.0;
         }
         if matches!(d.kind, AddKind::ImageSequence | AddKind::Photos) {
@@ -2194,7 +2612,7 @@ impl Switcher {
     /// Recording, External Output, MultiCorder (or Streaming) running: the original refuses a
     /// new or opened preset then (frmmain::zzr @0x24ffe8, error 11004 "ClosePresets").
     pub fn outputs_busy(&self) -> bool {
-        self.rec.is_some() || self.multicorder.is_some() || self.external_active()
+        self.rec.is_some() || self.multicorder.is_some() || self.replay_arm || self.external_active()
             || self.stream_active.contains(&true)
             || self.srt_active.contains(&true)
     }
@@ -2267,9 +2685,15 @@ impl Switcher {
                 Kind::VideoFile { path } => ("videofile", path.clone(), String::new()),
                 Kind::ImageFile { path } => ("imagefile", path.clone(), String::new()),
                 Kind::VideoList { paths, .. } => ("list", paths.join("|"), String::new()),
+                Kind::Replay { path } => ("replay", path.clone(), String::new()),
                 Kind::Desktop => ("desktop", String::new(), String::new()),
                 Kind::ImageSequence { folder } => ("imagesequence", folder.clone(), String::new()),
                 Kind::Photos { folder } => ("photos", folder.clone(), String::new()),
+                Kind::VideoDelay { source, seconds, resolution } => ("videodelay",
+                    self.number_of(source.unwrap_or(0)).to_string(),
+                    format!("{},{},{}", resolution[0], resolution[1], seconds)),
+                Kind::Telestrator { strokes } => ("telestrator",
+                    serde_json::to_string(strokes).unwrap_or_else(|_| "[]".into()), String::new()),
             };
             let cat = i.category.map(|c| c.to_string()).unwrap_or_default();
             let k = i.key;
@@ -2300,6 +2724,39 @@ impl Switcher {
             if i.place != Position::default() {
                 out.push_str(&format!("place\t{}\t{}\n", n + 1, fmt_pos(&i.place)));
             }
+            let bits = i.mirror as u16
+                | (i.sharpen as u16) << 1
+                | (i.deinterlace as u16) << 2
+                | (i.play_active as u16) << 3
+                | (i.pause_preview as u16) << 4
+                | (i.restart_active as u16) << 5
+                | (i.auto_mix_audio as u16) << 6
+                | (i.rec601 as u16) << 7
+                | (i.premultiplied as u16) << 8
+                | (i.flatten as u16) << 9
+                | (i.effects_source as u16) << 10;
+            if bits != 0 {
+                out.push_str(&format!("input_flags\t{}\t{}\n", n + 1, bits));
+            }
+            if i.aspect != 0.0 {
+                out.push_str(&format!("aspect\t{}\t{}\n", n + 1, i.aspect));
+            }
+            if let Some([r, g, b]) = i.tally_colour {
+                out.push_str(&format!("tally\t{}\t{r}\t{g}\t{b}\n", n + 1));
+            }
+            if i.click_action != 0 || i.delay_frames != 0 {
+                out.push_str(&format!("advanced\t{}\t{}\t{}\n", n + 1, i.click_action, i.delay_frames));
+            }
+            let c = i.colour_adjust;
+            if c != ColourAdjust::default() {
+                out.push_str(&format!("colour\t{}\t{},{},{},{},{},{},{},{},{}\n", n + 1, c.brightness,
+                    c.contrast, c.saturation, c.red, c.green, c.blue, c.alpha, c.black, c.white));
+            }
+            if i.audio_effects != crate::audio::Effects::default() {
+                if let Ok(fx) = serde_json::to_string(&i.audio_effects) {
+                    out.push_str(&format!("audio_effects\t{}\t{fx}\n", n + 1));
+                }
+            }
             if let Some(m) = &i.cam_mode {
                 out.push_str(&format!("cammode\t{}\t{}\n", n + 1, m.code()));
             }
@@ -2308,7 +2765,9 @@ impl Switcher {
             }
             for (k, l) in i.layers.iter().enumerate() {
                 if l.input.is_some() {
-                    out.push_str(&format!("layer\t{}\t{}\t{}\t{}\t{}\n", n + 1, k, l.on as u8, num(l.input), fmt_pos(&l.place)));
+                    out.push_str(&format!("layer\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{}\t{}\n", n + 1, k,
+                        l.on as u8, num(l.input), fmt_pos(&l.place), l.border as u8,
+                        l.border_colour[0], l.border_colour[1], l.border_colour[2], l.border_width));
                 }
             }
         }
@@ -2354,6 +2813,9 @@ impl Switcher {
         });
         match result {
             Ok(warnings) => {
+                if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("vmix")) {
+                    self.import_report = Some(crate::preset::ImportReport::collect(path, &self.inputs, warnings.clone()));
+                }
                 self.now = now;
                 let last = self.remember_preset(path);
                 set_output_fps(self.cfg.rate());
@@ -2370,6 +2832,8 @@ impl Switcher {
     pub(crate) fn load_preset_text(&mut self, text: &str) {
         let mut s = Self::empty();
         let mut ids = Vec::new();
+        // Video Delay source input numbers, resolved once every input exists.
+        let mut delay_sources: Vec<(usize, usize)> = Vec::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split('\t').collect();
             match f.first().copied() {
@@ -2394,9 +2858,19 @@ impl Switcher {
                         "videofile" => Kind::VideoFile { path: f[3].into() },
                         "imagefile" => Kind::ImageFile { path: f[3].into() },
                         "list" => Kind::VideoList { paths: f[3].split('|').filter(|p| !p.is_empty()).map(String::from).collect(), idx: 0 },
+                        "replay" => Kind::Replay { path: f[3].into() },
                         "desktop" => Kind::Desktop,
                         "imagesequence" => Kind::ImageSequence { folder: f[3].into() },
                         "photos" => Kind::Photos { folder: f[3].into() },
+                        "videodelay" => {
+                            let r: Vec<u32> = f[4].split(',').take(2).filter_map(|x| x.parse().ok()).collect();
+                            Kind::VideoDelay {
+                                source: None,
+                                seconds: f[4].split(',').nth(2).and_then(|x| x.parse().ok()).unwrap_or(1.0),
+                                resolution: if r.len() == 2 { [r[0], r[1]] } else { DELAY_RESOLUTIONS[3] },
+                            }
+                        }
+                        "telestrator" => Kind::Telestrator { strokes: serde_json::from_str(f[3]).unwrap_or_default() },
                         _ => Kind::Blank,
                     };
                     let mut i = Input::new(0, f[2], kind);
@@ -2416,6 +2890,12 @@ impl Switcher {
                             colour: if c.len() == 3 { [c[0], c[1], c[2]] } else { Key::default().colour },
                             tolerance: f[11].parse().unwrap_or(60),
                         };
+                    }
+                    if matches!(i.kind, Kind::VideoDelay { .. }) {
+                        let n = f[3].parse::<usize>().unwrap_or(0);
+                        if n > 0 {
+                            delay_sources.push((ids.len(), n));
+                        }
                     }
                     ids.push(s.add(i));
                 }
@@ -2461,8 +2941,76 @@ impl Switcher {
                     if let (Some(id), Some(p)) = (ids.get(n.wrapping_sub(1)).copied(), parse_pos(f[5])) {
                         let tid = ids.get(target.wrapping_sub(1)).copied();
                         if let Some(l) = s.input_mut(id).and_then(|i| i.layers.get_mut(k)) {
-                            *l = Layer { on: f[3] == "1", input: tid, place: p };
+                            let mut layer = Layer { on: f[3] == "1", input: tid, place: p, ..Layer::default() };
+                            if let Some(v) = f.get(6) {
+                                layer.border = *v == "1";
+                            }
+                            if let Some(v) = f.get(7) {
+                                let c: Vec<u8> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                                if c.len() == 3 {
+                                    layer.border_colour = [c[0], c[1], c[2]];
+                                }
+                            }
+                            if let Some(v) = f.get(8).and_then(|v| v.parse().ok()) {
+                                layer.border_width = v;
+                            }
+                            *l = layer;
                         }
+                    }
+                }
+                Some("input_flags") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    let bits: u16 = f[2].parse().unwrap_or(0);
+                    if let Some(i) = ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)) {
+                        i.mirror = bits & 1 != 0;
+                        i.sharpen = bits & 2 != 0;
+                        i.deinterlace = bits & 4 != 0;
+                        i.play_active = bits & 8 != 0;
+                        i.pause_preview = bits & 16 != 0;
+                        i.restart_active = bits & 32 != 0;
+                        i.auto_mix_audio = bits & 64 != 0;
+                        i.rec601 = bits & 128 != 0;
+                        i.premultiplied = bits & 256 != 0;
+                        i.flatten = bits & 512 != 0;
+                        i.effects_source = bits & 1024 != 0;
+                    }
+                }
+                Some("aspect") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    if let Some(i) = ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)) {
+                        i.aspect = f[2].parse().unwrap_or(0.0);
+                    }
+                }
+                Some("tally") if f.len() >= 5 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    let v: Vec<u8> = f[2..5].iter().filter_map(|x| x.parse().ok()).collect();
+                    if let Some(i) = ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)) {
+                        i.tally_colour = (v.len() == 3).then(|| [v[0], v[1], v[2]]);
+                    }
+                }
+                Some("advanced") if f.len() >= 4 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    if let Some(i) = ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)) {
+                        i.click_action = f[2].parse().unwrap_or(0);
+                        i.delay_frames = f[3].parse().unwrap_or(0);
+                    }
+                }
+                Some("colour") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    let v: Vec<f32> = f[2].split(',').filter_map(|x| x.parse().ok()).collect();
+                    if v.len() == 9 {
+                        if let Some(i) = ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)) {
+                            i.colour_adjust = ColourAdjust { brightness: v[0], contrast: v[1], saturation: v[2],
+                                red: v[3], green: v[4], blue: v[5], alpha: v[6], black: v[7], white: v[8] };
+                        }
+                    }
+                }
+                Some("audio_effects") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    if let (Some(i), Ok(fx)) = (ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)),
+                        serde_json::from_str::<crate::audio::Effects>(f[2]))
+                    {
+                        i.audio_effects = fx.normalized();
                     }
                 }
                 Some("preview") if f.len() >= 2 => {
@@ -2491,6 +3039,14 @@ impl Switcher {
                     }
                 }
                 _ => {}
+            }
+        }
+        for (index, number) in delay_sources {
+            let source = number.checked_sub(1).and_then(|k| ids.get(k)).copied();
+            if let Some(input) = ids.get(index).copied().and_then(|id| s.input_mut(id)) {
+                if let Kind::VideoDelay { source: field, .. } = &mut input.kind {
+                    *field = source;
+                }
             }
         }
         s.preset_name = "livemix_preset".into();
@@ -2528,6 +3084,20 @@ fn clean(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_sliders_follow_the_original() {
+        assert_eq!(zoom_from_slider(0), 1.0);
+        assert!((zoom_from_slider(-3990) - 0.0025).abs() < 1e-6);
+        assert_eq!(zoom_from_slider(4000), 5.0);
+        assert_eq!(zoom_from_slider(-2000), 0.5);
+        assert_eq!(zoom_to_slider(0.5), -2000);
+        assert_eq!(zoom_to_slider(2.0), 1000);
+        assert_eq!(zoom_to_slider(1.0), 0);
+        assert_eq!(pan_from_slider(-2000), -2.0);
+        assert_eq!(pan_to_slider(0.5), 500);
+        assert_eq!(pan_to_slider(9.0), 2000);
+    }
 
     fn frames(s: &mut Switcher, n: usize) {
         for _ in 0..n {
@@ -2709,6 +3279,85 @@ mod tests {
         assert!(s.overlays[channel].input.is_none());
         s.remove_input(s.inputs[3].id);
         assert!(s.overlays[channel].assigned.is_none());
+    }
+
+    #[test]
+    fn preset_keeps_input_settings_and_layer_border() {
+        let mut s = Switcher::demo();
+        let (a, b) = (s.inputs[1].id, s.inputs[2].id);
+        {
+            let i = s.input_mut(a).unwrap();
+            i.mirror = true;
+            i.sharpen = true;
+            i.deinterlace = true;
+            i.play_active = true;
+            i.pause_preview = true;
+            i.restart_active = true;
+            i.auto_mix_audio = true;
+            i.rec601 = true;
+            i.premultiplied = true;
+            i.flatten = true;
+            i.effects_source = true;
+            i.aspect = 4.0 / 3.0;
+            i.tally_colour = Some([1, 2, 3]);
+            i.click_action = 2;
+            i.delay_frames = 7;
+            i.audio_effects.pan = -0.4;
+            i.colour_adjust = ColourAdjust { brightness: 0.1, contrast: -0.2, saturation: 0.3,
+                red: 0.4, green: -0.5, blue: 0.6, alpha: -0.7, black: 0.125, white: -0.157 };
+            i.layers[3] = Layer { on: true, input: Some(b),
+                place: Position { zoom: 0.25, pan_x: 0.5, pan_y: -0.5, crop: [0.1, 0.2, 0.9, 0.8] },
+                border: true, border_colour: [9, 8, 7], border_width: 0.05 };
+        }
+        let text = s.preset_text();
+        let mut reopened = Switcher::empty();
+        reopened.load_preset_text(&text);
+        let i = &reopened.inputs[1];
+        assert!(i.mirror && i.sharpen && i.deinterlace);
+        assert!(i.play_active && i.pause_preview && i.restart_active && i.auto_mix_audio);
+        assert!(i.rec601 && i.premultiplied && i.flatten);
+        assert!(i.effects_source);
+        assert!((i.aspect - 4.0 / 3.0).abs() < 0.001);
+        assert_eq!(i.tally_colour, Some([1, 2, 3]));
+        assert_eq!((i.click_action, i.delay_frames), (2, 7));
+        assert!((i.audio_effects.pan + 0.4).abs() < 1e-6);
+        assert_eq!(i.colour_adjust, s.input(a).unwrap().colour_adjust);
+        let l = i.layers[3];
+        assert!(l.on && l.border);
+        assert_eq!(l.border_colour, [9, 8, 7]);
+        assert!((l.border_width - 0.05).abs() < 0.001);
+        assert_eq!(l.input, Some(reopened.inputs[2].id));
+        assert_eq!(l.place, s.input(a).unwrap().layers[3].place);
+    }
+
+    #[test]
+    fn preset_keeps_video_delay_and_telestrator() {
+        let mut s = Switcher::demo();
+        let source = s.inputs[0].id;
+        s.add(Input::new(0, "Delay", Kind::VideoDelay {
+            source: Some(source), seconds: 4.5, resolution: [1280, 720],
+        }));
+        s.add(Input::new(0, "Telestrator", Kind::Telestrator { strokes: vec![Telestroke {
+            points: vec![[0.1, 0.2], [0.3, 0.4]], colour: [10, 20, 30], width: 0.008,
+        }] }));
+        let text = s.preset_text();
+        let mut reopened = Switcher::empty();
+        reopened.load_preset_text(&text);
+        let delay = reopened.inputs.iter().find(|i| i.title == "Delay").unwrap();
+        let Kind::VideoDelay { source: restored, seconds, resolution } = &delay.kind else {
+            panic!("Video Delay lost its kind")
+        };
+        assert_eq!(*restored, Some(reopened.inputs[0].id));
+        assert!((seconds - 4.5).abs() < 0.001);
+        assert_eq!(*resolution, [1280, 720]);
+        let tele = reopened.inputs.iter().find(|i| i.title == "Telestrator").unwrap();
+        let Kind::Telestrator { strokes } = &tele.kind else {
+            panic!("Telestrator lost its kind")
+        };
+        assert_eq!(strokes.len(), 1);
+        assert_eq!(strokes[0].points, vec![[0.1, 0.2], [0.3, 0.4]]);
+        assert_eq!(strokes[0].colour, [10, 20, 30]);
+        assert!((strokes[0].width - 0.008).abs() < 1e-6);
     }
 
     #[test]
