@@ -30,6 +30,7 @@ pub struct Shared {
     pub restart: AtomicBool,
     /// Latest seek request in milliseconds, encoded as position + 1 (0 means none).
     pub seek_ms: AtomicU64,
+    pub precise_seek: AtomicBool,
     pub looping: AtomicBool,
     pub ended: AtomicBool,
     pub pos_ms: AtomicU64,
@@ -44,6 +45,8 @@ pub struct Shared {
 }
 
 /// Largest picture height a camera's Auto mode picks (Settings → Performance).
+pub static CAPTURE_LOW_LATENCY: AtomicBool = AtomicBool::new(false);
+
 pub static AUTO_CAM_MAX_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1080);
 
 /// One capture mode of a camera: picture size, frame rate and the video format it sends
@@ -106,6 +109,8 @@ pub enum Source {
     Omt(String),
     Srt(crate::srt::Connection),
     File(String),
+    FfmpegFile(String, u8),
+    AudioFile(String),
     AudioDevice(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
@@ -167,7 +172,7 @@ impl Recorder {
         let (p2, e2) = (path.clone(), error.clone());
         let encoder_status = Arc::clone(&encoder);
         #[cfg(windows)]
-        let gpu = Arc::new(AtomicBool::new(opts.hw && opts.format != RecordFormat::Wmv));
+        let gpu = Arc::new(AtomicBool::new(opts.hw && matches!(opts.format, RecordFormat::H264 | RecordFormat::Hevc)));
         #[cfg(windows)]
         let gpu_worker = gpu.clone();
         let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts,
@@ -240,37 +245,108 @@ pub enum RecordFormat {
     H264,
     Hevc,
     Wmv,
+    Wmv9,
+    Mjpeg,
+    MagicYuv,
+    Mpeg2Ts,
+    Mpeg2Ps,
+    H264Mkv,
+    HevcMkv,
+    ProRes,
+    DnxHr,
+    DnxHrMxf,
+}
+
+pub(crate) struct FfmpegProfile {
+    pub video: &'static str,
+    pub audio: &'static str,
+    pub container: &'static str,
+    pub pixel: &'static str,
+    pub bitrate: bool,
+    pub extra: &'static [&'static str],
 }
 
 impl RecordFormat {
+    pub const ALL: [Self; 13] = [Self::H264, Self::Hevc, Self::Wmv, Self::Wmv9, Self::Mjpeg, Self::MagicYuv,
+        Self::Mpeg2Ts, Self::Mpeg2Ps, Self::H264Mkv, Self::HevcMkv, Self::ProRes, Self::DnxHr, Self::DnxHrMxf];
+
     pub fn parse(value: &str) -> Self {
-        match value {
-            "hevc" => Self::Hevc,
-            "wmv" => Self::Wmv,
-            _ => Self::H264,
-        }
+        let format = Self::ALL.into_iter().find(|format| format.key() == value).unwrap_or_default();
+        if cfg!(windows) || format != Self::Wmv9 { format } else { Self::Wmv }
     }
 
     pub fn key(self) -> &'static str {
         match self {
-            Self::H264 => "h264",
-            Self::Hevc => "hevc",
-            Self::Wmv => "wmv",
+            Self::H264 => "h264", Self::Hevc => "hevc", Self::Wmv => "wmv8", Self::Wmv9 => "wmv",
+            Self::Mjpeg => "mjpeg", Self::MagicYuv => "magicyuv",
+            Self::Mpeg2Ts => "mpeg2ts", Self::Mpeg2Ps => "mpeg2ps",
+            Self::H264Mkv => "h264mkv", Self::HevcMkv => "hevcmkv",
+            Self::ProRes => "prores", Self::DnxHr => "dnxhr", Self::DnxHrMxf => "dnxhr-mxf",
         }
     }
 
     pub fn codec(self) -> &'static str {
         match self {
-            Self::H264 => "H.264",
-            Self::Hevc => "HEVC",
-            Self::Wmv => "WMV9",
+            Self::H264 | Self::H264Mkv => "H.264",
+            Self::Hevc | Self::HevcMkv => "HEVC",
+            Self::Wmv => "WMV8",
+            Self::Wmv9 => "WMV9",
+            Self::Mjpeg => "MJPEG",
+            Self::MagicYuv => "MagicYUV",
+            Self::Mpeg2Ts | Self::Mpeg2Ps => "MPEG-2",
+            Self::ProRes => "ProRes 422",
+            Self::DnxHr | Self::DnxHrMxf => "DNxHR HQ",
         }
     }
 
     pub fn extension(self) -> &'static str {
-        if self == Self::Wmv { "wmv" } else { "mp4" }
+        match self {
+            Self::H264 | Self::Hevc => "mp4",
+            Self::Wmv | Self::Wmv9 => "wmv",
+            Self::Mjpeg | Self::MagicYuv => "avi",
+            Self::Mpeg2Ts => "ts",
+            Self::Mpeg2Ps => "mpg",
+            Self::H264Mkv | Self::HevcMkv => "mkv",
+            Self::ProRes | Self::DnxHr => "mov",
+            Self::DnxHrMxf => "mxf",
+        }
     }
 
+    pub fn native_windows(self) -> bool {
+        matches!(self, Self::H264 | Self::Hevc | Self::Wmv9)
+    }
+
+    pub fn audio_codec(self) -> &'static str {
+        match self {
+            Self::Wmv | Self::Wmv9 => "WMA2",
+            Self::Mpeg2Ts | Self::Mpeg2Ps => "MP2",
+            Self::Mjpeg | Self::MagicYuv | Self::ProRes | Self::DnxHr | Self::DnxHrMxf => "PCM",
+            _ => "AAC",
+        }
+    }
+
+    pub(crate) fn ffmpeg_profile(self, hw: bool) -> FfmpegProfile {
+        let profile = |video, audio, container, pixel, bitrate, extra| FfmpegProfile {
+            video, audio, container, pixel, bitrate, extra,
+        };
+        let apple_hw = cfg!(target_os = "macos") && hw;
+        let h264 = if apple_hw { "h264_videotoolbox" } else { "libx264" };
+        let hevc = if apple_hw { "hevc_videotoolbox" } else { "libx265" };
+        match self {
+            Self::H264 => profile(h264, "aac", "mp4", "yuv420p", true, &["-movflags", "+faststart"]),
+            Self::Hevc => profile(hevc, "aac", "mp4", "yuv420p", true, &["-tag:v", "hvc1", "-movflags", "+faststart"]),
+            Self::H264Mkv => profile(h264, "aac", "matroska", "yuv420p", true, &[]),
+            Self::HevcMkv => profile(hevc, "aac", "matroska", "yuv420p", true, &[]),
+            Self::Wmv | Self::Wmv9 => profile("wmv2", "wmav2", "asf", "yuv420p", true, &[]),
+            Self::Mjpeg => profile("mjpeg", "pcm_s16le", "avi", "yuvj422p", false, &["-q:v", "3"]),
+            Self::MagicYuv => profile("magicyuv", "pcm_s16le", "avi", "gbrp", false, &[]),
+            Self::Mpeg2Ts => profile("mpeg2video", "mp2", "mpegts", "yuv420p", true, &[]),
+            Self::Mpeg2Ps => profile("mpeg2video", "mp2", "mpeg", "yuv420p", true, &[]),
+            Self::ProRes => profile("prores_ks", "pcm_s16le", "mov", "yuv422p10le", false, &["-profile:v", "2"]),
+            Self::DnxHr => profile("dnxhd", "pcm_s16le", "mov", "yuv422p", false, &["-profile:v", "dnxhr_hq"]),
+            Self::DnxHrMxf => profile("dnxhd", "pcm_s16le", "mxf", "yuv422p", false, &["-profile:v", "dnxhr_hq"]),
+        }
+    }
 }
 
 /// How a recording is written.
@@ -285,11 +361,12 @@ pub struct RecOpts {
     /// Use the graphics card's encoder when there is one (recording key "HardwareAcceleration").
     pub hw: bool,
     pub format: RecordFormat,
+    pub audio: bool,
 }
 
 impl Default for RecOpts {
     fn default() -> Self {
-        RecOpts { mbps: DEFAULT_MBPS, size: None, fps: RECORDING_FPS as f32, hw: true, format: RecordFormat::H264 }
+        RecOpts { mbps: DEFAULT_MBPS, size: None, fps: RECORDING_FPS as f32, hw: true, format: RecordFormat::H264, audio: true }
     }
 }
 
@@ -309,6 +386,7 @@ pub const NEW_FILE_EVERY: [u32; 8] = [0, 1, 5, 10, 15, 20, 30, 60];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PickKind {
     Video,
+    Audio,
     Image,
     Title,
     PresetOpen,

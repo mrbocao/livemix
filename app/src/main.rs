@@ -2,6 +2,8 @@
 
 mod model;
 mod render;
+mod ffmpeg_media;
+mod replay;
 mod media_common;
 #[cfg(target_os = "macos")]
 #[path = "media_macos.rs"]
@@ -109,26 +111,32 @@ fn apply_style(ctx: &egui::Context, theme: InterfaceTheme) {
     let mut style = egui::Style::default();
     style.spacing.item_spacing = Vec2::new(4.0, 4.0);
     style.spacing.button_padding = Vec2::new(6.0, 3.0);
-    if theme == InterfaceTheme::Modern {
-        let edge = Color32::from_rgb(47, 57, 72);
-        let accent = Color32::from_rgb(111, 167, 246);
-        v.panel_fill = Color32::from_rgb(17, 23, 33);
-        v.window_fill = Color32::from_rgb(24, 32, 45);
-        v.extreme_bg_color = Color32::from_rgb(13, 19, 28);
+    if theme != InterfaceTheme::Classic {
+        let palette = match theme {
+            InterfaceTheme::Graphite => [[25, 25, 27], [35, 35, 38], [18, 18, 20], [48, 48, 53], [65, 65, 72], [140, 189, 174]],
+            InterfaceTheme::Slate => [[21, 31, 33], [29, 44, 46], [14, 23, 25], [39, 56, 58], [53, 76, 79], [109, 199, 191]],
+            InterfaceTheme::Midnight => [[20, 17, 32], [31, 25, 49], [14, 11, 24], [45, 36, 65], [65, 51, 93], [182, 147, 255]],
+            _ => [[17, 23, 33], [24, 32, 45], [13, 19, 28], [35, 45, 60], [49, 65, 86], [111, 167, 246]],
+        }.map(|[r, g, b]| Color32::from_rgb(r, g, b));
+        let [panel, window, extreme, button, hovered, accent] = palette;
+        let edge = hovered.gamma_multiply(0.8);
+        v.panel_fill = panel;
+        v.window_fill = window;
+        v.extreme_bg_color = extreme;
         v.faint_bg_color = Color32::from_white_alpha(9);
         v.window_corner_radius = egui::CornerRadius::same(10);
         v.menu_corner_radius = egui::CornerRadius::same(8);
         v.window_stroke = Stroke::new(1.0_f32, edge);
-        v.selection.bg_fill = Color32::from_rgb(40, 69, 108);
+        v.selection.bg_fill = accent.gamma_multiply(0.43);
         v.selection.stroke = Stroke::new(1.0_f32, accent);
         for widget in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
             widget.corner_radius = egui::CornerRadius::same(6);
             widget.expansion = 0.0;
         }
-        v.widgets.inactive.bg_fill = Color32::from_rgb(35, 45, 60);
+        v.widgets.inactive.bg_fill = button;
         v.widgets.inactive.weak_bg_fill = v.widgets.inactive.bg_fill;
         v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, edge);
-        v.widgets.hovered.bg_fill = Color32::from_rgb(49, 65, 86);
+        v.widgets.hovered.bg_fill = hovered;
         v.widgets.hovered.weak_bg_fill = v.widgets.hovered.bg_fill;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
         v.widgets.active.bg_fill = v.selection.bg_fill;
@@ -263,7 +271,7 @@ struct App {
     /// Video Delay buffers, keyed by the delay input's id.
     delays: std::collections::HashMap<u32, DelayFeed>,
     audio_monitor: Option<audio::Monitor>,
-    monitor_bus: u8,
+    mixer: MixerControls,
     /// Recording slots 1 and 2 start and stop with Record.
     recordings: [Option<ComposedRecording>; 2],
     replay: ReplayCapture,
@@ -275,6 +283,8 @@ struct App {
     srt_outputs: [Option<(([u32; 2], f64), stream::Output)>; OUTPUT_COUNT],
     stream_outputs: [Option<StreamGroup>; stream::COUNT],
     network_scan: Option<std::sync::mpsc::Receiver<[Result<Vec<String>, String>; 2]>>,
+    network_thumbnail: Option<NetworkThumbnail>,
+    thumbnail_attempts: std::collections::HashSet<String>,
     /// One recording per camera (MultiCorder).
     multi: std::collections::HashMap<u32, media::Recorder>,
     browse_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
@@ -320,71 +330,217 @@ struct ComposedRecording {
     recorder: Arc<media::Recorder>,
     channel: usize,
     route_override: Option<OutputRoute>,
+    audio_override: Option<u32>,
     started: f64,
+}
+
+struct NetworkThumbnail {
+    link: String,
+    shared: Arc<media::Shared>,
+    result: std::sync::mpsc::Receiver<Option<egui::ColorImage>>,
+    deadline: Instant,
+}
+
+impl Drop for NetworkThumbnail {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn update_network_thumbnails(ctx: &egui::Context, dialog: &mut AddDialog, enabled: bool,
+    active: &mut Option<NetworkThumbnail>, attempted: &mut std::collections::HashSet<String>)
+{
+    if !enabled || !dialog.open || dialog.kind != AddKind::Desktop {
+        *active = None;
+        return;
+    }
+    if let Some(job) = active {
+        match job.result.try_recv() {
+            Ok(image) => {
+                if let Some(image) = image {
+                    let texture = ctx.load_texture(&job.link, image, egui::TextureOptions::LINEAR);
+                    dialog.thumbnails.insert(job.link.clone(), texture);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < job.deadline => return,
+            Err(_) => {}
+        }
+        *active = None;
+    }
+    let link = dialog.ndi_sources.iter().map(|name| format!("ndi:{name}"))
+        .chain(dialog.omt_sources.iter().map(|name| format!("omt:{name}")))
+        .find(|link| attempted.insert(link.clone()));
+    let Some(link) = link else { return; };
+    let shared = Arc::new(media::Shared::default());
+    let (send, result) = std::sync::mpsc::channel();
+    let receiver = Arc::clone(&shared);
+    let worker_link = link.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let opened = if let Some(name) = worker_link.strip_prefix("ndi:") {
+            ndi::thumbnail(Arc::clone(&receiver), name)
+        } else {
+            omt::thumbnail(Arc::clone(&receiver), worker_link.strip_prefix("omt:").unwrap_or_default())
+        };
+        let frame = receiver.frame.lock().unwrap().take();
+        let image = opened.ok().and(frame).and_then(|frame| {
+            let image = image::RgbaImage::from_raw(frame.w as u32, frame.h as u32, frame.rgba)?;
+            let image = image::imageops::thumbnail(&image, 160, 90);
+            Some(egui::ColorImage::from_rgba_unmultiplied([image.width() as usize, image.height() as usize], image.as_raw()))
+        });
+        let _ = send.send(image);
+        repaint.request_repaint();
+    });
+    *active = Some(NetworkThumbnail { link, shared, result, deadline: Instant::now() + std::time::Duration::from_secs(2) });
+}
+
+fn network_thumbnail_grid(ui: &mut egui::Ui, dialog: &mut AddDialog) {
+    if dialog.ndi_sources.is_empty() && dialog.omt_sources.is_empty() { return; }
+    let rows = dialog.ndi_sources.iter().map(|name| ("ndi", name)).chain(dialog.omt_sources.iter().map(|name| ("omt", name)));
+    egui::ScrollArea::vertical().id_salt("network-thumbnails").max_height(175.0).show(ui, |ui| {
+        for (protocol, name) in rows {
+            let key = format!("{protocol}:{name}");
+            ui.horizontal(|ui| {
+                let clicked = if let Some(texture) = dialog.thumbnails.get(&key) {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(96.0, 54.0)).sense(Sense::click())).clicked()
+                } else {
+                    ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::hover());
+                    false
+                };
+                if clicked || ui.selectable_label(dialog.ndi_source.as_ref() == Some(&key), format!("{} · {name}", protocol.to_uppercase())).clicked() {
+                    dialog.ndi_source = Some(key);
+                }
+            });
+        }
+    });
 }
 
 struct ReplayTrack {
     recording: ComposedRecording,
-    name: String,
+    angle: usize,
+    file: String,
     worker: std::thread::JoinHandle<()>,
 }
 
-struct ReplayFile {
-    name: String,
-    path: std::path::PathBuf,
-}
-
-impl Drop for ReplayFile {
-    fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); }
-}
-
-struct ReplayEvent {
-    id: u64,
-    name: String,
-    marked: bool,
-    angles: Vec<Arc<ReplayFile>>,
-}
-
 struct FinalizingTrack {
-    file: Arc<ReplayFile>,
+    angle: usize,
+    file: String,
     error: Arc<Mutex<String>>,
     worker: std::thread::JoinHandle<()>,
 }
 
 struct FinalizingReplay {
+    start: u64,
+    end: u64,
     tracks: Vec<FinalizingTrack>,
-    marked: bool,
-    discard: bool,
+}
+
+type ReplayResult = Result<std::path::PathBuf, String>;
+type ReplayJob = std::sync::mpsc::Receiver<ReplayResult>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayMotion { Still, Forward, Reverse }
+
+struct IndexedReplay {
+    angle: usize,
+    position: f64,
+    range: Option<(u64, u64)>,
+    direction: ReplayMotion,
+    paused: bool,
+    file: Option<String>,
+    seek: Option<(u64, u64, f64)>,
+    due: f64,
+}
+
+struct ReplayPlayback {
+    job: ReplayJob,
+    ready: Option<ReplayResult>,
+    program: bool,
+    speed: u8,
 }
 
 #[derive(Default)]
 struct ReplayCapture {
+    folder: Option<std::path::PathBuf>,
+    session: replay::Session,
+    clock: Option<(f64, u64)>,
     current: Vec<ReplayTrack>,
-    finalizing: Option<FinalizingReplay>,
-    events: Vec<ReplayEvent>,
-    marking: bool,
-    next_event: u64,
-    copying: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    finalizing: Vec<FinalizingReplay>,
+    mark_in: Option<u64>,
+    marks: Vec<(u64, u64)>,
+    playback: [Option<ReplayPlayback>; 2],
+    sync_playback: bool,
+    indexed: [Option<IndexedReplay>; 2],
+    export: Option<ReplayJob>,
+    close_after_recording: bool,
 }
 
-impl Drop for ReplayCapture {
-    fn drop(&mut self) {
-        if let Some(replay) = self.finalizing.take() {
-            std::thread::spawn(move || for track in replay.tracks { let _ = track.worker.join(); });
-        }
-        for track in self.current.drain(..) {
-            let path = track.recording.recorder.path.clone();
-            drop(track.recording);
-            std::thread::spawn(move || { let _ = track.worker.join(); let _ = std::fs::remove_file(path); });
-        }
+impl ReplayCapture {
+    fn frame_ms(&self, fallback: f32) -> f64 {
+        1000.0 / f64::from(self.session.format.as_ref().map_or(fallback, |format| format.fps)).max(1.0)
     }
+
+    fn position(&self, now: f64) -> u64 {
+        self.clock.map_or(0, |(wall, start)| start + ((now - wall).max(0.0) * 1000.0).round() as u64)
+    }
+
+    fn save(&self) -> Result<(), String> {
+        self.session.save(self.folder.as_deref().ok_or("No replay session")?)
+    }
+
+    fn job(&self, event: u64, angle: usize, speed: u8, export: bool) -> Result<ReplayJob, String> {
+        let event = self.session.events.iter().find(|e| e.id == event)
+            .filter(|event| event.angles.get(angle) == Some(&true)).cloned().ok_or("Select an angle available in this event")?;
+        let folder = self.folder.clone().ok_or("Open a replay session first")?;
+        let segments = self.session.segments.iter().filter(|segment| segment.start < event.end && segment.end > event.start).cloned().collect::<Vec<_>>();
+        let native = self.session.native;
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stamp = replay_stamp();
+            let target = if native {
+                media::storage_folder().join("Imported Replay").join(format!("session-{stamp}"))
+            } else {
+                folder.join(if export { "export" } else { "playback" })
+            };
+            let output = if export {
+                target.join(format!("Event-{}-Camera-{}-{stamp}.mp4", event.id, angle + 1))
+            } else {
+                target.join(format!("Event-{}-{}-{}-Camera-{}-{speed}.mp4", event.id, event.start, event.end, angle + 1))
+            };
+            let pending = target.join(format!("render-{stamp}.mp4"));
+            let result = std::fs::create_dir_all(target).map_err(|error| error.to_string()).and_then(|_| {
+                if output.is_file() { return Ok(()); }
+                replay::event_media(&folder, &segments, &event, angle, speed, &pending)?;
+                if !output.is_file() {
+                    std::fs::rename(&pending, &output).or_else(|error| if output.is_file() { Ok(()) } else { Err(error) })
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            });
+            let _ = std::fs::remove_file(&pending);
+            let _ = send.send(result.map(|_| output));
+        });
+        Ok(receive)
+    }
+}
+
+fn poll_replay_job(job: &ReplayJob) -> Option<Result<std::path::PathBuf, String>> {
+    match job.try_recv() {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("Replay worker stopped unexpectedly".into())),
+    }
+}
+
+fn replay_stamp() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
 impl ComposedRecording {
     fn new(folder: &str, name: &str, channel: usize, started: f64, opts: media::RecOpts) -> Self {
         let path = rec_dir(folder).join(format!("{}.{}", media::recording_name(name), opts.format.extension()));
         let recorder = Arc::new(media::Recorder::start_opts(path.to_string_lossy().into_owned(), opts));
-        Self { recorder, channel, route_override: None, started }
+        Self { recorder, channel, route_override: None, audio_override: None, started }
     }
 
     fn route(&self, settings: &Settings) -> OutputRoute {
@@ -409,7 +565,8 @@ impl App {
         // Settings window options saved last time (defaults are the original's config defaults).
         s.load_settings();
         s.external[0].open = s.cfg.start_external;
-        s.fullscreen = s.cfg.start_fullscreen;
+        s.fullscreen[0] = s.cfg.start_fullscreen;
+        if s.cfg.start_fullscreen2 { toggle_fullscreen(&mut s, 1); }
         // Testing aid: LIVEMIX_EXTRA_INPUTS=N adds N test cameras (to check the input grid).
         let extra: usize = std::env::var("LIVEMIX_EXTRA_INPUTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         for _ in 0..extra.min(200) {
@@ -431,6 +588,11 @@ impl App {
         // Testing aid: LIVEMIX_OPEN=settings / add opens that window at start.
         match std::env::var("LIVEMIX_OPEN").unwrap_or_default().as_str() {
             "settings" => s.settings_open = true,
+            "decoders" => {
+                s.settings_open = true;
+                s.cfg.page = 4;
+            }
+            "recording" => s.rec_setup = true,
             "outputs" => {
                 s.settings_open = true;
                 s.cfg.page = 1;
@@ -499,6 +661,11 @@ impl App {
                 s.add_dialog.open = true;
                 s.add_dialog.kind = AddKind::Colour;
             }
+            "replay" if screenshot.is_some() => {
+                s.ensure_replay_inputs();
+                s.replay_open = true;
+                s.replay_setup_open = true;
+            }
             "audio" => {
                 // Input Settings > Audio on a video input, to check the fader, meter and graphs.
                 if let Some(i) = s.inputs.get_mut(1) {
@@ -528,7 +695,7 @@ impl App {
             media: Default::default(),
             delays: Default::default(),
             audio_monitor: None,
-            monitor_bus: 0,
+            mixer: MixerControls::default(),
             recordings: Default::default(),
             replay: Default::default(),
             multi_outputs: Default::default(),
@@ -539,6 +706,8 @@ impl App {
             srt_outputs: Default::default(),
             stream_outputs: Default::default(),
             network_scan: None,
+            network_thumbnail: None,
+            thumbnail_attempts: Default::default(),
             multi: Default::default(),
             browse_rx: None,
             browse_kind: media::PickKind::Video,
@@ -565,7 +734,7 @@ impl App {
         let picture_time = self.video_clock.picture_time;
         let display_sources: Vec<_> = self.s.cfg.outputs.iter().zip(&self.s.external)
             .filter(|(_, window)| window.open).map(|(route, _)| route.source)
-            .chain(self.s.fullscreen.then_some(self.s.cfg.fs_source))
+            .chain(self.s.fullscreen.into_iter().zip(self.s.cfg.fs_source).filter_map(|(open, source)| open.then_some(source)))
             .chain(self.composed_recordings().map(|r| r.route(&self.s.cfg).source))
             .chain(self.s.cfg.outputs.iter().enumerate().filter(|(channel, _)| {
                 self.ndi_outputs[*channel].as_ref().is_some_and(|(_, sender)| sender.subscribed())
@@ -573,7 +742,7 @@ impl App {
                     || self.s.srt_active[*channel]
             }).map(|(_, route)| route.source))
             .chain(self.s.cfg.streams.iter().zip(&self.s.stream_active).filter(|(_, active)| **active)
-                .map(|(stream, _)| self.s.cfg.outputs[stream.source].source))
+                .map(|(stream, _)| stream_route(&self.s, stream).source))
             .collect();
         #[cfg(windows)]
         let pending_gpu = &mut self.pending_gpu;
@@ -590,8 +759,8 @@ impl App {
             // closes a file once it is old enough (a new one starts with the next frame).
             multi.retain(|id, _| ids.contains(id) && !s.mc_off.contains(id) && !(mc_split > 0.0 && now - multi_started.get(id).copied().unwrap_or(now) >= mc_split));
         }
-        let (mc_dir, mc_mbps, mc_fps, mc_hw, mc_format) = (
-            s.cfg.mc_folder.clone(), s.cfg.mc_mbps, s.cfg.frame_rate(), s.cfg.hw_encoder, s.cfg.mc_codec,
+        let (mc_dir, mc_mbps, mc_fps, mc_hw, mc_format, mc_audio) = (
+            s.cfg.mc_folder.clone(), s.cfg.mc_mbps, s.cfg.frame_rate(), s.cfg.hw_encoder, s.cfg.mc_codec, s.cfg.record_audio[2],
         );
         // Inputs seen big right now (Preview, Output, transitions, overlays and their layers).
         let skip = u64::from(s.cfg.preview_skip.max(1));
@@ -653,16 +822,21 @@ impl App {
                         ),
                         Kind::Device { link, .. } => (
                             media::Source::Device(link.clone(), inp.cam_mode.clone()),
-                            format!("{link}|{}", inp.cam_mode.as_ref().map(|m| m.code()).unwrap_or_default()),
+                            format!("{link}|{}|{}", inp.cam_mode.as_ref().map(|m| m.code()).unwrap_or_default(), s.cfg.low_latency_capture),
                             false,
                             true,
                         ),
-                        Kind::VideoFile { path } => (media::Source::File(path.clone()), path.clone(), true, false),
+                        Kind::VideoFile { path } => {
+                            let (source, key) = file_decoder(&s.cfg, path);
+                            (source, key, true, false)
+                        },
+                        Kind::AudioFile { path } => (media::Source::AudioFile(path.clone()), format!("audio-file:{path}"), true, false),
                         Kind::VideoList { paths, idx } => {
                             let p = paths.get(*idx).cloned().unwrap_or_default();
-                            (media::Source::File(p.clone()), format!("{idx}:{p}"), true, false)
+                            let (source, key) = file_decoder(&s.cfg, &p);
+                            (source, format!("{idx}:{key}"), true, false)
                         }
-                        Kind::Replay { path } => (
+                        Kind::Replay { path, .. } => (
                             media::Source::File(path.clone()), format!("replay:{path}"), true, false,
                         ),
                         Kind::Desktop => (media::Source::Desktop, "desktop".into(), false, false),
@@ -704,6 +878,7 @@ impl App {
                         buffer.set_effects(&inp.audio_effects);
                     }
                     if is_file {
+                        sh.precise_seek.store(matches!(inp.kind, Kind::Replay { .. }), Relaxed);
                         sh.paused.store(!inp.playing, Relaxed);
                         sh.looping.store(inp.loop_on && !is_list, Relaxed);
                         if inp.restart_req {
@@ -764,7 +939,7 @@ impl App {
                             let rec = multi.entry(inp.id).or_insert_with(|| {
                                 multi_started.insert(inp.id, now);
                                 let p = rec_dir(&mc_dir).join(format!("{}.{}", media::recording_name(&safe_name(&inp.title)), mc_format.extension()));
-                                media::Recorder::start_opts(p.to_string_lossy().to_string(), media::RecOpts { mbps: mc_mbps, size: None, fps: mc_fps, hw: mc_hw, format: mc_format })
+                                media::Recorder::start_opts(p.to_string_lossy().to_string(), media::RecOpts { mbps: mc_mbps, size: None, fps: mc_fps, hw: mc_hw, format: mc_format, audio: mc_audio })
                             });
                             let at = Instant::now();
                             let count = (f64::from(audio::RATE) / f64::from(mc_fps)).ceil() as usize;
@@ -893,144 +1068,478 @@ impl App {
             .chain(self.replay.current.iter().map(|track| &track.recording))
     }
 
-    fn update_replay(&mut self, now: f64) {
-        let replay = &mut self.replay;
-        if replay.finalizing.as_ref().is_some_and(|event| event.tracks.iter().all(|track| track.worker.is_finished())) {
-            let finished = replay.finalizing.take().unwrap();
-            let mut angles = Vec::new();
-            let mut failures = Vec::new();
-            for track in finished.tracks {
-                let joined = track.worker.join().is_ok();
-                let error = track.error.lock().unwrap();
-                if joined && error.is_empty() && std::fs::metadata(&track.file.path).is_ok_and(|file| file.len() > 0) {
-                    angles.push(track.file);
-                } else {
-                    failures.push(track.file.name.clone());
-                }
+    fn indexed_command(&mut self, action: replay::Action) {
+        if self.replay.folder.is_none() { return; }
+        let inputs = self.s.ensure_replay_inputs();
+        let frame = self.replay.frame_ms(self.s.cfg.frame_rate());
+        for channel in 0..2 {
+            if self.s.replay_channel < 2 && self.s.replay_channel != channel || self.replay.playback[channel].is_some() {
+                continue;
             }
-            if !finished.discard && !angles.is_empty() {
-                replay.next_event += 1;
-                let previous_id = replay.events.get(self.s.replay_event).map(|event| event.id);
-                let name = if finished.marked { format!("Event {}", replay.next_event) } else { "Latest segment".into() };
-                if !finished.marked {
-                    replay.events.retain(|event| event.marked);
+            let angle = self.s.replay_cameras[channel];
+            let event = self.s.replay_event.and_then(|id| self.replay.session.events.iter().find(|event| event.id == id));
+            let previous = self.replay.indexed[channel].as_ref().filter(|cursor| cursor.angle == angle);
+            let mut range = previous.map_or_else(|| event.map(|event| (event.start, event.end)), |cursor| cursor.range);
+            let folder = self.replay.folder.as_deref().unwrap();
+            let tail = self.replay.session.segments.iter().rev().find(|segment| segment.files[angle].as_deref()
+                .is_some_and(|file| replay::direct_path(folder, file).is_some()));
+            let position = previous.map(|cursor| {
+                if cursor.direction == ReplayMotion::Forward {
+                    if let Some(segment) = self.replay.session.segments.iter().find(|segment| {
+                        cursor.file.is_some() && segment.files[angle] == cursor.file
+                    }) {
+                        let position = self.s.input(inputs[channel]).map_or(0.0, |input| input.pos);
+                        return (segment.start as f64 + f64::from(position) * 1000.0).min(segment.end as f64);
+                    }
                 }
-                replay.events.insert(0, ReplayEvent { id: replay.next_event, name, marked: finished.marked, angles });
-                replay.events.truncate(12);
-                let previous_index = previous_id.and_then(|id| replay.events.iter().position(|event| event.id == id));
-                if finished.marked || previous_index.is_none() {
-                    self.s.replay_event = 0;
-                    self.s.replay_angle = 0;
-                } else {
-                    self.s.replay_event = previous_index.unwrap();
+                cursor.position
+            }).or_else(|| {
+                let input = self.s.inputs.iter().find(|input| matches!(input.kind, Kind::Replay { channel: c, .. } if c == channel))?;
+                event.map(|event| event.start as f64 + f64::from(input.pos) * f64::from(self.s.replay_speed[channel]) * 10.0)
+            });
+            let (point, direction) = match action {
+                replay::Action::Live => {
+                    range = None;
+                    (tail.map(|segment| segment.start as f64), ReplayMotion::Forward)
                 }
-                self.s.replay_status = "Replay ready".into();
-            }
-            if !failures.is_empty() {
-                self.s.replay_arm = false;
-                self.s.replay_status = format!("Replay recording failed for {}", failures.join(", "));
-            }
-        }
-        if let Some(result) = replay.copying.as_ref().and_then(|receiver| receiver.try_recv().ok()) {
-            replay.copying = None;
-            match result {
-                Ok(path) => {
-                    let title = path.file_stem().unwrap_or_default().to_string_lossy();
-                    let input = Input::new(0, &title, Kind::VideoFile { path: path.to_string_lossy().into_owned() });
-                    self.s.preview = Some(self.s.add(input));
-                    self.s.replay_status = "Replay angle added to Preview".into();
+                replay::Action::Step(step) => (position.map(|point| point + f64::from(step) * frame), ReplayMotion::Still),
+                replay::Action::Reverse if previous.is_some_and(|cursor| cursor.direction == ReplayMotion::Reverse) => (position, ReplayMotion::Still),
+                replay::Action::Reverse => {
+                    let point = position.filter(|point| range.is_none_or(|(start, _)| *point > start as f64 + frame))
+                        .or_else(|| range.map(|(_, end)| end as f64 - frame));
+                    (point, ReplayMotion::Reverse)
                 }
-                Err(error) => self.s.replay_status = error,
-            }
-        }
-        if std::mem::take(&mut self.s.replay_add) && replay.copying.is_none() {
-            let source = replay.events.get(self.s.replay_event)
-                .and_then(|event| event.angles.get(self.s.replay_angle)).cloned();
-            if let Some(source) = source {
-                let folder = self.s.cfg.rec_folder.clone();
-                let (send, receive) = std::sync::mpsc::channel();
-                replay.copying = Some(receive);
-                std::thread::spawn(move || {
-                    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-                    let name = safe_name(&source.name);
-                    let target = rec_dir(&folder).join(format!("Replay {name}-{stamp}.mp4"));
-                    let result = std::fs::copy(&source.path, &target).map(|_| target).map_err(|error| error.to_string());
-                    let _ = send.send(result);
+                _ => return,
+            };
+            if let Some(position) = point.or_else(|| tail.map(|segment| segment.end as f64 - frame)) {
+                let position = range.map_or(position, |(start, end)| position.clamp(start as f64, (end as f64 - frame).max(start as f64)));
+                self.replay.indexed[channel] = Some(IndexedReplay {
+                    angle, position, range, direction, paused: false, file: None, seek: None, due: 0.0,
                 });
+                if (self.s.replay_channel < 2 || channel == 0) && self.s.output != Some(inputs[channel]) {
+                    self.s.preview = Some(inputs[channel]);
+                }
+            } else {
+                self.s.replay_status = if self.replay.session.native {
+                    "No directly seekable camera file. Use Play to prepare a native MPEG event.".into()
+                } else { "No finalized video for this camera".into() };
             }
         }
+    }
+
+    fn update_indexed_replay(&mut self, now: f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(folder) = self.replay.folder.as_deref() else { return };
+        let frame = self.replay.frame_ms(self.s.cfg.frame_rate());
+        for (channel, transport) in self.replay.indexed.iter_mut().enumerate() {
+            let Some(cursor) = transport else { continue };
+            if cursor.paused { continue; }
+            let Some(input) = self.s.inputs.iter_mut().find(|input| matches!(input.kind,
+                Kind::Replay { channel: current, .. } if current == channel)) else { continue };
+            let source = self.media.get(&input.id).and_then(|feed| feed.shared.as_ref());
+            if let Some((baseline, target, sent)) = cursor.seek {
+                let done = source.is_some_and(|source| source.seq.load(Relaxed) != baseline
+                    && source.seek_ms.load(Relaxed) == 0 && source.pos_ms.load(Relaxed).abs_diff(target) <= frame.ceil() as u64);
+                if !done {
+                    if now - sent > 3.0 {
+                        cursor.seek = None;
+                        cursor.direction = ReplayMotion::Still;
+                        self.s.replay_status = "Replay decoder could not seek to the requested frame".into();
+                    }
+                    continue;
+                }
+                cursor.seek = None;
+                if cursor.direction != ReplayMotion::Reverse {
+                    input.playing = cursor.direction == ReplayMotion::Forward;
+                    continue;
+                }
+            } else if cursor.direction == ReplayMotion::Still && cursor.file.is_some() {
+                continue;
+            }
+            if cursor.direction == ReplayMotion::Forward && cursor.file.is_some() {
+                if let Some(segment) = self.replay.session.segments.iter().find(|segment| {
+                    segment.files[cursor.angle].as_ref() == cursor.file.as_ref()
+                }) {
+                    if let Some(source) = source {
+                        cursor.position = segment.start.saturating_add(source.pos_ms.load(Relaxed)).min(segment.end) as f64;
+                        if !source.ended.load(Relaxed) && cursor.position < segment.end as f64 { continue; }
+                    }
+                    cursor.position = segment.end as f64;
+                }
+            } else if cursor.direction == ReplayMotion::Reverse && cursor.file.is_some() {
+                if now < cursor.due || self.s.replay_speed[channel] == 0 { continue; }
+                let next = cursor.position - frame;
+                if next < cursor.range.map_or(0.0, |(start, _)| start as f64) - 0.01 {
+                    cursor.direction = ReplayMotion::Still;
+                    continue;
+                }
+                cursor.position = next.max(0.0);
+            }
+            let segments = &self.replay.session.segments;
+            let has_angle = |segment: &&replay::Segment| segment.files[cursor.angle].as_deref()
+                .is_some_and(|file| replay::direct_path(folder, file).is_some());
+            let segment = segments.iter().filter(has_angle).find(|segment| {
+                (segment.start as f64..segment.end as f64).contains(&cursor.position)
+            }).or_else(|| {
+                if cursor.direction == ReplayMotion::Forward {
+                    segments.iter().filter(has_angle).find(|segment| segment.start as f64 >= cursor.position)
+                } else {
+                    segments.iter().filter(has_angle).rev().find(|segment| segment.end as f64 <= cursor.position + frame)
+                }
+            });
+            let Some(segment) = segment else {
+                if cursor.direction != ReplayMotion::Forward { cursor.direction = ReplayMotion::Still; }
+                continue;
+            };
+            let file = segment.files[cursor.angle].as_ref().unwrap();
+            let Some(path) = replay::direct_path(folder, file) else { continue };
+            if cursor.direction == ReplayMotion::Forward && cursor.file.as_ref() == Some(file) { continue; }
+            cursor.position = cursor.position.clamp(segment.start as f64, (segment.end as f64 - frame).max(segment.start as f64));
+            let offset = (cursor.position - segment.start as f64).floor() as u64;
+            let path = path.to_string_lossy().into_owned();
+            let same_file = matches!(&input.kind, Kind::Replay { path: current, .. } if *current == path);
+            let baseline = if same_file { source.map_or(0, |source| source.seq.load(Relaxed)) } else { 0 };
+            input.kind = Kind::Replay { path, channel };
+            input.playing = false;
+            input.seek_ms = Some(offset);
+            cursor.file = Some(file.clone());
+            cursor.seek = Some((baseline, offset, now));
+            cursor.due = now + frame / (10.0 * f64::from(self.s.replay_speed[channel].max(1)));
+        }
+    }
+
+
+    fn update_replay(&mut self, now: f64) {
+        if let Some(new_session) = self.s.replay_load.take() {
+            if self.s.replay_arm || !self.replay.current.is_empty() || !self.replay.finalizing.is_empty()
+                || self.replay.playback.iter().any(Option::is_some) || self.replay.export.is_some()
+            {
+                self.s.replay_status = "Stop recording and wait for replay jobs before changing sessions".into();
+            } else {
+                let folder = std::path::PathBuf::from(self.s.replay_setup.folder.trim());
+                let opened = (|| -> Result<replay::Session, String> {
+                    if folder.as_os_str().is_empty() { return Err("Select a Session Folder".into()); }
+                    if new_session {
+                        std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+                        if std::fs::read_dir(&folder).map_err(|error| error.to_string())?.next().is_some() {
+                            return Err("Choose an empty folder for a new replay session".into());
+                        }
+                        let camera_names = self.s.replay_angles.map(|source| {
+                            if source == SRC_OUTPUT { "Program".into() }
+                            else { source.checked_sub(1).and_then(|id| self.s.input(id)).map(|input| input.title.clone()).unwrap_or_default() }
+                        });
+                        let session = replay::Session { setup: self.s.replay_setup.clone(), camera_names, ..Default::default() };
+                        session.save(&folder)?;
+                        Ok(session)
+                    } else {
+                        replay::Session::open(&folder)
+                    }
+                })();
+                match opened {
+                    Ok(session) => {
+                        let selected_folder = folder.to_string_lossy().into_owned();
+                        self.s.replay_setup = session.setup.clone();
+                        self.s.replay_setup.folder = selected_folder.clone();
+                        self.s.replay_session = selected_folder;
+                        self.s.replay_read_only = session.native;
+                        for (index, name) in session.camera_names.iter().enumerate() {
+                            if name.is_empty() && !new_session { self.s.replay_angles[index] = MV_AUTO; continue; }
+                            if name.is_empty() { continue; }
+                            self.s.replay_angles[index] = if name == "Program" { SRC_OUTPUT } else {
+                                self.s.inputs.iter().find(|input| input.title == *name).map_or(MV_AUTO, |input| input.id + 1)
+                            };
+                        }
+                        self.s.replay_event = session.events.first().map(|event| event.id);
+                        self.s.replay_events = session.events.clone();
+                        self.s.replay_status = if session.native && session.segments.is_empty() {
+                            "vMix event list loaded read-only. No compatible recording files found.".into()
+                        } else if session.native {
+                            "vMix replay opened read-only".into()
+                        } else { "Replay session ready".into() };
+                        self.s.replay_setup_open = false;
+                        self.s.ensure_replay_inputs();
+                        for input in &mut self.s.inputs {
+                            if let Kind::Replay { path, .. } = &mut input.kind {
+                                path.clear();
+                                input.playing = false;
+                            }
+                        }
+                        self.replay = ReplayCapture { folder: Some(folder), session, ..Default::default() };
+                    }
+                    Err(error) => self.s.replay_status = error,
+                }
+            }
+        }
+
+        if matches!(self.s.replay_command, Some(replay::Action::Live | replay::Action::Step(_) | replay::Action::Reverse)) {
+            let action = self.s.replay_command.take().unwrap();
+            self.indexed_command(action);
+        }
+        let replay = &mut self.replay;
+        let Some(folder) = replay.folder.clone() else {
+            self.s.replay_arm = false;
+            return;
+        };
+        if self.s.replay_session.is_empty() && !self.s.replay_arm && replay.finalizing.is_empty() && replay.current.is_empty() {
+            self.replay = Default::default();
+            return;
+        }
+        if replay.session.native { self.s.replay_arm = false; }
+        let mut changed = false;
+        if let Some(index) = replay.finalizing.iter().position(|segment| segment.tracks.iter().all(|track| track.worker.is_finished())) {
+            let segment = replay.finalizing.remove(index);
+            let mut files = std::array::from_fn(|_| None);
+            for track in segment.tracks {
+                let joined = track.worker.join().is_ok();
+                let file = folder.join(&track.file);
+                if joined && track.error.lock().unwrap().is_empty() && std::fs::metadata(&file).is_ok_and(|entry| entry.len() > 0) {
+                    files[track.angle] = Some(track.file);
+                } else {
+                    let _ = std::fs::remove_file(file);
+                    self.s.replay_status = format!("Camera {} failed to record", track.angle + 1);
+                }
+            }
+            if files.iter().any(Option::is_some) && segment.end > segment.start {
+                replay.session.segments.push(replay::Segment { start: segment.start, end: segment.end, files });
+                replay.session.segments.sort_by_key(|segment| segment.start);
+                changed = true;
+            } else {
+                self.s.replay_arm = false;
+            }
+        }
+
+        let position = replay.position(now);
+        if let Some(command) = self.s.replay_command.take() {
+            match command {
+                replay::Action::MarkIn if !replay.current.is_empty() => replay.mark_in = Some(position),
+                replay::Action::CancelMark => replay.mark_in = None,
+                replay::Action::MarkOut if !replay.current.is_empty() => {
+                    if let Some(start) = replay.mark_in.take().filter(|start| *start < position) {
+                        replay.marks.push((start, position));
+                        self.s.replay_status = "Waiting for marked media to finalize…".into();
+                    }
+                }
+                replay::Action::MarkLast(ms) if !replay.current.is_empty() => {
+                    let take_start = replay.clock.map_or(position, |(_, start)| start);
+                    let start = position.saturating_sub(ms).max(take_start);
+                    if start < position {
+                        replay.marks.push((start, position));
+                        self.s.replay_status = "Waiting for marked media to finalize…".into();
+                    }
+                }
+                replay::Action::SaveEvent(event) if !replay.session.native => {
+                    if let Some(stored) = replay.session.events.iter_mut().find(|stored| stored.id == event.id) {
+                        *stored = event;
+                        changed = true;
+                    }
+                }
+                replay::Action::DeleteEvent(id) if !replay.session.native => {
+                    replay.session.events.retain(|event| event.id != id);
+                    self.s.replay_event = replay.session.events.first().map(|event| event.id);
+                    changed = true;
+                }
+                replay::Action::Play { event, program } => {
+                    replay.sync_playback = self.s.replay_channel == 2;
+                    for channel in 0..2 {
+                        if (self.s.replay_channel < 2 && self.s.replay_channel != channel) || replay.playback[channel].is_some() {
+                            continue;
+                        }
+                        let speed = self.s.replay_speed[channel];
+                        if speed == 0 {
+                            for input in &mut self.s.inputs {
+                                if matches!(input.kind, Kind::Replay { channel: target, .. } if target == channel) { input.playing = false; }
+                            }
+                            continue;
+                        }
+                        match replay.job(event, self.s.replay_cameras[channel], speed, false) {
+                            Ok(job) => {
+                                replay.indexed[channel] = None;
+                                let take = program && (self.s.replay_channel < 2 || channel == 0);
+                                replay.playback[channel] = Some(ReplayPlayback { job, ready: None, program: take, speed });
+                                self.s.replay_status = format!("Preparing Replay {}…", ["A", "B"][channel]);
+                            }
+                            Err(error) => self.s.replay_status = error,
+                        }
+                    }
+                }
+                replay::Action::Pause(channel) => {
+                    let selected = |target: usize| channel == 2 || target == channel;
+                    let resume = !replay.indexed.iter().enumerate().any(|(index, cursor)| selected(index)
+                        && cursor.as_ref().is_some_and(|cursor| cursor.direction != ReplayMotion::Still && !cursor.paused))
+                        && !self.s.inputs.iter().any(|input| matches!(input.kind, Kind::Replay { channel, .. }
+                            if selected(channel)) && input.playing);
+                    for (index, cursor) in replay.indexed.iter_mut().enumerate() {
+                        if selected(index) {
+                            if let Some(cursor) = cursor { cursor.paused = !resume; }
+                        }
+                    }
+                    for input in &mut self.s.inputs {
+                        if let Kind::Replay { channel, .. } = input.kind {
+                            if selected(channel) {
+                                input.playing = resume && replay.indexed[channel].as_ref()
+                                    .is_none_or(|cursor| cursor.direction == ReplayMotion::Forward && cursor.seek.is_none());
+                            }
+                        }
+                    }
+                }
+                replay::Action::Export { event, angle } if replay.export.is_none() => match replay.job(event, angle, 100, true) {
+                    Ok(job) => { replay.export = Some(job); self.s.replay_status = "Exporting replay…".into(); }
+                    Err(error) => self.s.replay_status = error,
+                },
+                _ => {}
+            }
+        }
+
+        for job in replay.playback.iter_mut().flatten() {
+            if job.ready.is_none() {
+                job.ready = poll_replay_job(&job.job);
+            }
+        }
+        let apply_playback = !replay.sync_playback || replay.playback.iter().flatten().all(|job| job.ready.is_some());
+        for channel in 0..2 {
+            let result = replay.playback[channel].as_mut().and_then(|job| {
+                if !apply_playback { return None; }
+                job.ready.take().map(|result| (result, job.program, job.speed))
+            });
+            if let Some((result, program, speed)) = result {
+                replay.playback[channel] = None;
+                match result {
+                    Ok(path) => {
+                        let id = self.s.ensure_replay_inputs()[channel];
+                        if let Some(input) = self.s.input_mut(id) {
+                            input.kind = Kind::Replay { path: path.to_string_lossy().into_owned(), channel };
+                            input.playing = true;
+                            input.pos = 0.0;
+                        }
+                        if program {
+                            let mut transition = self.s.replay_setup.transition_ms;
+                            if self.s.replay_setup.match_speed {
+                                transition = transition.saturating_mul(100) / u32::from(speed.max(1));
+                            }
+                            self.s.transition_input(id, if transition == 0 { Effect::Cut } else { Effect::Fade }, transition);
+                        } else if !replay.sync_playback || channel == 0 {
+                            self.s.preview = Some(id);
+                        }
+                        self.s.replay_status = format!("Replay {} playing", ["A", "B"][channel]);
+                    }
+                    Err(error) => self.s.replay_status = error,
+                }
+            }
+        }
+        if let Some(result) = replay.export.as_ref().and_then(poll_replay_job) {
+            replay.export = None;
+            self.s.replay_status = match result {
+                Ok(path) => format!("Exported to {}", path.display()),
+                Err(error) => error,
+            };
+        }
+
         if self.s.replay_arm && self.program.lock().unwrap().error.is_some()
             && self.s.replay_angles.iter().any(|&source| !matches!(source, SRC_OUTPUT | MV_AUTO))
         {
             self.s.replay_arm = false;
             self.s.replay_status = "Multicamera replay requires offscreen capture".into();
         }
-        let elapsed = replay.current.first().map_or(0.0, |track| now - track.recording.started);
-        let cut = !self.s.replay_arm || self.s.replay_mark_in || self.s.replay_mark
-            || elapsed >= if replay.marking { 120.0 } else { 8.0 };
-        if cut && !replay.current.is_empty() && replay.finalizing.is_none() {
-            let begin = self.s.replay_arm && std::mem::take(&mut self.s.replay_mark_in);
-            let mark_out = std::mem::take(&mut self.s.replay_mark);
-            let marked = replay.marking || mark_out;
-            let tracks = replay.current.drain(..).map(|track| {
-                let file = Arc::new(ReplayFile { name: track.name, path: track.recording.recorder.path.clone().into() });
-                FinalizingTrack { file, error: track.recording.recorder.error.clone(), worker: track.worker }
+        if !replay.current.is_empty() && (!self.s.replay_arm || (
+            replay.finalizing.len() < 2
+                && now - replay.current[0].recording.started >= replay::SEGMENT_MS as f64 / 1000.0))
+        {
+            let start = replay.position(replay.current[0].recording.started);
+            let tracks = replay.current.drain(..).map(|track| FinalizingTrack {
+                angle: track.angle, file: track.file, error: track.recording.recorder.error.clone(), worker: track.worker,
             }).collect();
-            replay.finalizing = Some(FinalizingReplay { tracks, marked, discard: begin && !marked });
-            replay.marking = begin;
+            replay.finalizing.push(FinalizingReplay { start, end: position, tracks });
+        }
+
+        if self.s.replay_arm && replay.clock.is_none() {
+            let setup = &self.s.replay_setup;
+            let format = replay::Format {
+                size: setup.size.unwrap_or(self.record_format.0),
+                fps: setup.fps.unwrap_or(self.record_format.1 as f32),
+                codec: media::RecordFormat::parse(&setup.codec).key().to_owned(),
+            };
+            if replay.session.format.as_ref().is_some_and(|old| *old != format) {
+                self.s.replay_arm = false;
+                self.s.replay_status = "Recording format differs from this session. Restore it or create a new session.".into();
+            } else {
+                replay.session.format = Some(format);
+            }
         }
         if self.s.replay_arm && replay.current.is_empty() {
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-            let ([w, h], fps) = self.record_format;
-            let options = media::RecOpts { mbps: self.s.cfg.rec_mbps, size: Some((w, h)),
-                fps: fps as f32, hw: self.s.cfg.hw_encoder, format: media::RecordFormat::H264 };
+            if replay.clock.is_none() {
+                let last = replay.session.segments.last().map_or(0, |segment| segment.end);
+                replay.clock = Some((now, last));
+                replay.session.setup = self.s.replay_setup.clone();
+                replay.session.camera_names = self.s.replay_angles.map(|source| {
+                    if source == SRC_OUTPUT { "Program".into() }
+                    else { source.checked_sub(1).and_then(|id| self.s.input(id)).map(|input| input.title.clone()).unwrap_or_default() }
+                });
+                changed = true;
+            }
+            let stamp = replay_stamp();
+            let setup = &self.s.replay_setup;
+            let [w, h] = setup.size.unwrap_or(self.record_format.0);
+            let fps = setup.fps.unwrap_or(self.record_format.1 as f32);
+            let options = media::RecOpts { mbps: setup.mbps.clamp(1, 100), size: Some((w, h)),
+                fps, hw: self.s.cfg.hw_encoder, format: media::RecordFormat::parse(&setup.codec), audio: true };
             let timeline = Arc::new(std::sync::OnceLock::new());
             let mut seen = std::collections::HashSet::new();
-            for (index, source) in self.s.replay_angles.into_iter().enumerate() {
+            for (angle, source) in self.s.replay_angles.into_iter().enumerate() {
                 if source == MV_AUTO || !seen.insert(source) { continue; }
-                if source != SRC_OUTPUT && self.s.input(source - 1).is_none() { continue; }
-                let path = std::env::temp_dir().join(format!("LiveMix Replay {}-{stamp}-{index}.mp4", std::process::id()));
-                let name = src_name(&self.s, source);
+                if source != SRC_OUTPUT && !self.s.input(source - 1).is_some_and(|input| !matches!(input.kind, Kind::Replay { .. })) { continue; }
+                let file = format!("camera-{}-{stamp}.mp4", angle + 1);
                 let route = OutputRoute { source, overlays: source == SRC_OUTPUT };
                 let (recorder, worker) = media::Recorder::spawn_writer_with_timeline(
-                    path.to_string_lossy().into_owned(), options, Some(timeline.clone()));
-                let recording = ComposedRecording { recorder: Arc::new(recorder), channel: 0, route_override: Some(route), started: now };
-                replay.current.push(ReplayTrack { recording, name, worker });
+                    folder.join(&file).to_string_lossy().into_owned(), options, Some(timeline.clone()));
+                let recording = ComposedRecording { recorder: Arc::new(recorder), channel: 0,
+                    route_override: Some(route), audio_override: match setup.audio {
+                        0 => None,
+                        1 => Some(SRC_OUTPUT),
+                        n => self.s.replay_angles.get(usize::from(n - 2)).copied().filter(|&source| source != MV_AUTO),
+                    }, started: now };
+                replay.current.push(ReplayTrack { recording, angle, file, worker });
             }
             if replay.current.is_empty() {
                 self.s.replay_arm = false;
-                self.s.replay_status = "Select at least one available angle".into();
-            } else if replay.marking {
-                self.s.replay_status = "Recording marked event…".into();
-            } else if replay.events.is_empty() {
-                self.s.replay_status = format!("Buffering {} angle(s)…", replay.current.len());
+                self.s.replay_status = "Select at least one available camera".into();
+            } else if self.s.replay_status == "Replay session ready" {
+                self.s.replay_status = format!("Recording {} camera(s)", replay.current.len());
             }
         }
         if !self.s.replay_arm {
-            self.s.replay_mark_in = false;
-            self.s.replay_mark = false;
+            if let Some(start) = replay.mark_in.take().filter(|start| *start < position) {
+                replay.marks.push((start, position));
+            }
+            if replay.finalizing.is_empty() { replay.clock = None; }
         }
-        self.s.replay_marking = replay.marking;
-        self.s.replay_available = !replay.events.is_empty() && replay.copying.is_none();
-        self.s.replay_events = replay.events.iter().map(|event| {
-            (event.name.clone(), event.angles.iter().map(|angle| angle.name.clone()).collect())
-        }).collect();
-        // "Instant Replay" inputs show the selected event angle like a normal video source.
-        let selected = replay.events.get(self.s.replay_event)
-            .and_then(|event| event.angles.get(self.s.replay_angle))
-            .map(|file| file.path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        for input in &mut self.s.inputs {
-            if let Kind::Replay { path } = &mut input.kind {
-                if *path != selected {
-                    *path = selected.clone();
-                    input.pos = 0.0;
-                    input.playing = !selected.is_empty();
-                }
+
+        let ready_until = replay.session.segments.last().map_or(0, |segment| segment.end);
+        replay.marks.retain(|&(start, end)| {
+            if end <= ready_until && !replay.finalizing.iter().any(|segment| segment.start < end && segment.end > start) {
+                let id = replay.session.new_event(start, end);
+                self.s.replay_event = Some(id);
+                self.s.replay_status = format!("Event {id} saved");
+                changed = true;
+                false
+            } else if !self.s.replay_arm && replay.finalizing.is_empty() {
+                self.s.replay_status = "Marked range could not be recorded".into();
+                false
+            } else { true }
+        });
+        if changed && self.s.replay_setup.delete_old && replay.export.is_none() && replay.playback.iter().all(Option::is_none) {
+            let mark = replay.mark_in.into_iter().chain(replay.marks.iter().map(|range| range.0))
+                .chain(replay.indexed.iter().flatten().map(|cursor| cursor.position as u64)).min();
+            replay.session.prune(&folder, ready_until.saturating_sub(self.s.replay_setup.buffer_seconds * 1000), mark);
+        }
+        if changed {
+            self.s.replay_events = replay.session.events.clone();
+            if let Err(error) = replay.save() {
+                self.s.replay_status = format!("Could not save replay session: {error}");
             }
         }
+        self.s.replay_marking = replay.mark_in.is_some();
+        self.update_indexed_replay(now);
     }
-
 
     fn recording_error(&self, recording: &ComposedRecording) -> Option<String> {
         let error = recording.recorder.error.lock().unwrap();
@@ -1057,7 +1566,7 @@ impl App {
             }
         }
         let ([w, h], fps) = self.record_format;
-        let options = |mbps, format, hw| media::RecOpts { mbps, size: Some((w, h)), fps: fps as f32, hw, format };
+        let options = |mbps, format, hw, audio| media::RecOpts { mbps, size: Some((w, h)), fps: fps as f32, hw, format, audio };
 
         if self.s.rec.is_none() {
             if let Some(primary) = self.recordings[0].take() {
@@ -1073,10 +1582,10 @@ impl App {
             if self.recordings[0].is_none() {
                 let name = safe_name(&c.rec_name);
                 self.recordings[0] = Some(ComposedRecording::new(&c.rec_folder, &name, c.rec_source, now,
-                    options(c.rec_mbps, c.rec_codec, c.hw_encoder)));
+                    options(c.rec_mbps, c.rec_codec, c.hw_encoder, c.record_audio[0])));
                 if c.rec_second {
                     self.recordings[1] = Some(ComposedRecording::new(&c.rec_folder, &format!("{name} - 2"), c.rec_second_source, now,
-                        options(c.rec_second_mbps, c.rec_second_codec, c.hw_encoder)));
+                        options(c.rec_second_mbps, c.rec_second_codec, c.hw_encoder, c.record_audio[1])));
                 }
                 let path = &self.recordings[0].as_ref().unwrap().recorder.path;
                 self.s.notice(&format!("Recording to {path}"));
@@ -1112,7 +1621,7 @@ impl App {
             if self.multi_outputs[channel].is_none() {
                 let c = &self.s.cfg;
                 self.multi_outputs[channel] = Some(ComposedRecording::new(&c.mc_folder, &format!("MultiCorder Output {}", channel + 1), channel, now,
-                    options(c.mc_mbps, c.mc_codec, c.hw_encoder)));
+                    options(c.mc_mbps, c.mc_codec, c.hw_encoder, c.record_audio[2])));
             }
             if let Some(error) = self.multi_outputs[channel].as_ref().and_then(|r| self.recording_error(r)) {
                 self.multi_outputs[channel] = None;
@@ -1282,7 +1791,8 @@ impl App {
                 continue;
             }
             let leader = groups.iter().position(|group| group.first().is_some_and(|(_, first)| {
-                (first.source, first.quality, first.hardware) == (destination.source, destination.quality, destination.hardware)
+                (first.source, first.direct, first.quality, first.bitrate, first.hardware, first.hevc)
+                    == (destination.source, destination.direct, destination.quality, destination.bitrate, destination.hardware, destination.hevc)
             })).unwrap_or(index);
             groups[leader].push((index, destination.clone()));
         }
@@ -1317,7 +1827,7 @@ impl App {
 
     fn audio_input(&self, input: &Input) -> Option<(&media::Shared, bool, f32)> {
         let source = self.media.get(&input.id)?.shared.as_deref()?;
-        let file = matches!(input.kind, Kind::VideoFile { .. } | Kind::VideoList { .. });
+        let file = matches!(input.kind, Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Replay { .. });
         let gain = if input.audio_on { input.volume / 100.0 } else { 0.0 };
         Some((source, file, gain))
     }
@@ -1325,8 +1835,8 @@ impl App {
     /// Peak level of every audio input, kept for the mixer strips and the Input Settings meter.
     fn update_levels(&mut self) {
         let at = Instant::now();
-        let levels: Vec<(u32, f32)> = self.s.inputs.iter().filter(|input| input.kind.has_audio())
-            .map(|input| (input.id, self.audio_input(input).map_or(0.0, |source| audio::input_peak(source, at))))
+        let levels: Vec<(u32, [f32; 2])> = self.s.inputs.iter().filter(|input| input.kind.has_audio())
+            .map(|input| (input.id, self.audio_input(input).map_or([0.0; 2], |source| audio::input_peaks(source, at))))
             .collect();
         for (id, level) in levels {
             if let Some(input) = self.s.input_mut(id) {
@@ -1344,8 +1854,11 @@ impl App {
         let gain = if master { self.master_gain() } else { 1.0 };
         audio::mix(self.s.inputs.iter().filter(|input| {
             if master { input.bus_m } else { Some(input.id) == selected }
-        }).filter_map(|input| self.audio_input(input))
-            .map(|(source, file, level)| (source, file, level * gain)), at, frames)
+        }).filter_map(|input| {
+            let (source, file, level) = self.audio_input(input)?;
+            let auto = if master { self.s.automatic_audio_gain(input) } else { 1.0 };
+            Some((source, file, level * gain * auto))
+        }), at, frames)
     }
 
     fn master_gain(&self) -> f32 {
@@ -1358,18 +1871,31 @@ impl App {
         let error = monitor.error.lock().unwrap().take();
         if let Some(error) = error {
             self.audio_monitor = None;
+            self.mixer.last_error = Some(error.clone());
             self.s.notice(&format!("Audio monitor: {error}"));
             return;
         }
-        let gain = if self.monitor_bus == 0 { self.master_gain() } else { 1.0 };
-        let sources = self.s.inputs.iter().filter(|input| match self.monitor_bus {
-            1 => input.bus_a,
-            2 => input.bus_b,
-            _ => input.bus_m,
+        let solo = self.s.inputs.iter().any(|input| input.solo && input.kind.has_audio());
+        let bus_gain = if self.mixer.bus == 0 { self.master_gain() } else { 1.0 };
+        let headphones = self.mixer.headphones / 100.0;
+        let sources = self.s.inputs.iter().filter(|input| {
+            if solo {
+                return input.solo && input.kind.has_audio();
+            }
+            match self.mixer.bus {
+                1 => input.bus_a,
+                2 => input.bus_b,
+                _ => input.bus_m,
+            }
         }).filter_map(|input| {
             let (_, file, volume) = self.audio_input(input)?;
-            Some((self.media.get(&input.id)?.shared.clone()?, file, volume * gain))
-        }).collect();
+            let gain = if solo {
+                if input.solo_pfl { 1.0 } else { volume }
+            } else {
+                volume * bus_gain * self.s.automatic_audio_gain(input)
+            };
+            Some((self.media.get(&input.id)?.shared.clone()?, file, gain * headphones))
+        }).collect::<Vec<_>>().into();
         *monitor.sources.lock().unwrap() = sources;
     }
 
@@ -1393,59 +1919,60 @@ impl App {
             let size = self.record_format.0;
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
             let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("program-offscreen"));
-            let mut groups: Vec<(OutputRoute, program::Destinations)> = Vec::new();
+            let mut groups: Vec<(OutputRoute, u32, program::Destinations)> = Vec::new();
             for recording in self.composed_recordings() {
                 let route = recording.route(&self.s.cfg);
-                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                let audio_source = recording.audio_override.unwrap_or(route.source);
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == audio_source) {
                     destinations.recorders.push(Arc::clone(&recording.recorder));
                 } else {
-                    groups.push((route, program::Destinations { recorders: vec![Arc::clone(&recording.recorder)], ..Default::default() }));
+                    groups.push((route, audio_source, program::Destinations { recorders: vec![Arc::clone(&recording.recorder)], ..Default::default() }));
                 }
             }
             for (channel, (_, sink)) in self.decklink_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
                     destinations.decklinks.push(sink.clone());
                 } else {
-                    groups.push((route, program::Destinations { decklinks: vec![sink.clone()], ..Default::default() }));
+                    groups.push((route, route.source, program::Destinations { decklinks: vec![sink.clone()], ..Default::default() }));
                 }
             }
             for (channel, (_, sink)) in self.ndi_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))).filter(|(_, (_, sink))| sink.subscribed()) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
                     destinations.ndi.push(sink.clone());
                 } else {
-                    groups.push((route, program::Destinations { ndi: vec![sink.clone()], ..Default::default() }));
+                    groups.push((route, route.source, program::Destinations { ndi: vec![sink.clone()], ..Default::default() }));
                 }
             }
             for (channel, (_, sink)) in self.omt_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))).filter(|(_, (_, sink))| sink.subscribed()) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
                     destinations.omt.push(sink.clone());
                 } else {
-                    groups.push((route, program::Destinations { omt: vec![sink.clone()], ..Default::default() }));
+                    groups.push((route, route.source, program::Destinations { omt: vec![sink.clone()], ..Default::default() }));
                 }
             }
             for (channel, (_, sink)) in self.srt_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
                     destinations.streams.push(sink.clone());
                 } else {
-                    groups.push((route, program::Destinations { streams: vec![sink.clone()], ..Default::default() }));
+                    groups.push((route, route.source, program::Destinations { streams: vec![sink.clone()], ..Default::default() }));
                 }
             }
             for (index, (_, _, sink)) in self.stream_outputs.iter().enumerate().filter_map(|(index, sink)| sink.as_ref().map(|sink| (index, sink))) {
-                let route = self.s.cfg.outputs[self.s.cfg.streams[index].source];
-                if let Some((_, destinations)) = groups.iter_mut().find(|(existing, _)| *existing == route) {
+                let route = stream_route(&self.s, &self.s.cfg.streams[index]);
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
                     destinations.streams.push(sink.clone());
                 } else {
-                    groups.push((route, program::Destinations { streams: vec![sink.clone()], ..Default::default() }));
+                    groups.push((route, route.source, program::Destinations { streams: vec![sink.clone()], ..Default::default() }));
                 }
             }
             let captured_at = Instant::now();
-            for (route, mut recorders) in groups {
+            for (route, audio_source, mut recorders) in groups {
                 let count = (f64::from(audio::RATE) / self.record_format.1).ceil() as usize;
-                recorders.audio = self.mix_audio(route.source, captured_at, count);
+                recorders.audio = self.mix_audio(audio_source, captured_at, count);
                 draw_src(&egui::Painter::new(ctx.clone(), layer, rect), rect, &self.s, now, route.source, route.overlays);
                 let shapes = ctx.graphics_mut(|graphics| {
                     std::mem::take(graphics.entry(layer)).all_entries().cloned().collect()
@@ -1622,7 +2149,7 @@ impl App {
     }
 
     /// File picker and device list requests from the Add Input dialog.
-    fn handle_requests(&mut self) {
+    fn handle_requests(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.snap_rx {
             if let Ok(res) = rx.try_recv() {
                 self.snap_rx = None;
@@ -1660,6 +2187,7 @@ impl App {
                         // Recording Setup "Browse" / MultiCorder "Change Recording Folder".
                         (media::PickKind::Folder, 1) => self.s.cfg.rec_folder = p,
                         (media::PickKind::Folder, 2) => self.s.cfg.mc_folder = p,
+                        (media::PickKind::Folder, 3) => self.s.replay_setup.folder = p,
                         (kind, _) => {
                             let d = &mut self.s.add_dialog;
                             match kind {
@@ -1679,6 +2207,9 @@ impl App {
         let d = &mut self.s.add_dialog;
         if d.open && d.kind == AddKind::Desktop && d.ndi_scan && self.network_scan.is_none() {
             d.ndi_scan = false;
+            d.thumbnails.clear();
+            self.thumbnail_attempts.clear();
+            self.network_thumbnail = None;
             d.ndi_status = "Discovering NDI sources…".into();
             d.omt_status = "Discovering OMT sources…".into();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1709,6 +2240,8 @@ impl App {
                 Err(error) => d.omt_status = error,
             }
         }
+        update_network_thumbnails(ctx, d, self.s.cfg.network_thumbnails && self.network_scan.is_none(),
+            &mut self.network_thumbnail, &mut self.thumbnail_attempts);
         if self.s.refresh_devices || (d.open && d.kind.uses_device() && !d.devices_loaded) {
             self.s.refresh_devices = false;
             let decklinks = decklink::refresh_devices();
@@ -1726,49 +2259,80 @@ impl App {
 
 #[cfg(all(test, windows))]
 #[test]
-fn replay_finalizes_multiple_angles_and_adds_the_selected_angle_to_preview() {
+fn replay_marks_without_rotating_records_and_reopens_both_channels() {
     let mut app = App::new(None);
     app.s.cfg = Settings::default();
     app.s.cfg.hw_encoder = false;
-    app.s.cfg.rec_folder = std::env::temp_dir().to_string_lossy().into_owned();
+    let folder = std::env::temp_dir().join(format!("livemix-replay-test-{}", replay_stamp()));
+    app.s.replay_setup.folder = folder.to_string_lossy().into_owned();
+    app.s.replay_load = Some(true);
     app.record_format = ([320, 180], 25.0);
     app.s.replay_angles[1] = app.s.inputs[0].id + 1;
+    app.update_replay(0.0);
     app.s.replay_arm = true;
     app.update_replay(0.0);
     assert_eq!(app.replay.current.len(), 2);
+    let original = app.replay.current[0].file.clone();
     let start = Instant::now();
-    for index in 0..10 {
+    for index in 0..20 {
         for track in &app.replay.current {
             track.recording.recorder.push_audio([220, 60, 30, 255].repeat(320 * 180), 320, 180,
-                start + std::time::Duration::from_millis(index * 40), Default::default());
+                start + std::time::Duration::from_millis(index * 40), audio::test_tone(1920));
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    app.s.replay_command = Some(replay::Action::MarkIn);
+    app.update_replay(0.08);
+    app.s.replay_command = Some(replay::Action::MarkOut);
+    app.update_replay(0.68);
+    assert_eq!(app.replay.current[0].file, original);
+    assert!(app.s.replay_events.is_empty());
     app.s.replay_arm = false;
-    app.s.replay_mark = true;
-    app.update_replay(0.4);
+    app.update_replay(0.8);
     let deadline = Instant::now() + std::time::Duration::from_secs(8);
-    while !app.s.replay_available && Instant::now() < deadline {
-        app.update_replay(0.4);
+    while app.s.replay_events.is_empty() && Instant::now() < deadline {
+        app.update_replay(0.8);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(app.s.replay_available, "{}", app.s.replay_status);
-    assert_eq!(app.s.replay_events[0].1.len(), 2);
-    assert!(app.s.replay_events[0].0.starts_with("Event "));
-    app.s.replay_angle = 1;
-    app.s.replay_add = true;
-    app.update_replay(0.4);
-    let previous = app.s.preview;
-    let deadline = Instant::now() + std::time::Duration::from_secs(4);
-    while app.s.preview == previous && Instant::now() < deadline {
-        app.update_replay(0.4);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(app.s.replay_events.len(), 1, "{}", app.s.replay_status);
+    let event = &app.s.replay_events[0];
+    assert_eq!((event.start, event.end), (80, 680));
+    assert_eq!(event.angles[..2], [true, true]);
+    let id = event.id;
+    app.s.replay_load = Some(false);
+    app.update_replay(0.8);
+    assert_eq!(app.s.replay_event, Some(id));
+    if crate::stream::command().arg("-version").output().is_ok_and(|output| output.status.success()) {
+        app.s.replay_channel = 2;
+        app.s.replay_cameras = [0, 1];
+        app.s.replay_speed = [100, 50];
+        app.s.replay_command = Some(replay::Action::Play { event: id, program: false });
+        app.update_replay(0.8);
+        let deadline = Instant::now() + std::time::Duration::from_secs(12);
+        while app.replay.playback.iter().any(Option::is_some) && Instant::now() < deadline {
+            app.update_replay(0.8);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for channel in 0..2 {
+            assert!(app.s.inputs.iter().any(|input| {
+                matches!(&input.kind, Kind::Replay { channel: c, path } if *c == channel
+                    && std::fs::metadata(path).is_ok_and(|entry| entry.len() > 1000))
+            }), "{}", app.s.replay_status);
+        }
     }
-    let input = app.s.preview.and_then(|id| app.s.input(id)).unwrap();
-    assert!(input.title.starts_with("Replay "));
-    let Kind::VideoFile { path } = &input.kind else { panic!("Expected a replay file"); };
-    assert!(std::fs::metadata(path).unwrap().len() > 1000);
-    std::fs::remove_file(path).unwrap();
+    app.s.replay_channel = 0;
+    app.s.replay_command = Some(replay::Action::Live);
+    app.update_replay(0.8);
+    let id = app.s.preview.unwrap();
+    assert!(matches!(&app.s.input(id).unwrap().kind, Kind::Replay { channel: 0, path } if path.ends_with(&original)));
+    assert_eq!(app.s.input(id).unwrap().seek_ms, Some(0));
+    app.s.replay_command = Some(replay::Action::Step(1));
+    app.update_replay(0.81);
+    assert_eq!(app.s.input(id).unwrap().seek_ms, Some(40));
+    app.s.replay_command = Some(replay::Action::Reverse);
+    app.update_replay(0.82);
+    assert!(matches!(app.replay.indexed[0].as_ref().unwrap().direction, ReplayMotion::Reverse));
+    std::fs::remove_dir_all(folder).unwrap();
 }
 
 /// What a keyboard shortcut does (function names from the original's shortcut list).
@@ -1871,6 +2435,7 @@ impl eframe::App for App {
         let rate = self.s.cfg.rate();
         set_output_fps(rate);
         media::AUTO_CAM_MAX_H.store(self.s.cfg.auto_cam_max_h, std::sync::atomic::Ordering::Relaxed);
+        media::CAPTURE_LOW_LATENCY.store(self.s.cfg.low_latency_capture, std::sync::atomic::Ordering::Relaxed);
         let previous_picture = self.video_clock.picture_time;
         let video_due = self.video_clock.advance(t, f64::from(rate));
         if video_due {
@@ -1889,17 +2454,31 @@ impl eframe::App for App {
             apply_telestroke(&mut self.s, stroke);
         }
         automation::State::tick(&mut self.s, now);
-        self.handle_requests();
+        self.handle_requests(ctx);
         self.update_media(ctx, video_due);
         self.update_levels();
+        if self.s.show_mixer || self.s.cfg.master_meter || self.s.cfg.mv_audio_program.contains(&true) {
+            self.s.program_audio_level = audio::stereo_peaks(&self.mix_audio(SRC_OUTPUT, Instant::now(), 960));
+        }
         self.update_recording(t);
+        if ctx.input(|input| input.viewport().close_requested())
+            && (!self.replay.current.is_empty() || !self.replay.finalizing.is_empty())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.replay.close_after_recording = true;
+            self.s.replay_arm = false;
+        }
         self.update_replay(t);
+        if self.replay.close_after_recording && self.replay.finalizing.is_empty() && self.replay.current.is_empty() {
+            self.replay.close_after_recording = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.update_decklink_outputs();
         self.update_network_outputs();
         self.update_scopes(ctx, t);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.s.fullscreen = false;
+            self.s.fullscreen = [false; 2];
             for window in &mut self.s.external {
                 window.fullscreen = false;
             }
@@ -1911,15 +2490,16 @@ impl eframe::App for App {
         bottom_bar(ctx, &mut self.s, t);
         monitors(ctx, &mut self.s, picture_time);
         if self.s.show_mixer {
-            let at = Instant::now();
-            let levels = self.s.inputs.iter().map(|input| (input.id, input.level)).collect();
-            let master = audio::peak(&self.mix_audio(SRC_OUTPUT, at, 960));
+            let master = self.s.program_audio_level;
             let mut monitor = self.audio_monitor.is_some();
-            mixer_panel(ctx, &mut self.s, &levels, master, &mut monitor, &mut self.monitor_bus);
+            mixer_panel(ctx, &mut self.s, master, &mut monitor, &mut self.mixer);
             if monitor && self.audio_monitor.is_none() {
-                match audio::Monitor::start() {
+                match audio::Monitor::start(&self.s.cfg.headphones_device) {
                     Ok(stream) => self.audio_monitor = Some(stream),
-                    Err(error) => self.s.notice(&format!("Audio monitor: {error}")),
+                    Err(error) => {
+                        self.mixer.last_error = Some(error.clone());
+                        self.s.notice(&format!("Audio monitor: {error}"));
+                    }
                 }
             } else if !monitor {
                 self.audio_monitor = None;
@@ -1958,14 +2538,19 @@ impl eframe::App for App {
         let adapters = if readers.is_empty() { self.graphics_adapter.clone() } else {
             format!("{} | File reader devices: {}", self.graphics_adapter, readers.join(", "))
         };
-        dialogs(ctx, &mut self.s, &adapters, &encoder, &program_path);
+        dialogs(ctx, &mut self.s, &adapters, &encoder, &program_path, &mut self.mixer);
+        self.audio_mixer_windows(ctx);
         for channel in 0..OUTPUT_COUNT {
             if self.s.external[channel].open {
                 output_window(ctx, &mut self.s, picture_time, channel);
             }
         }
-        if self.s.fullscreen {
-            fullscreen_window(ctx, &mut self.s, picture_time);
+        for slot in 0..2 {
+            if self.s.fullscreen[slot] {
+                fullscreen_window(ctx, &mut self.s, picture_time, slot);
+            } else {
+                ctx.data_mut(|data| data.remove::<u32>(egui::Id::new(("fs-started", slot))));
+            }
         }
         input_preview_window(ctx, &mut self.s, picture_time);
 
@@ -2047,15 +2632,11 @@ fn top_bar(ctx: &egui::Context, s: &mut Switcher) {
                 if fs_x > cur {
                     ui.add_space(fs_x - cur);
                 }
-                let fs_tip = |ui: &mut egui::Ui| {
-                    ui.label(format!(
-                        "Toggle on or off the Fullscreen Output display — shows {} on screen {} (change both in Settings > Display)",
-                        src_name(s, s.cfg.fs_source),
-                        (s.cfg.fs_display as usize).min(screens().len() - 1) + 1
-                    ));
-                };
-                if bar_btn(ui, "Fullscreen", s.fullscreen).on_hover_ui(fs_tip).clicked() {
-                    s.fullscreen = !s.fullscreen;
+                for slot in 0..2 {
+                    let label = if slot == 0 { "Fullscreen" } else { "Fullscreen 2" };
+                    if bar_btn(ui, label, s.fullscreen[slot]).on_hover_text(src_name(s, s.cfg.fs_source[slot])).clicked() {
+                        toggle_fullscreen(s, slot);
+                    }
                 }
                 // External Output indicator beside Fullscreen (lit while the External window is on).
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::click());
@@ -2189,7 +2770,7 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
         let num = id.map(|i| s.number_of(i)).unwrap_or(0);
         // Full-width title bar: orange for Preview, green for Output (as in the original).
         let (bar, _) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::hover());
-        let col = if is_output { OUTPUT } else { PREVIEW };
+        let col = if is_output { s.cfg.output_colour } else { s.cfg.preview_colour };
         ui.painter().rect_filled(bar, 0.0, col);
         let heading = if is_output { "Output" } else { "Preview" };
         let caption = if num > 0 { format!("{num} · {title}") } else { "—".into() };
@@ -2268,18 +2849,19 @@ fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bool, w: f32,
         }
         let (area, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
-        // The picture keeps 16:9 inside the black monitor area.
-        let mut pw = w;
-        let mut ph = w * 9.0 / 16.0;
-        if ph > h {
-            ph = h;
-            pw = h * 16.0 / 9.0;
-        }
-        let rect = egui::Rect::from_center_size(area.center(), Vec2::new(pw, ph));
+        // Keep the meter outside the video rectangle used for screenshot fallback.
+        let show_master_meter = is_output && s.cfg.master_meter && area.width() >= 80.0;
+        let mut video_area = area;
+        if show_master_meter { video_area.max.x -= 28.0; }
+        let rect = fit_16_9(video_area);
         let painter = ui.painter_at(rect);
         if is_output {
             s.output_rect = rect;
             draw_output(&painter, rect, s, t);
+            if show_master_meter {
+                let meter = egui::Rect::from_min_max(video_area.right_top(), area.right_bottom());
+                picture_audio_meter(&ui.painter_at(meter), meter, s.program_audio_level);
+            }
         } else {
             // Waveform Monitor layout (hc::a): where the picture and the scopes go.
             let (pic, scopes) = scope_layout(s.cfg.wave_type);
@@ -2395,7 +2977,8 @@ fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32) {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
         ui.add_space(6.0);
         let bw = w - 28.0;
-        let overlay_space = if s.cfg.show_overlays { 52.0 } else { 0.0 };
+        let overlay_space = if s.cfg.show_overlays { 52.0 } else { 0.0 }
+            + if s.cfg.production_clock { 26.0 } else { 0.0 };
         let bh = ((h - 6.0 - 7.0 * 6.0 - overlay_space - 70.0) / 7.0).clamp(24.0, 40.0);
         let busy = s.trans.is_some();
         if s.cfg.show_quickplay && ui
@@ -2493,6 +3076,30 @@ fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32) {
                     }
                 });
             }
+        }
+        if s.cfg.production_clock {
+            let id = ui.make_persistent_id("production-clock");
+            let now = ui.input(|input| input.time);
+            let (mut start, mut elapsed) = ui.data(|data| data.get_temp::<(Option<f64>, f64)>(id)).unwrap_or((Some(0.0), 0.0));
+            let shown = elapsed + start.map_or(0.0, |start| (now - start).max(0.0));
+            let response = ui.add_sized([bw, 22.0], egui::Button::new(RichText::new(clock(shown)).monospace()))
+                .on_hover_text("Production Clock · click to pause or resume · right-click to reset");
+            if response.clicked() {
+                if start.is_some() {
+                    start = None;
+                    elapsed = shown;
+                } else {
+                    start = Some(now);
+                }
+            }
+            response.context_menu(|ui| {
+                if ui.button("Reset Production Clock").clicked() {
+                    elapsed = 0.0;
+                    if start.is_some() { start = Some(now); }
+                    ui.close_menu();
+                }
+            });
+            ui.data_mut(|data| data.insert_temp(id, (start, elapsed)));
         }
         if s.cfg.show_tbar {
             ui.add_space(4.0);
@@ -2654,12 +3261,19 @@ fn draw_multiview(p: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64, mv:
             SRC_PREVIEW => s.preview,
             n => Some(n - 1),
         };
+        if src == SRC_OUTPUT && s.cfg.mv_audio_program[mv.min(1)] {
+            picture_audio_meter(&bp, r, s.program_audio_level);
+        } else if src != SRC_OUTPUT && s.cfg.mv_audio_inputs[mv.min(1)] {
+            if let Some(input) = id.and_then(|id| s.input(id)).filter(|input| input.kind.has_audio()) {
+                picture_audio_meter(&bp, r, input.level);
+            }
+        }
         // Strip colour: Output (ActiveColour, DarkGreen) before Preview (PreviewColour,
         // DarkOrange); anything else MV_IDLE.
         let strip_col = if src == SRC_OUTPUT || (src != SRC_PREVIEW && id.is_some() && id == s.output) {
-            OUTPUT
+            s.cfg.output_colour
         } else if src == SRC_PREVIEW || (id.is_some() && id == s.preview) {
-            PREVIEW
+            s.cfg.preview_colour
         } else {
             MV_IDLE
         };
@@ -2687,24 +3301,40 @@ fn screens() -> Vec<[i32; 4]> {
 
 /// The Fullscreen display (top bar "Fullscreen"): a borderless window covering the screen chosen
 /// in Settings → Display, showing the Fullscreen source. Esc or a double-click closes it.
-fn fullscreen_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
-    let id = egui::ViewportId::from_hash_of("livemix-fullscreen");
+fn fullscreen_display(index: usize, count: usize) -> usize {
+    if index < count { index } else { 0 }
+}
+
+fn toggle_fullscreen(s: &mut Switcher, slot: usize) {
+    let monitors = screens();
+    let other = 1 - slot;
+    if !s.fullscreen[slot] && s.fullscreen[other]
+        && fullscreen_display(s.cfg.fs_display[slot], monitors.len()) == fullscreen_display(s.cfg.fs_display[other], monitors.len())
+    {
+        s.notice("Choose a different monitor for each active Fullscreen output");
+        return;
+    }
+    s.fullscreen[slot] = !s.fullscreen[slot];
+}
+
+fn fullscreen_window(ctx: &egui::Context, s: &mut Switcher, t: f64, slot: usize) {
+    let id = egui::ViewportId::from_hash_of(("livemix-fullscreen", slot));
     let mons = screens();
-    let m = mons[(s.cfg.fs_display as usize).min(mons.len() - 1)];
+    let m = mons[fullscreen_display(s.cfg.fs_display[slot], mons.len())];
     let ppp = ctx.pixels_per_point();
     let builder = egui::ViewportBuilder::default()
-        .with_title("LiveMix Fullscreen")
+        .with_title(format!("LiveMix Fullscreen {}", slot + 1))
         .with_decorations(false)
         .with_position(egui::pos2(m[0] as f32 / ppp, m[1] as f32 / ppp))
         .with_inner_size(Vec2::new(m[2] as f32 / ppp, m[3] as f32 / ppp))
         .with_window_level(egui::WindowLevel::AlwaysOnTop);
     // Re-place the window when another screen is chosen.
-    let key = egui::Id::new("fs-display-last");
-    let last = ctx.data(|d| d.get_temp::<u8>(key));
-    if last != Some(s.cfg.fs_display) {
-        ctx.data_mut(|d| d.insert_temp(key, s.cfg.fs_display));
+    let key = egui::Id::new(("fs-display-last", slot));
+    let last = ctx.data(|d| d.get_temp::<[i32; 4]>(key));
+    if last != Some(m) {
+        ctx.data_mut(|d| d.insert_temp(key, m));
         if last.is_some() {
-            ctx.data_mut(|d| d.remove::<u32>(egui::Id::new("fs-started")));
+            ctx.data_mut(|d| d.remove::<u32>(egui::Id::new(("fs-started", slot))));
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Fullscreen(false));
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::OuterPosition(egui::pos2(m[0] as f32 / ppp, m[1] as f32 / ppp)));
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::InnerSize(Vec2::new(m[2] as f32 / ppp, m[3] as f32 / ppp)));
@@ -2713,7 +3343,7 @@ fn fullscreen_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
     let mut close = false;
     ctx.show_viewport_immediate(id, builder, |ctx, _class| {
         // Once the window sits on its screen, make it truly fullscreen there.
-        let started = egui::Id::new("fs-started");
+        let started = egui::Id::new(("fs-started", slot));
         let n = ctx.data(|d| d.get_temp::<u32>(started)).unwrap_or(0);
         if n < 3 {
             ctx.data_mut(|d| d.insert_temp(started, n + 1));
@@ -2725,7 +3355,7 @@ fn fullscreen_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
             let r = ui.max_rect();
             let resp = ui.interact(r, egui::Id::new("fullscreen-area"), Sense::click());
             let out = fit_16_9(r);
-            draw_src(&ui.painter_at(out), out, s, t, s.cfg.fs_source, s.cfg.fs_overlays);
+            draw_src(&ui.painter_at(out), out, s, t, s.cfg.fs_source[slot], s.cfg.fs_overlays[slot]);
             if resp.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
@@ -2741,7 +3371,7 @@ fn fullscreen_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
         }
     });
     if close {
-        s.fullscreen = false;
+        s.fullscreen[slot] = false;
     }
 }
 
@@ -2950,7 +3580,7 @@ fn inputs_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                         let title = s.input(from).map(|i| format!("{}  {}", s.number_of(i.id), i.title)).unwrap_or_default();
                         let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag-ghost")));
                         let gr = egui::Rect::from_min_size(pos + Vec2::new(12.0, 8.0), Vec2::new(tile_w * 0.8, TILE_HEADER));
-                        lp.rect_filled(gr, 2.0, PREVIEW.gamma_multiply(0.85));
+                        lp.rect_filled(gr, 2.0, s.cfg.preview_colour.gamma_multiply(0.85));
                         lp.text(gr.left_center() + Vec2::new(8.0, 0.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(13.0), Color32::WHITE);
                         if ui.input(|i| i.pointer.any_released()) {
                             if let Some((to, _)) = target {
@@ -2998,7 +3628,7 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
     let Some(inp) = s.input(id) else { return };
     let is_out = s.output == Some(id);
     let is_prev = s.preview == Some(id);
-    let border = if is_out { OUTPUT_BRIGHT } else if is_prev { PREVIEW } else { EDGE };
+    let border = if is_out { s.cfg.output_colour } else if is_prev { s.cfg.preview_colour } else { EDGE };
     let title = inp.title.clone();
     let cat = inp.category;
     let loop_on = inp.loop_on;
@@ -3019,7 +3649,7 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
         let (hr, header) = ui.allocate_exact_size(hsize, Sense::click_and_drag());
         // Dragging the title bar carries the input (dropped on another input in inputs_panel).
         header.dnd_set_drag_payload(id);
-        let hcol = if is_out { OUTPUT } else if is_prev { PREVIEW } else { BTN };
+        let hcol = if is_out { s.cfg.output_colour } else if is_prev { s.cfg.preview_colour } else { BTN };
         let close_rect = egui::Rect::from_min_size(
             if shrunk { egui::pos2(hr.left(), hr.bottom() - TILE_HEADER) }
             else { egui::pos2(hr.right() - TILE_HEADER, hr.top()) },
@@ -3166,6 +3796,9 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
             } else {
                 draw_source(&painter, r, inp, 1.0, t, &s.inputs);
             }
+            if s.cfg.input_meter && inp.kind.has_audio() {
+                picture_audio_meter(&painter, r, inp.level);
+            }
             if playable {
                 let k = (inp.pos / inp.duration.max(0.01)).clamp(0.0, 1.0);
                 let bar = egui::Rect::from_min_size(egui::pos2(r.left(), r.bottom() - 3.0), Vec2::new(r.width() * k, 3.0));
@@ -3198,7 +3831,7 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
                 ui.spacing_mut().item_spacing.x = 1.0;
                 ui.spacing_mut().button_padding.x = 1.0;
                 let scale = ((tile_w - 3.0) / 153.0).min(1.0);
-                if tile_btn(ui, "Preview", 48.0 * scale, s.input_preview == Some(id), true, PREVIEW)
+                if tile_btn(ui, "Preview", 48.0 * scale, s.input_preview == Some(id), true, s.cfg.preview_colour)
                     .on_hover_text("Open a larger preview of this input").clicked()
                 {
                     s.input_preview = Some(id);
@@ -3271,41 +3904,196 @@ fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, t: f64) {
 
 // ---------------------------------------------------------------- mixer
 
-fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, levels: &std::collections::HashMap<u32, f32>,
-    master: f32, monitor: &mut bool, bus: &mut u8)
-{
+#[derive(Clone, Copy)]
+enum MixerSettings {
+    Master,
+    Input(u32),
+}
+
+struct MixerControls {
+    bus: u8,
+    headphones: f32,
+    statistics: bool,
+    settings: Option<MixerSettings>,
+    last_error: Option<String>,
+}
+
+impl Default for MixerControls {
+    fn default() -> Self {
+        Self { bus: 0, headphones: 100.0, statistics: false, settings: None, last_error: None }
+    }
+}
+
+impl App {
+    fn audio_mixer_windows(&mut self, ctx: &egui::Context) {
+        if self.mixer.statistics {
+            egui::Window::new("Audio Engine")
+                .open(&mut self.mixer.statistics)
+                .default_width(500.0)
+                .show(ctx, |ui| {
+                    ui.label(format!("Status: {}", if self.audio_monitor.is_some() {
+                        "Headphone monitoring active"
+                    } else {
+                        "Headphone monitoring off"
+                    }));
+                    ui.label(format!("Sample Rate: {} Hz (mixer)", audio::RATE));
+                    ui.label(format!("Bit Rate: {} kb/s (16-bit stereo PCM)", audio::RATE * 16 * 2 / 1000));
+                    if let Some(error) = &self.mixer.last_error {
+                        ui.label(format!("Last monitor error: {error}"));
+                    }
+                    ui.separator();
+                    egui::ScrollArea::both().max_height(240.0).show(ui, |ui| {
+                        egui::Grid::new("audio-engine-inputs").striped(true).show(ui, |ui| {
+                            for label in ["Input", "Peak L", "Peak R", "Buffered", "Clock resyncs"] {
+                                ui.strong(label);
+                            }
+                            ui.end_row();
+                            for input in self.s.inputs.iter().filter(|input| input.kind.has_audio()) {
+                                ui.label(&input.title);
+                                for peak in input.level {
+                                    ui.label(if peak > 0.0 { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "−∞ dBFS".into() });
+                                }
+                                if let Some(buffer) = self.media.get(&input.id).and_then(|slot| slot.shared.as_ref())
+                                    .and_then(|source| source.audio.try_lock().ok())
+                                {
+                                    let (frames, resyncs) = buffer.diagnostics();
+                                    ui.label(format!("{:.0} ms", frames as f32 * 1000.0 / audio::RATE as f32));
+                                    ui.label(resyncs.to_string());
+                                } else {
+                                    ui.label("—");
+                                    ui.label("—");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+        }
+
+        let Some(target) = self.mixer.settings else { return };
+        let mut open = true;
+        match target {
+            MixerSettings::Master => {
+                egui::Window::new("Audio Settings — Master").open(&mut open).show(ctx, |ui| {
+                    ui.checkbox(&mut self.s.master_on, "Master audio");
+                    ui.add(egui::Slider::new(&mut self.s.master_volume, 0.0..=100.0).text("Master volume").suffix("%"));
+                    ui.add(egui::Slider::new(&mut self.mixer.headphones, 0.0..=100.0).text("Headphone volume").suffix("%"));
+                });
+            }
+            MixerSettings::Input(id) => {
+                if let Some(input) = self.s.input_mut(id) {
+                    egui::Window::new(format!("Audio Settings — {}", input.title))
+                        .id(egui::Id::new(("mixer-audio-settings", id)))
+                        .open(&mut open)
+                        .default_width(490.0)
+                        .default_height(215.0)
+                        .show(ctx, |ui| {
+                            input_audio(ui, input, (ctx.screen_rect().height() - 110.0).clamp(100.0, 215.0));
+                        });
+                } else {
+                    open = false;
+                }
+            }
+        }
+        if !open {
+            self.mixer.settings = None;
+        }
+    }
+}
+
+fn picture_audio_meter(painter: &egui::Painter, picture: egui::Rect, levels: [f32; 2]) {
+    let height = (picture.height() * 0.72).min(128.0);
+    if height < 26.0 || picture.width() < 28.0 {
+        return;
+    }
+    let width = (picture.width() * 0.035).clamp(5.0, 9.0);
+    let origin = picture.right_bottom() - Vec2::new(2.0 * width + 5.0, height + 5.0);
+    let backing = egui::Rect::from_min_size(origin - Vec2::splat(2.0), Vec2::new(2.0 * width + 5.0, height + 4.0));
+    painter.rect_filled(backing, 1.0, Color32::from_black_alpha(215));
+    for (index, level) in levels.into_iter().enumerate() {
+        let lane = egui::Rect::from_min_size(origin + Vec2::new(index as f32 * (width + 1.0), 0.0),
+            Vec2::new(width, height));
+        render::meter(painter, lane, meter_fraction(level));
+    }
+}
+
+fn meter_fraction(level: f32) -> f32 {
+    ((20.0 * level.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+fn headphone_knob(ui: &mut egui::Ui, volume: &mut f32) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(23.0), Sense::click_and_drag());
+    if response.dragged() {
+        *volume = (*volume - ui.input(|input| input.pointer.delta().y)).clamp(0.0, 100.0);
+    }
+    if response.has_focus() {
+        let step = ui.input(|input| {
+            i32::from(input.key_pressed(egui::Key::ArrowUp)) - i32::from(input.key_pressed(egui::Key::ArrowDown))
+        });
+        *volume = (*volume + step as f32).clamp(0.0, 100.0);
+    }
+    if response.double_clicked() {
+        *volume = 100.0;
+    }
+    let center = rect.center();
+    let angle = egui::lerp(0.75..=2.25, *volume / 100.0) * std::f32::consts::PI;
+    let pointer = Vec2::new(angle.cos(), angle.sin());
+    let style = ui.style().interact(&response);
+    ui.painter().circle(center, 10.0, style.bg_fill, style.bg_stroke);
+    ui.painter().line_segment([center, center + pointer * 7.5], Stroke::new(1.5_f32, TEXT));
+    response.on_hover_text(format!("Headphones {:.0}% · Drag up or down", *volume));
+}
+
+
+fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, master: [f32; 2], monitor: &mut bool, controls: &mut MixerControls) {
+    let width = (ctx.available_rect().width() / 3.0).clamp(260.0, 760.0);
     egui::SidePanel::right("mixer")
-        .exact_width(330.0)
-        .resizable(false)
-        .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::same(6)))
+        .default_width(width)
+        .width_range(240.0..=ctx.available_rect().width() * 0.55)
+        .frame(egui::Frame::new().fill(ctx.style().visuals.window_fill()).inner_margin(egui::Margin::same(3)))
         .show(ctx, |ui| {
-            ui.label(RichText::new("Audio Mixer").strong().color(Color32::WHITE));
-            ui.horizontal(|ui| {
-                ui.checkbox(monitor, "Monitor").on_hover_text("Listen through the system output. Use headphones when a microphone is live.");
-                egui::ComboBox::from_id_salt("audio-monitor-bus").selected_text(["Master", "A", "B"][usize::from(*bus)])
-                    .show_ui(ui, |ui| {
-                        for (index, label) in ["Master", "A", "B"].into_iter().enumerate() {
-                            ui.selectable_value(bus, index as u8, label);
+            let follow_id = ui.make_persistent_id("follow-input-category");
+            let mut follow = ui.data(|data| data.get_temp::<bool>(follow_id)).unwrap_or(false);
+            ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 18.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(" Audio Mixer ").strong()
+                    .color(Color32::WHITE).background_color(Color32::from_rgb(0, 100, 0))))
+                    .context_menu(|ui| {
+                        if ui.checkbox(&mut follow, "Follow input categories").changed() {
+                            ui.data_mut(|data| data.insert_temp(follow_id, follow));
+                            ui.close_menu();
                         }
                     });
             });
-            ui.add_space(2.0);
-            egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+            let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.0), Sense::hover());
+            ui.painter().rect_filled(line, 0.0, Color32::from_rgb(0, 100, 0));
+            let height = (ui.available_height() - 10.0).clamp(146.0, 190.0);
+            egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    // master strip
-                    strip(ui, "Master", &mut s.master_volume, &mut s.master_on, master, None);
-                    ui.separator();
-                    let ids: Vec<u32> = s.inputs.iter().filter(|i| i.kind.has_audio()).map(|i| i.id).collect();
-                    for id in ids {
-                        let level = levels.get(&id).copied().unwrap_or_default();
-                        let num = s.number_of(id);
-                        if let Some(i) = s.input_mut(id) {
-                            let name = format!("{} {}", num, i.title);
-                            let mut buses = [i.bus_m, i.bus_a, i.bus_b];
-                            strip(ui, &name, &mut i.volume, &mut i.audio_on, level, Some(&mut buses));
-                            i.bus_m = buses[0];
-                            i.bus_a = buses[1];
-                            i.bus_b = buses[2];
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if mixer_section(ui, "OUTPUTS", height) {
+                        let open = mixer_strip(ui, "Master", &mut s.master_volume, &mut s.master_on,
+                            master, None, height, Some((&mut *monitor, &mut *controls)));
+                        if open {
+                            controls.settings = Some(MixerSettings::Master);
+                        }
+                    }
+                    if mixer_section(ui, "INPUTS", height) {
+                        let category = if follow { s.filter } else { None };
+                        for (index, input) in s.inputs.iter_mut().enumerate()
+                            .filter(|(_, i)| i.kind.has_audio() && category.is_none_or(|c| i.category == Some(c)))
+                        {
+                            let name = format!("{} {}", index + 1, input.title);
+                            let strip = MixerInputControls {
+                                buses: [&mut input.bus_m, &mut input.bus_a, &mut input.bus_b],
+                                solo: &mut input.solo,
+                                solo_pfl: &mut input.solo_pfl,
+                                auto: &mut input.auto_mix_audio,
+                            };
+                            if mixer_strip(ui, &name, &mut input.volume, &mut input.audio_on, input.level,
+                                Some(strip), height, None)
+                            {
+                                controls.settings = Some(MixerSettings::Input(input.id));
+                            }
                         }
                     }
                 });
@@ -3313,43 +4101,127 @@ fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, levels: &std::collections:
         });
 }
 
-fn strip(ui: &mut egui::Ui, name: &str, vol: &mut f32, on: &mut bool, level: f32, buses: Option<&mut [bool; 3]>) {
-    ui.allocate_ui_with_layout(Vec2::new(66.0, ui.available_height()), egui::Layout::top_down(egui::Align::Center), |ui| {
-        ui.set_width(66.0);
-        let mut short: String = name.chars().take(10).collect();
-        if name.chars().count() > 10 {
-            short.push('…');
-        }
-        ui.label(RichText::new(short).size(10.5).color(TEXT));
-        let h = (ui.available_height() - 90.0).clamp(80.0, 260.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.spacing_mut().slider_width = h;
-            ui.add(egui::Slider::new(vol, 0.0..=100.0).vertical().show_value(false));
-            let (r, _) = ui.allocate_exact_size(Vec2::new(14.0, h), Sense::hover());
-            meter(ui.painter(), r, if *on { level } else { 0.0 });
+fn mixer_section(ui: &mut egui::Ui, name: &str, height: f32) -> bool {
+    let id = ui.make_persistent_id(name);
+    let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(true);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(22.0, height), Sense::click());
+    if response.on_hover_text(format!("{} {name}", if open { "Collapse" } else { "Expand" })).clicked() {
+        open = !open;
+        ui.data_mut(|data| data.insert_temp(id, open));
+    }
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, if open { Color32::from_rgb(0, 103, 169) } else { BTN });
+    let galley = p.layout_no_wrap(name.to_owned(), egui::FontId::proportional(11.0), Color32::WHITE);
+    let pos = rect.center() + Vec2::new(-galley.size().y / 2.0, galley.size().x / 2.0);
+    p.add(egui::epaint::TextShape::new(pos, galley, Color32::WHITE)
+        .with_angle(-std::f32::consts::FRAC_PI_2));
+    open
+}
+
+struct MixerInputControls<'a> {
+    buses: [&'a mut bool; 3],
+    solo: &'a mut bool,
+    solo_pfl: &'a mut bool,
+    auto: &'a mut bool,
+}
+
+fn mixer_strip(ui: &mut egui::Ui, name: &str, volume: &mut f32, on: &mut bool, levels: [f32; 2],
+    input: Option<MixerInputControls<'_>>, height: f32, monitor: Option<(&mut bool, &mut MixerControls)>) -> bool
+{
+    let master = input.is_none();
+    let mut input = input;
+    let mut monitor = monitor;
+    let width = 98.0;
+    egui::Frame::new().fill(Color32::from_rgb(13, 18, 23)).inner_margin(2).show(ui, |ui| ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
+        let header = if master { Color32::from_rgb(0, 100, 0) } else { BTN };
+        let (title, _) = ui.allocate_exact_size(Vec2::new(width, 17.0), Sense::hover());
+        ui.painter().rect_filled(title, 0.0, header);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(title).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| {
+            ui.add(egui::Label::new(RichText::new(name).size(11.0).strong().color(Color32::WHITE))
+                .truncate()).on_hover_text(name);
         });
-        ui.label(RichText::new(format!("{:.0}", vol)).size(10.0).color(TEXT_DIM));
-        let b = egui::Button::new(RichText::new(if *on { "On" } else { "Muted" }).size(10.5).color(Color32::BLACK))
-            .fill(if *on { Color32::from_rgb(0x4c, 0xc0, 0x50) } else { Color32::from_rgb(0xd0, 0x40, 0x40) })
-            .min_size(Vec2::new(56.0, 18.0));
-        if ui.add(b).clicked() {
-            *on = !*on;
-        }
-        if let Some(bs) = buses {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for (k, n) in ["M", "A", "B"].iter().enumerate() {
-                    let b = egui::Button::new(RichText::new(*n).size(10.0).color(if bs[k] { Color32::BLACK } else { TEXT }))
-                        .fill(if bs[k] { Color32::from_rgb(0x50, 0x9a, 0xe0) } else { BTN })
-                        .min_size(Vec2::new(18.0, 16.0));
-                    if ui.add(b).on_hover_text("Send this Inputs audio to this bus").clicked() {
-                        bs[k] = !bs[k];
+        let meter_height = height - 48.0;
+        let mut settings = false;
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.add_space(13.0);
+                settings = ui.add_sized([24.0, 24.0], egui::Button::new("⚙"))
+                    .on_hover_text("Audio settings").clicked();
+                if let Some((_, controls)) = monitor.as_mut() {
+                    ui.add_space((meter_height - 90.0).max(0.0));
+                    if ui.add_sized([24.0, 24.0], egui::Button::new("i")).on_hover_text("Audio Engine statistics").clicked() {
+                        controls.statistics = true;
+                    }
+                } else if let Some(input) = input.as_mut() {
+                    ui.add_space((meter_height - 113.0).max(0.0));
+                    let solo = ui.add_sized([24.0, 19.0], egui::Button::new("S").selected(*input.solo))
+                        .on_hover_text("Solo in headphones");
+                    solo.context_menu(|ui| {
+                        if ui.checkbox(input.solo_pfl, "Solo PFL (pre-fader)").changed() {
+                            ui.close_menu();
+                        }
+                    });
+                    if solo.clicked() {
+                        *input.solo = !*input.solo;
+                    }
+                    if ui.add_sized([24.0, 19.0], egui::Button::new("↔").selected(*input.auto))
+                        .on_hover_text("Automatically mix audio with Program").clicked()
+                    {
+                        *input.auto = !*input.auto;
                     }
                 }
+                if ui.add_sized([24.0, 24.0], egui::Button::new(if *on { "♪" } else { "×" })
+                    .fill(if *on { Color32::from_rgb(0, 100, 0) } else { BTN }))
+                    .on_hover_text(if *on { "Mute" } else { "Unmute" }).clicked()
+                {
+                    *on = !*on;
+                }
             });
-        }
-    });
+            let (scale, _) = ui.allocate_exact_size(Vec2::new(8.0, meter_height), Sense::hover());
+            let p = ui.painter();
+            for tick in 0..=10 {
+                let y = egui::lerp((scale.top() + 6.0)..=(scale.bottom() - 6.0), tick as f32 / 10.0);
+                let length = if tick % 5 == 0 { 6.0 } else { 3.0 };
+                p.hline((scale.right() - length)..=scale.right(), y, Stroke::new(1.0_f32, TEXT_DIM));
+            }
+            ui.spacing_mut().slider_width = meter_height;
+            ui.spacing_mut().slider_rail_height = 3.0;
+            ui.add(egui::Slider::new(volume, 0.0..=100.0).vertical().show_value(false)
+                .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.48 }))
+                .on_hover_text(format!("Volume {:.0}%", *volume));
+            for (label, level) in ["Left", "Right"].into_iter().zip(levels) {
+                let (r, hover) = ui.allocate_exact_size(Vec2::new(10.0, meter_height), Sense::hover());
+                let db = 20.0 * level.log10();
+                render::meter(ui.painter(), r, meter_fraction(level));
+                hover.on_hover_text(if level > 0.0 { format!("{label} {db:.1} dBFS") } else { format!("{label} −∞ dBFS") });
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(input) = input {
+                for ((name, bus), enabled) in [("M", "Master"), ("A", "Bus A"), ("B", "Bus B")].into_iter().zip(input.buses) {
+                    if ui.add_sized([25.0, 18.0], egui::Button::new(name).selected(*enabled))
+                        .on_hover_text(format!("Route to {bus}")).clicked() { *enabled = !*enabled; }
+                }
+            } else if let Some((monitor, controls)) = monitor {
+                if ui.add_sized([25.0, 18.0], egui::Button::new("HP").selected(*monitor))
+                    .on_hover_text("Headphone monitoring through the system output").clicked()
+                {
+                    *monitor = !*monitor;
+                }
+                headphone_knob(ui, &mut controls.headphones);
+                egui::ComboBox::from_id_salt("audio-monitor-bus").width(35.0)
+                    .selected_text(["M", "A", "B"][usize::from(controls.bus)])
+                    .show_ui(ui, |ui| {
+                        for (index, label) in ["Master", "A", "B"].into_iter().enumerate() {
+                            ui.selectable_value(&mut controls.bus, index as u8, label);
+                        }
+                    });
+            }
+        });
+        settings
+    }).inner).inner
 }
 
 // ---------------------------------------------------------------- bottom bar
@@ -3435,7 +4307,10 @@ fn bottom_bar(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                     if big_btn(ui, "Snapshot", false, None).on_hover_text("Take image snapshot of Output (saved in Pictures\\LiveMix)").clicked() {
                         s.snapshot_req = true;
                     }
-                    if big_btn(ui, "Replay", s.replay_arm, None).clicked() { s.replay_open = true; }
+                    if big_btn(ui, "Replay", s.replay_arm, None).clicked() {
+                        s.replay_open = true;
+                        s.replay_setup_open = s.replay_session.is_empty();
+                    }
                     if big_btn(ui, "Audio Mixer", s.show_mixer, Some(Color32::from_rgb(0x00, 0x64, 0x00))).on_hover_text("Show or hide audio mixer pane").clicked() {
                         s.show_mixer = !s.show_mixer;
                     }
@@ -3662,6 +4537,7 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize, u32, Stri
             Kind::Title { .. } => "Title",
             Kind::GtTitle { .. } => "GT Title",
             Kind::Clock => "Production Clock",
+            Kind::AudioFile { .. } => "Audio",
             Kind::Camera(_) => "Test Camera",
             Kind::Video { .. } => "Test Video",
             Kind::Image(_) => "Test Image",
@@ -3669,8 +4545,8 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize, u32, Stri
         ui.label(kind);
         ui.end_row();
         let file = match &inp.kind {
-            Kind::VideoFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. }
-            | Kind::Replay { path } => Some(path.clone()),
+            Kind::VideoFile { path } | Kind::AudioFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. }
+            | Kind::Replay { path, .. } => Some(path.clone()),
             Kind::Photos { folder } | Kind::ImageSequence { folder } => Some(folder.clone()),
             _ => None,
         };
@@ -3839,17 +4715,17 @@ fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize, u32, Stri
     }
     ui.separator();
     // chkMirror / chkSharpen / chkDeinterlace, the transition options and chkFlatten.
-    ui.checkbox(&mut inp.mirror, "Mirror");
-    ui.checkbox(&mut inp.sharpen, "Sharpen").on_hover_text("Sharpen capture inputs");
-    ui.checkbox(&mut inp.deinterlace, "Deinterlace Blend").on_hover_text("Blend fields of interlaced sources");
+    setting_toggle(ui, &mut inp.mirror, "Mirror");
+    setting_toggle(ui, &mut inp.sharpen, "Sharpen").on_hover_text("Sharpen capture inputs");
+    setting_toggle(ui, &mut inp.deinterlace, "Deinterlace Blend").on_hover_text("Blend fields of interlaced sources");
     if inp.kind.playable() {
-        ui.checkbox(&mut inp.loop_on, "Loop");
+        setting_toggle(ui, &mut inp.loop_on, "Loop");
     }
-    ui.checkbox(&mut inp.play_active, "Automatically Play with Transition");
-    ui.checkbox(&mut inp.pause_preview, "Automatically Pause after Transition");
-    ui.checkbox(&mut inp.restart_active, "Automatically Restart with Transition");
-    ui.checkbox(&mut inp.auto_mix_audio, "Automatically mix audio");
-    ui.checkbox(&mut inp.flatten, "Flatten Layers").on_hover_text("Render the layers into one picture");
+    setting_toggle(ui, &mut inp.play_active, "Automatically Play with Transition");
+    setting_toggle(ui, &mut inp.pause_preview, "Automatically Pause after Transition");
+    setting_toggle(ui, &mut inp.restart_active, "Automatically Restart with Transition");
+    setting_toggle(ui, &mut inp.auto_mix_audio, "Automatically mix audio");
+    setting_toggle(ui, &mut inp.flatten, "Flatten Layers").on_hover_text("Render the layers into one picture");
     ui.horizontal(|ui| {
         ui.label("Aspect Ratio");
         egui::ComboBox::from_id_salt(("in-aspect", inp.id)).width(140.0)
@@ -3958,7 +4834,7 @@ fn input_colour_key(ui: &mut egui::Ui, inp: &mut Input) {
         ui.label(RichText::new("Colour keying works on cameras, video files, lists and desktop capture.").color(TEXT_DIM));
         return;
     }
-    ui.checkbox(&mut inp.key.on, "Chroma Key (remove this colour)");
+    setting_toggle(ui, &mut inp.key.on, "Chroma Key (remove this colour)");
     ui.horizontal(|ui| {
         ui.label("Key colour");
         ui.color_edit_button_srgb(&mut inp.key.colour);
@@ -4077,8 +4953,8 @@ fn input_colour_correction(ui: &mut egui::Ui, inp: &mut Input) {
         }
     });
     ui.add_space(4.0);
-    ui.checkbox(&mut inp.rec601, "Rec. 601 to 709").on_hover_text("Correct SD colour space sources");
-    ui.checkbox(&mut inp.premultiplied, "Premultiplied Alpha");
+    setting_toggle(ui, &mut inp.rec601, "Rec. 601 to 709").on_hover_text("Correct SD colour space sources");
+    setting_toggle(ui, &mut inp.premultiplied, "Premultiplied Alpha");
     ui.add_space(6.0);
     colour_ramp(ui, *adj);
 }
@@ -4089,7 +4965,7 @@ fn input_colour_correction(ui: &mut egui::Ui, inp: &mut Input) {
 fn input_effects(ui: &mut egui::Ui, inp: &mut Input, page: &mut usize) {
     let sel_id = egui::Id::new(("effects-sel", inp.id));
     let mut sel: usize = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0).min(5);
-    ui.checkbox(&mut inp.effects_source, "Use Source Settings")
+    setting_toggle(ui, &mut inp.effects_source, "Use Source Settings")
         .on_hover_text("Use the render effects configured on the source input.");
     if inp.effects_source {
         ui.label(RichText::new("The input uses the source's render effects; clear the box to edit its own.")
@@ -4104,14 +4980,14 @@ fn input_effects(ui: &mut egui::Ui, inp: &mut Input, page: &mut usize) {
                     sel = k;
                 }
                 match k {
-                    0 => { ui.checkbox(&mut inp.mirror, "On"); }
-                    1 => { ui.checkbox(&mut inp.sharpen, "On"); }
-                    2 => { ui.checkbox(&mut inp.deinterlace, "On"); }
+                    0 => { setting_toggle(ui, &mut inp.mirror, "On"); }
+                    1 => { setting_toggle(ui, &mut inp.sharpen, "On"); }
+                    2 => { setting_toggle(ui, &mut inp.deinterlace, "On"); }
                     3 => {
                         let on = inp.colour_adjust != ColourAdjust::default();
                         ui.label(RichText::new(if on { "Configured" } else { "Off" }).size(10.0).color(TEXT_DIM));
                     }
-                    4 => { ui.checkbox(&mut inp.key.on, "On"); }
+                    4 => { setting_toggle(ui, &mut inp.key.on, "On"); }
                     _ => {
                         let on = inp.place != Position::default();
                         ui.label(RichText::new(if on { "Configured" } else { "Default" }).size(10.0).color(TEXT_DIM));
@@ -4125,15 +5001,15 @@ fn input_effects(ui: &mut egui::Ui, inp: &mut Input, page: &mut usize) {
     ui.label(RichText::new(format!("{} properties", names[sel])).strong());
     match sel {
         0 => {
-            ui.checkbox(&mut inp.mirror, "Mirror the picture horizontally");
+            setting_toggle(ui, &mut inp.mirror, "Mirror the picture horizontally");
             ui.label(RichText::new("Also on General (chkMirror).").size(10.0).color(TEXT_DIM));
         }
         1 => {
-            ui.checkbox(&mut inp.sharpen, "Sharpen the picture");
+            setting_toggle(ui, &mut inp.sharpen, "Sharpen the picture");
             ui.label(RichText::new("Also on General (chkSharpen).").size(10.0).color(TEXT_DIM));
         }
         2 => {
-            ui.checkbox(&mut inp.deinterlace, "Deinterlace Blend");
+            setting_toggle(ui, &mut inp.deinterlace, "Deinterlace Blend");
             ui.label(RichText::new("Blends the fields of interlaced sources; also on General.")
                 .size(10.0).color(TEXT_DIM));
         }
@@ -4147,7 +5023,7 @@ fn input_effects(ui: &mut egui::Ui, inp: &mut Input, page: &mut usize) {
         }
         4 => {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut inp.key.on, "Enable");
+                setting_toggle(ui, &mut inp.key.on, "Enable");
                 ui.color_edit_button_srgb(&mut inp.key.colour);
                 ui.label("Key colour");
             });
@@ -4267,24 +5143,24 @@ fn dynamics_graph(ui: &mut egui::Ui, fx: &mut crate::audio::Effects) {
     }
 }
 
-/// The Audio section: volume fader, dBFS meter, graphic EQ and dynamics graphs with their
-/// numeric controls. vMix keeps these in the Audio Mixer; here they sit with the input.
-fn input_audio(ui: &mut egui::Ui, inp: &mut Input) {
+fn input_audio_general(ui: &mut egui::Ui, inp: &mut Input) {
     if !inp.kind.has_audio() {
         ui.label(RichText::new("This input has no audio. Video, camera, list, audio file and stream inputs do.")
             .color(TEXT_DIM));
         return;
     }
-    let level = if inp.audio_on { inp.level } else { 0.0 };
+    let levels = if inp.audio_on { inp.level } else { [0.0; 2] };
     ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(Vec2::new(46.0, 200.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+        ui.allocate_ui_with_layout(Vec2::new(46.0, 152.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.label(RichText::new("Volume").size(10.0).color(TEXT_DIM));
-            ui.spacing_mut().slider_width = 150.0;
+            ui.spacing_mut().slider_width = 112.0;
             ui.add(egui::Slider::new(&mut inp.volume, 0.0..=100.0).vertical().show_value(true));
         });
-        let (meter_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 168.0), Sense::hover());
-        render::meter(ui.painter(), meter_rect, level);
-        let (scale_rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 168.0), Sense::hover());
+        for level in levels {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 136.0), Sense::hover());
+            render::meter(ui.painter(), rect, meter_fraction(level));
+        }
+        let (scale_rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 136.0), Sense::hover());
         {
             let p = ui.painter_at(scale_rect);
             for db in [0.0f32, -6.0, -12.0, -18.0, -24.0, -36.0, -48.0] {
@@ -4342,11 +5218,45 @@ fn input_audio(ui: &mut egui::Ui, inp: &mut Input) {
                     fx.pan = 0.0;
                 }
             });
-            ui.label(RichText::new("Audio processing is applied to the Program mix.").size(10.0).color(TEXT_DIM));
+            setting_toggle(ui, &mut inp.auto_mix_audio, "Automatically mix audio");
+            setting_toggle(ui, &mut inp.solo_pfl, "Solo PFL (pre-fader)");
         });
     });
+}
+
+fn input_audio(ui: &mut egui::Ui, input: &mut Input, page_height: f32) {
+    let id = ui.make_persistent_id(("audio-settings-page", input.id));
+    let mut page = ui.data(|data| data.get_temp::<usize>(id)).unwrap_or_default();
+    ui.horizontal_wrapped(|ui| {
+        for (index, name) in ["General", "EQ", "Compressor", "Noise Gate"].into_iter().enumerate() {
+            ui.selectable_value(&mut page, index, name);
+        }
+    });
+    ui.data_mut(|data| data.insert_temp(id, page));
     ui.separator();
-    ui.label(RichText::new("Graphic EQ").strong());
+    egui::ScrollArea::vertical().id_salt(page).max_height(page_height).show(ui, |ui| match page {
+        1 => input_audio_eq(ui, input),
+        2 => {
+            dynamics_graph(ui, &mut input.audio_effects);
+            ui.add(egui::Slider::new(&mut input.audio_effects.comp_threshold, -60.0..=0.0).text("Threshold").suffix(" dBFS"));
+            ui.add(egui::Slider::new(&mut input.audio_effects.comp_ratio, 1.0..=20.0).text("Ratio").suffix(":1"));
+            if ui.button("Reset").clicked() {
+                let defaults = audio::Effects::default();
+                input.audio_effects.comp_threshold = defaults.comp_threshold;
+                input.audio_effects.comp_ratio = defaults.comp_ratio;
+            }
+        }
+        3 => {
+            ui.add(egui::Slider::new(&mut input.audio_effects.gate_threshold, -90.0..=0.0).text("Threshold").suffix(" dBFS"));
+            if ui.button("Reset").clicked() {
+                input.audio_effects.gate_threshold = audio::Effects::default().gate_threshold;
+            }
+        }
+        _ => input_audio_general(ui, input),
+    });
+}
+
+fn input_audio_eq(ui: &mut egui::Ui, inp: &mut Input) {
     eq_graph(ui, &mut inp.audio_effects.eq);
     egui::Grid::new(("eq-bands", inp.id)).num_columns(4).spacing([8.0, 2.0]).show(ui, |ui| {
         for (index, frequency) in dsp::EQ_BANDS.into_iter().enumerate() {
@@ -4358,24 +5268,11 @@ fn input_audio(ui: &mut egui::Ui, inp: &mut Input) {
             }
         }
     });
-    ui.separator();
-    ui.label(RichText::new("Dynamics").strong());
-    dynamics_graph(ui, &mut inp.audio_effects);
-    egui::Grid::new(("dynamics", inp.id)).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-        ui.label("Noise gate");
-        ui.add(egui::Slider::new(&mut inp.audio_effects.gate_threshold, -90.0..=0.0).suffix(" dBFS"));
-        ui.end_row();
-        ui.label("Compressor threshold");
-        ui.add(egui::Slider::new(&mut inp.audio_effects.comp_threshold, -60.0..=0.0).suffix(" dBFS"));
-        ui.end_row();
-        ui.label("Compressor ratio");
-        ui.add(egui::Slider::new(&mut inp.audio_effects.comp_ratio, 1.0..=20.0).suffix(":1"));
-        ui.end_row();
-    });
-    if ui.button("Reset audio effects").clicked() {
-        inp.audio_effects = Default::default();
+    if ui.button("Reset EQ").clicked() {
+        inp.audio_effects.eq = audio::Effects::default().eq;
     }
 }
+
 
 /// Tally Lights: the input's own tally colour, plus the original's notes.
 fn input_tally(ui: &mut egui::Ui, inp: &mut Input, number: usize) {
@@ -4384,7 +5281,7 @@ fn input_tally(ui: &mut egui::Ui, inp: &mut Input, number: usize) {
         .size(11.0).color(TEXT_DIM));
     let mut custom = inp.tally_colour.is_some();
     let mut colour = inp.tally_colour.unwrap_or([0xff, 0x9a, 0x1a]);
-    if ui.checkbox(&mut custom, "Use a custom tally colour").changed() {
+    if setting_toggle(ui, &mut custom, "Use a custom tally colour").changed() {
         inp.tally_colour = custom.then_some(colour);
     }
     ui.horizontal(|ui| {
@@ -4498,7 +5395,7 @@ fn layers_editor(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize, u32, Stri
                     sel = k;
                 }
                 let l = &mut inp.layers[k];
-                ui.checkbox(&mut l.on, "On");
+                setting_toggle(ui, &mut l.on, "On");
                 let cur = l.input.and_then(|id| others.iter().find(|o| o.1 == id))
                     .map(|o| format!("{} {}", o.0, o.2)).unwrap_or_else(|| "None".into());
                 egui::ComboBox::from_id_salt(("layer-in", inp.id, k)).width(210.0)
@@ -4641,7 +5538,7 @@ fn layers_editor(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize, u32, Stri
             }
         }
         2 => {
-            ui.checkbox(&mut l.border, "Border");
+            setting_toggle(ui, &mut l.border, "Border");
             ui.horizontal(|ui| {
                 ui.label("Colour");
                 ui.color_edit_button_srgb(&mut l.border_colour);
@@ -4722,7 +5619,7 @@ const SETTINGS_PAGES: [&str; 17] = [
     "Streaming",
 ];
 /// Sections built in this version (indexes into SETTINGS_PAGES).
-const SETTINGS_BUILT: [usize; 13] = [0, 1, 2, 3, 5, 6, 7, 9, 11, 13, 14, 15, 16];
+const SETTINGS_BUILT: [usize; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 14, 15, 16];
 
 fn settings_navigation(ui: &mut egui::Ui, pages: &[&str], built: &[usize], groups: &[(&str, &[usize])],
     selected: &mut usize, max_height: f32)
@@ -5052,6 +5949,10 @@ fn multiview_settings(ui: &mut egui::Ui, s: &mut Switcher) {
             s.cfg.mv_boxes[mv].clear();
         }
     });
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut s.cfg.mv_audio_program[mv], "Program audio meter");
+        ui.checkbox(&mut s.cfg.mv_audio_inputs[mv], "Input audio meters");
+    });
     ui.horizontal_top(|ui| {
         // Live picture of this MultiView.
         let (r, _) = ui.allocate_exact_size(Vec2::new(256.0, 144.0), Sense::hover());
@@ -5091,6 +5992,13 @@ fn multiview_settings(ui: &mut egui::Ui, s: &mut Switcher) {
     ui.label(RichText::new("Show a MultiView by choosing it as the Source of Fullscreen or External.").size(11.0).color(TEXT_DIM));
 }
 
+fn edit_tally_colour(ui: &mut egui::Ui, colour: &mut Color32) {
+    let mut rgb = [colour.r(), colour.g(), colour.b()];
+    if ui.color_edit_button_srgb(&mut rgb).changed() {
+        *colour = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    }
+}
+
 fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, encoder: &str, program_path: &str) {
     let page = s.cfg.page.min(SETTINGS_PAGES.len() - 1);
     ui.label(RichText::new(SETTINGS_PAGES[page]).strong().size(15.0).color(Color32::WHITE));
@@ -5116,7 +6024,7 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
                             ui.selectable_value(&mut s.cfg.out_rate, k as u8, *name);
                         }
                     });
-                    ui.checkbox(&mut s.cfg.interlaced, "Interlaced");
+                    setting_toggle(ui, &mut s.cfg.interlaced, "Interlaced");
                 });
                 ui.end_row();
                 ui.label("Output Format:");
@@ -5135,67 +6043,87 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
                 });
                 ui.end_row();
                 ui.label("Preview Colour:");
-                ui.label(RichText::new("DarkOrange").color(PREVIEW));
+                ui.horizontal(|ui| {
+                    edit_tally_colour(ui, &mut s.cfg.preview_colour);
+                    if ui.small_button("Reset").clicked() { s.cfg.preview_colour = PREVIEW; }
+                });
                 ui.end_row();
                 ui.label("Output Colour:");
-                ui.label(RichText::new("DarkGreen").color(Color32::from_rgb(0x30, 0xc0, 0x30)));
+                ui.horizontal(|ui| {
+                    edit_tally_colour(ui, &mut s.cfg.output_colour);
+                    if ui.small_button("Reset").clicked() { s.cfg.output_colour = OUTPUT; }
+                });
                 ui.end_row();
                 ui.label("Theme:");
                 egui::ComboBox::from_id_salt("interface-theme")
-                    .selected_text(if s.cfg.theme == InterfaceTheme::Modern { "Modern" } else { "Classic" })
+                    .selected_text(s.cfg.theme.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut s.cfg.theme, InterfaceTheme::Classic, "Classic");
-                        ui.selectable_value(&mut s.cfg.theme, InterfaceTheme::Modern, "Modern");
+                        for theme in InterfaceTheme::ALL { ui.selectable_value(&mut s.cfg.theme, theme, theme.label()); }
                     });
                 ui.end_row();
             });
             ui.add_space(6.0);
-            // Fullscreen (frmSettings lblFullscreen / lblOutputScreen "Display:").
-            ui.label(RichText::new("Fullscreen:").strong());
-            egui::Grid::new("set-fs").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Source:");
-                let cur = src_name(s, s.cfg.fs_source);
-                let choices = src_choices(s, true);
-                egui::ComboBox::from_id_salt("fs-src").width(240.0).selected_text(cur).show_ui(ui, |ui| {
-                    for (v, name) in choices {
-                        ui.selectable_value(&mut s.cfg.fs_source, v, name);
-                    }
-                });
-                ui.end_row();
-                ui.label("Display:");
-                let mons = screens();
-                let cur = (s.cfg.fs_display as usize).min(mons.len() - 1);
-                let mname = |k: usize, m: &[i32; 4]| format!("Screen {} — {}x{}{}", k + 1, m[2], m[3], if k == 0 { " (main)" } else { "" });
-                egui::ComboBox::from_id_salt("fs-display").width(240.0).selected_text(mname(cur, &mons[cur])).show_ui(ui, |ui| {
-                    for (k, m) in mons.iter().enumerate() {
-                        if ui.selectable_label(k == cur, mname(k, m)).clicked() {
-                            s.cfg.fs_display = k as u8;
-                        }
-                    }
-                });
-                ui.end_row();
-            });
+            let fullscreen_tab = ui.id().with("fullscreen-tab");
+            let mut slot = ui.data(|data| data.get_temp::<usize>(fullscreen_tab)).unwrap_or(0);
             ui.horizontal(|ui| {
-                ui.checkbox(&mut s.cfg.fs_overlays, "Overlays");
-                if ui.button(if s.fullscreen { "Turn Fullscreen off" } else { "Turn Fullscreen on" }).clicked() {
-                    s.fullscreen = !s.fullscreen;
+                for index in 0..2 {
+                    ui.selectable_value(&mut slot, index, format!("Fullscreen {}", index + 1));
                 }
-                ui.label(RichText::new("Esc or a double-click leaves it").size(11.0).color(TEXT_DIM));
+            });
+            ui.data_mut(|data| data.insert_temp(fullscreen_tab, slot));
+            let mons = screens();
+            let choices = src_choices(s, true);
+            ui.push_id(("fullscreen-settings", slot), |ui| {
+                    egui::Grid::new("set-fs").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Source");
+                        let label = src_name(s, s.cfg.fs_source[slot]);
+                        egui::ComboBox::from_id_salt("source").width(235.0).selected_text(label).show_ui(ui, |ui| {
+                            for (value, name) in &choices {
+                                ui.selectable_value(&mut s.cfg.fs_source[slot], *value, name);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Monitor");
+                        let current = fullscreen_display(s.cfg.fs_display[slot], mons.len());
+                        let label = |k: usize| format!("Screen {} · {}×{}{}", k + 1, mons[k][2], mons[k][3],
+                            if k == 0 { " (main)" } else { "" });
+                        egui::ComboBox::from_id_salt("monitor").width(235.0).selected_text(label(current)).show_ui(ui, |ui| {
+                            for index in 0..mons.len() {
+                                if ui.selectable_label(index == current, label(index)).clicked() {
+                                    let other = 1 - slot;
+                                    if s.fullscreen[slot] && s.fullscreen[other]
+                                        && fullscreen_display(s.cfg.fs_display[other], mons.len()) == index
+                                    {
+                                        s.notice("This monitor is already used by the other Fullscreen output");
+                                    } else {
+                                        s.cfg.fs_display[slot] = index;
+                                    }
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        setting_toggle(ui, &mut s.cfg.fs_overlays[slot], "Overlays");
+                        let action = if s.fullscreen[slot] { "Turn off" } else { "Turn on" };
+                        if ui.button(action).clicked() { toggle_fullscreen(s, slot); }
+                    });
             });
             ui.separator();
             multiview_settings(ui, s);
             ui.separator();
-            ui.checkbox(&mut s.cfg.input_numbers, "Show Input Numbers");
-            ui.checkbox(&mut s.cfg.master_meter, "Show Master Audio Meter in Main Window");
-            ui.checkbox(&mut s.cfg.input_meter, "Show Audio Meter next to Inputs");
+            setting_toggle(ui, &mut s.cfg.input_numbers, "Show Input Numbers");
+            setting_toggle(ui, &mut s.cfg.production_clock, "Show Production Clock");
+            setting_toggle(ui, &mut s.cfg.master_meter, "Show Master Audio Meter in Main Window");
+            setting_toggle(ui, &mut s.cfg.input_meter, "Show Audio Meter next to Inputs");
             ui.separator();
             ui.label(RichText::new("Transition Display:").strong());
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut s.cfg.show_quickplay, "QuickPlay");
-                ui.checkbox(&mut s.cfg.show_trans24, "Transitions 2-4");
-                ui.checkbox(&mut s.cfg.show_ftb, "FTB");
-                ui.checkbox(&mut s.cfg.show_tbar, "T-Bar");
-                ui.checkbox(&mut s.cfg.show_overlays, "Overlay");
+                setting_toggle(ui, &mut s.cfg.show_quickplay, "QuickPlay");
+                setting_toggle(ui, &mut s.cfg.show_trans24, "Transitions 2-4");
+                setting_toggle(ui, &mut s.cfg.show_ftb, "FTB");
+                setting_toggle(ui, &mut s.cfg.show_tbar, "T-Bar");
+                setting_toggle(ui, &mut s.cfg.show_overlays, "Overlay");
             });
         }
         2 => {
@@ -5219,22 +6147,23 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
                 ui.end_row();
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut s.ftb_audio, "Fade To Black includes Audio");
-            ui.checkbox(&mut s.pause_preview, "Automatically Pause Preview Input after Transition");
-            ui.checkbox(&mut s.play_active, "Automatically Play Output Input with Transition");
-            ui.checkbox(&mut s.restart_active, "Automatically Restart Output Input with Transition");
-            ui.checkbox(&mut s.cfg.preview_click, "Activate QuickPlay by clicking Preview Window");
-            ui.checkbox(&mut s.cfg.recording_confirm, "Display confirmation for Record, External, Stream and MultiCorder buttons");
-            ui.checkbox(&mut s.cfg.input_close_confirm, "Display confirmation for Input Close button");
+            setting_toggle(ui, &mut s.ftb_audio, "Fade To Black includes Audio");
+            setting_toggle(ui, &mut s.pause_preview, "Automatically Pause Preview Input after Transition");
+            setting_toggle(ui, &mut s.play_active, "Automatically Play Output Input with Transition");
+            setting_toggle(ui, &mut s.restart_active, "Automatically Restart Output Input with Transition");
+            setting_toggle(ui, &mut s.cfg.preview_click, "Activate QuickPlay by clicking Preview Window");
+            setting_toggle(ui, &mut s.cfg.recording_confirm, "Display confirmation for Record, External, Stream and MultiCorder buttons");
+            setting_toggle(ui, &mut s.cfg.input_close_confirm, "Display confirmation for Input Close button");
             ui.separator();
-            ui.checkbox(&mut s.cfg.start_maximised, "Start Maximised");
-            ui.checkbox(&mut s.cfg.start_fullscreen, "Start Fullscreen display");
-            ui.checkbox(&mut s.cfg.start_external, "Start External Output");
+            setting_toggle(ui, &mut s.cfg.start_maximised, "Start Maximised");
+            setting_toggle(ui, &mut s.cfg.start_fullscreen, "Start Fullscreen 1");
+            setting_toggle(ui, &mut s.cfg.start_fullscreen2, "Start Fullscreen 2");
+            setting_toggle(ui, &mut s.cfg.start_external, "Start External Output");
         }
         3 => {
             // Performance (names from frmSettings: lblPreviewSkip, chkLockBackBuffer,
             // chkDisableInputEffects; hardware encoder = recording key "HardwareAcceleration").
-            egui::Grid::new("set-perf").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            egui::Grid::new("set-perf").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
                 ui.label("Preview Skip:");
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("perf-skip").selected_text(if s.cfg.preview_skip <= 1 { "None".to_string() } else { format!("Every {} frames", s.cfg.preview_skip) }).show_ui(ui, |ui| {
@@ -5255,10 +6184,15 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
                 ui.end_row();
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut s.cfg.lock_refresh, "Synchronize interface with display refresh")
+            setting_toggle(ui, &mut s.cfg.network_thumbnails, "Show NDI/OMT thumbnails when browsing sources");
+            if cfg!(windows) {
+                setting_toggle(ui, &mut s.cfg.low_latency_capture, "Low Latency Capture")
+                    .on_hover_text("Request the Media Foundation low-latency mode for local camera inputs.");
+            }
+            setting_toggle(ui, &mut s.cfg.lock_refresh, "Synchronize interface with display refresh")
                 .on_hover_text("The video clock always follows the Master Frame Rate.");
-            ui.checkbox(&mut s.cfg.no_input_effects, "Disable Effects on Input Previews (input boxes skip position, crop and layers)");
-            ui.checkbox(&mut s.cfg.hw_encoder, "Use Hardware Encoder for recordings (when available for the selected codec)");
+            setting_toggle(ui, &mut s.cfg.no_input_effects, "Disable Effects on Input Previews (input boxes skip position, crop and layers)");
+            setting_toggle(ui, &mut s.cfg.hw_encoder, "Use Hardware Encoder for recordings (when available for the selected codec)");
             ui.separator();
             ui.label(format!("Graphics adapter: {graphics_adapter}"));
             #[cfg(windows)]
@@ -5284,6 +6218,36 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
             ui.label(format!("Program encoder: {encoder}"));
             ui.add_space(4.0);
             ui.label(RichText::new("Lower camera modes (Input Settings > General) and a lower Output Size also save work.").size(11.0).color(TEXT_DIM));
+        }
+        4 => {
+            ui.strong("File decoding");
+            if cfg!(windows) {
+                setting_toggle(ui, &mut s.cfg.ffmpeg_all_files, "Use FFmpeg for all video files");
+                ui.add_enabled_ui(!s.cfg.ffmpeg_all_files, |ui| {
+                    ui.label("Use FFmpeg for these extensions");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut s.cfg.ffmpeg_extensions)
+                            .hint_text("*.mov, *.qt, *.mxf, *.mp4").desired_width(230.0));
+                        if ui.button("Common formats").clicked() {
+                            s.cfg.ffmpeg_extensions = "*.mov,*.qt,*.mxf,*.mp4".into();
+                        }
+                    });
+                    ui.label("Other video files use Windows Media Foundation.");
+                });
+            } else {
+                ui.label("Video files use FFmpeg on macOS.");
+            }
+            ui.separator();
+            ui.label("FFmpeg deinterlacing");
+            let methods = ["Off", "BWDIF", "YADIF"];
+            egui::ComboBox::from_id_salt("decoder-deinterlace")
+                .selected_text(methods[usize::from(s.cfg.decoder_deinterlace.min(2))])
+                .show_ui(ui, |ui| {
+                    for (index, method) in methods.into_iter().enumerate() {
+                        ui.selectable_value(&mut s.cfg.decoder_deinterlace, index as u8, method);
+                    }
+                });
+            ui.label(RichText::new("Applies to interlaced video files and playlists. FFmpeg and FFprobe are required.").color(TEXT_DIM));
         }
         5 => {
             ui.label("Default recording folder:");
@@ -5315,19 +6279,40 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
                 ui.end_row();
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut s.cfg.ext_on_top, "On Top");
-            ui.checkbox(&mut s.cfg.ext_hide_cursor, "Hide Cursor");
-            ui.checkbox(&mut s.cfg.start_external, "Open Output 1 at startup");
+            setting_toggle(ui, &mut s.cfg.ext_on_top, "On Top");
+            setting_toggle(ui, &mut s.cfg.ext_hide_cursor, "Hide Cursor");
+            setting_toggle(ui, &mut s.cfg.start_external, "Open Output 1 at startup");
             if ui.button("Configure Output 1–4…").clicked() {
                 s.cfg.page = 1;
             }
         }
         7 => {
             // Audio
-            ui.checkbox(&mut s.ftb_audio, "Fade To Black includes Audio");
-            ui.checkbox(&mut s.cfg.master_meter, "Show Master Audio Meter in Main Window");
-            ui.checkbox(&mut s.cfg.input_meter, "Show Audio Meter next to Inputs");
-            ui.label(RichText::new("Real sound capture, devices, ASIO and VST are not available yet.").size(11.0).color(TEXT_DIM));
+            setting_toggle(ui, &mut s.ftb_audio, "Fade To Black includes Audio");
+            setting_toggle(ui, &mut s.cfg.master_meter, "Show Master Audio Meter in Main Window");
+            setting_toggle(ui, &mut s.cfg.input_meter, "Show Audio Meter next to Inputs");
+            setting_toggle(ui, &mut s.cfg.default_auto_mix, "Automatically mix new inputs");
+            ui.horizontal(|ui| {
+                ui.label("Default Bus for New Inputs");
+                for (index, label) in ["Master", "A", "B"].into_iter().enumerate() {
+                    ui.selectable_value(&mut s.cfg.default_audio_bus, index, label);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Default Input Audio Delay");
+                ui.add(egui::DragValue::new(&mut s.cfg.default_audio_delay_ms).range(0..=1000).suffix(" ms"));
+            });
+        }
+        8 => {
+            ui.label("Headphones");
+            let label = if s.cfg.headphones_device.is_empty() { "System default" } else { &s.cfg.headphones_device };
+            egui::ComboBox::from_id_salt("headphones-device").selected_text(label).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.cfg.headphones_device, String::new(), "System default");
+                for name in audio::output_devices() {
+                    ui.selectable_value(&mut s.cfg.headphones_device, name.clone(), name);
+                }
+            });
+            ui.label("The selection applies the next time headphone monitoring starts.");
         }
         11 => {
             // Shortcuts
@@ -5353,10 +6338,10 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
         14 => {
             // Alerts
             ui.label(RichText::new("No Recording Alert").strong());
-            ui.checkbox(&mut s.cfg.recording_alert, "Display alert on UI when NOT Recording");
+            setting_toggle(ui, &mut s.cfg.recording_alert, "Display alert on UI when NOT Recording");
             ui.add_space(4.0);
             ui.label(RichText::new("Fade To Black Alert").strong());
-            ui.checkbox(&mut s.cfg.ftb_alert, "Display alert on UI when Fade To Black (FTB) enabled");
+            setting_toggle(ui, &mut s.cfg.ftb_alert, "Display alert on UI when Fade To Black (FTB) enabled");
         }
         9 => {
             if s.remote.is_some() {
@@ -5403,11 +6388,35 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapter: &str, en
 /// in its usual RTMP address.
 const STREAM_DESTS: [(&str, &str); 4] = [
     ("Custom RTMP Server", ""),
-    ("YouTube", "rtmp://a.rtmp.youtube.com/live2"),
+    ("YouTube RTMPS", "rtmps://a.rtmps.youtube.com/live2"),
     ("Facebook", "rtmps://live-api-s.facebook.com:443/rtmp/"),
     ("Twitch", "rtmp://live.twitch.tv/app"),
 ];
-const STREAM_QUALITIES: [&str; 3] = ["720p 3 Mbps", "1080p 6 Mbps", "1080p 9 Mbps"];
+fn file_decoder(settings: &Settings, path: &str) -> (media::Source, String) {
+    let extension = std::path::Path::new(path).extension().and_then(|extension| extension.to_str());
+    let ffmpeg = cfg!(target_os = "macos") || settings.ffmpeg_all_files
+        || extension.is_some_and(|extension| settings.ffmpeg_extensions.split([',', ';', ' ']).any(|item| {
+            extension.eq_ignore_ascii_case(item.trim().trim_start_matches(['*', '.']))
+        }));
+    if ffmpeg {
+        let deinterlace = settings.decoder_deinterlace;
+        (media::Source::FfmpegFile(path.to_owned(), deinterlace), format!("ffmpeg:{deinterlace}:{path}"))
+    } else {
+        (media::Source::File(path.to_owned()), path.to_owned())
+    }
+}
+
+fn stream_route(s: &Switcher, destination: &stream::Destination) -> OutputRoute {
+    let configured = s.cfg.outputs[destination.source];
+    if let Some(source) = destination.direct {
+        if matches!(source, SRC_OUTPUT | SRC_PREVIEW | SRC_MV1 | SRC_MV2)
+            || source.checked_sub(1).is_some_and(|id| s.input(id).is_some())
+        {
+            return OutputRoute { source, overlays: matches!(source, SRC_OUTPUT | SRC_PREVIEW) };
+        }
+    }
+    configured
+}
 
 /// The original's "New File Every" list: None, 1, 5, 10, 15, 20, 30, 60 (minutes).
 fn new_file_every(ui: &mut egui::Ui, id: &str, v: &mut u32) -> bool {
@@ -5421,28 +6430,52 @@ fn new_file_every(ui: &mut egui::Ui, id: &str, v: &mut u32) -> bool {
     *v != before
 }
 
-fn recording_format_tabs(ui: &mut egui::Ui, format: &mut media::RecordFormat, multi: bool) -> bool {
-    use media::RecordFormat::{H264, Hevc, Wmv};
-    let tabs: &[(&str, Option<media::RecordFormat>)] = if multi {
-        &[("AVI", None), ("VMX AVI", None), ("MKV", None), ("MP4", Some(H264)),
-          ("FFMPEG", None), ("MPEG-2 TS", None), ("WMV", cfg!(windows).then_some(Wmv))]
-    } else {
-        &[("AVI", None), ("MPEG-2", None), ("WMV", cfg!(windows).then_some(Wmv)), ("WMV Streaming", None),
-          ("MP4", Some(H264)), ("FFMPEG", None), ("VMX AVI", None)]
-    };
+fn setting_toggle(ui: &mut egui::Ui, value: &mut bool, label: impl Into<egui::WidgetText>) -> egui::Response {
+    let label = label.into();
+    let mut response = ui.horizontal(|ui| {
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(32.0, 18.0), egui::Sense::click());
+        let text = ui.add(egui::Label::new(label.clone()).sense(egui::Sense::click()));
+        (rect, response.union(text))
+    }).inner;
+    if response.1.clicked() {
+        *value = !*value;
+        response.1.mark_changed();
+    }
+    response.1.widget_info(|| egui::WidgetInfo::selected(
+        egui::WidgetType::Checkbox, ui.is_enabled(), *value, label.text(),
+    ));
+    let track = response.0;
+    let style = ui.style().interact(&response.1);
+    let color = if *value { ui.visuals().selection.bg_fill } else { style.bg_fill };
+    ui.painter().rect(track, 9.0, color, style.bg_stroke, egui::StrokeKind::Inside);
+    let progress = ui.ctx().animate_bool(response.1.id, *value);
+    let x = egui::lerp(track.left() + 9.0..=track.right() - 9.0, progress);
+    ui.painter().circle_filled(egui::pos2(x, track.center().y), 5.0, style.fg_stroke.color);
+    response.1
+}
+
+fn recording_groups() -> &'static [(&'static str, &'static [media::RecordFormat])] {
+    use media::RecordFormat::*;
+    const WMV: &[media::RecordFormat] = if cfg!(windows) { &[Wmv9, Wmv] } else { &[Wmv] };
+    &[
+        ("AVI", &[Mjpeg, MagicYuv]), ("MPEG-2", &[Mpeg2Ts, Mpeg2Ps]),
+        ("WMV", WMV), ("WMV Streaming", &[]), ("MP4", &[H264, Hevc]),
+        ("FFmpeg", &[ProRes, DnxHr, DnxHrMxf]), ("VMX AVI", &[]), ("MKV", &[H264Mkv, HevcMkv]),
+    ]
+}
+
+fn recording_format_tabs(ui: &mut egui::Ui, format: &mut media::RecordFormat) -> bool {
     let before = *format;
     ui.horizontal_wrapped(|ui| {
-        for &(name, choice) in tabs {
-            let active = choice == Some(*format) || (choice == Some(H264) && *format == Hevc);
-            let button = egui::Button::new(name).fill(if active { OUTPUT } else { BTN_DARK })
-                .min_size(Vec2::new(59.0, 24.0));
-            let response = ui.add_enabled(choice.is_some(), button);
+        for &(name, choices) in recording_groups() {
+            let active = choices.contains(format);
+            let button = egui::Button::new(name).selected(active).min_size(Vec2::new(48.0, 24.0));
+            let response = ui.add_enabled(!choices.is_empty(), button);
             if response.clicked() && !active {
-                if let Some(choice) = choice {
-                    *format = choice;
-                }
-            } else if choice.is_none() {
-                response.on_disabled_hover_text("This format requires an encoder that LiveMix does not yet support.");
+                *format = choices[0];
+            }
+            if choices.is_empty() {
+                response.on_disabled_hover_text("LiveMix has no encoder for this profile.");
             }
         }
     });
@@ -5451,9 +6484,11 @@ fn recording_format_tabs(ui: &mut egui::Ui, format: &mut media::RecordFormat, mu
 
 fn recording_profile(ui: &mut egui::Ui, id: &str, format: &mut media::RecordFormat) -> bool {
     let before = *format;
-    egui::ComboBox::from_id_salt(id).width(140.0).selected_text(format.codec()).show_ui(ui, |ui| {
-        for codec in [media::RecordFormat::H264, media::RecordFormat::Hevc] {
-            ui.selectable_value(format, codec, codec.codec());
+    let choices = recording_groups().iter().find(|(_, choices)| choices.contains(format)).unwrap().1;
+    let label = |format: media::RecordFormat| format!("{} · .{}", format.codec(), format.extension());
+    egui::ComboBox::from_id_salt(id).width(176.0).selected_text(label(*format)).show_ui(ui, |ui| {
+        for &codec in choices {
+            ui.selectable_value(format, codec, label(codec));
         }
     });
     *format != before
@@ -5475,23 +6510,24 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
         let mut open = true;
         egui::Window::new("Recording Setup").open(&mut open).collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(590.0).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(8.0);
             let tab_id = ui.id().with("recording-slot");
             let mut secondary = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut secondary, false, "Recording 1");
                 ui.selectable_value(&mut secondary, true, "Recording 2");
                 if secondary {
-                    changed |= ui.checkbox(&mut s.cfg.rec_second, "Enabled").changed();
+                    changed |= setting_toggle(ui, &mut s.cfg.rec_second, "Enabled").changed();
                 }
             });
             ui.data_mut(|d| d.insert_temp(tab_id, secondary));
             let codec = if secondary { &mut s.cfg.rec_second_codec } else { &mut s.cfg.rec_codec };
-            changed |= recording_format_tabs(ui, codec, false);
+            changed |= recording_format_tabs(ui, codec);
             ui.separator();
             let output_names: Vec<_> = s.cfg.outputs.iter().enumerate()
                 .map(|(n, route)| format!("Output {} · {}", n + 1, src_name(s, route.source))).collect();
             let name = safe_name(&s.cfg.rec_name);
-            egui::Grid::new("rec-setup").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            egui::Grid::new("rec-setup").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
                 ui.label("Filename:");
                 ui.horizontal(|ui| {
                     folder_line(ui, &s.cfg.rec_folder);
@@ -5526,13 +6562,16 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                     });
                 changed |= *source != before;
                 ui.end_row();
-                if *codec != media::RecordFormat::Wmv {
-                    ui.label("Profile:");
-                    changed |= recording_profile(ui, "rec-profile", codec);
-                    ui.end_row();
-                }
-                ui.label("Bit Rate:");
-                changed |= ui.add(egui::DragValue::new(mbps).range(1..=100).suffix(" Mbps")).changed();
+                ui.label("Video codec");
+                changed |= recording_profile(ui, "rec-profile", codec);
+                ui.end_row();
+                ui.label("Video bitrate");
+                changed |= ui.add_enabled(codec.ffmpeg_profile(false).bitrate,
+                    egui::DragValue::new(mbps).range(1..=100).suffix(" Mbps")).changed();
+                ui.end_row();
+                ui.label("Audio track");
+                changed |= setting_toggle(ui, &mut s.cfg.record_audio[usize::from(secondary)],
+                    format!("{} · Stereo", codec.audio_codec())).changed();
                 ui.end_row();
                 ui.label("New File Every:");
                 ui.horizontal(|ui| {
@@ -5541,8 +6580,8 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 });
                 ui.end_row();
             });
-            ui.checkbox(&mut s.cfg.recording_confirm, "Ask before stopping (Display confirmation for Record, External, Stream and MultiCorder buttons)");
-            ui.label(RichText::new("Video only. HEVC requires a compatible Windows encoder. Both slots share the folder and split interval.").size(11.0).color(TEXT_DIM));
+            setting_toggle(ui, &mut s.cfg.recording_confirm, "Ask before stopping (Display confirmation for Record, External, Stream and MultiCorder buttons)");
+            ui.label(RichText::new("Both slots share the folder and split interval.").size(11.0).color(TEXT_DIM));
             ui.horizontal(|ui| {
                 if ui.button("  OK  ").clicked() {
                     s.rec_setup = false;
@@ -5559,7 +6598,9 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
 
     if s.stream_setup {
         let mut open = true;
+        let sources = src_choices(s, true);
         egui::Window::new("Streaming Settings").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(8.0);
             ui.horizontal(|ui| {
                 for slot in 0..stream::COUNT {
                     ui.selectable_value(&mut s.stream_slot, slot, format!("Stream {}", slot + 1));
@@ -5568,7 +6609,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
             let index = s.stream_slot;
             let active = &mut s.stream_active[index];
             let destination = &mut s.cfg.streams[index];
-            ui.add_enabled_ui(!*active, |ui| egui::Grid::new("stream-setup").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.add_enabled_ui(!*active, |ui| egui::Grid::new("stream-setup").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
                 ui.label("Destination");
                 let cur = (destination.provider as usize).min(STREAM_DESTS.len() - 1);
                 egui::ComboBox::from_id_salt("stream-dest").width(240.0).selected_text(STREAM_DESTS[cur].0).show_ui(ui, |ui| {
@@ -5586,27 +6627,50 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 ui.label("Stream Name or Key");
                 ui.add(egui::TextEdit::singleline(&mut destination.key).password(true).desired_width(320.0));
                 ui.end_row();
-                ui.label("Quality");
-                let q = (destination.quality as usize).min(STREAM_QUALITIES.len() - 1);
-                egui::ComboBox::from_id_salt("stream-q").width(240.0).selected_text(STREAM_QUALITIES[q]).show_ui(ui, |ui| {
-                    for (k, name) in STREAM_QUALITIES.iter().enumerate() {
-                        if ui.selectable_label(k == q, *name).clicked() {
-                            destination.quality = k as u8;
-                        }
+                ui.label("Resolution");
+                let q = usize::from(destination.quality).min(stream::QUALITIES.len() - 1);
+                egui::ComboBox::from_id_salt("stream-q").width(240.0).selected_text(stream::QUALITIES[q].0).show_ui(ui, |ui| {
+                    for (k, (label, [w, h], mbps)) in stream::QUALITIES.iter().enumerate() {
+                        ui.selectable_value(&mut destination.quality, k as u8, format!("{label} · {w}×{h} · {mbps} Mbps"));
                     }
                 });
                 ui.end_row();
+                ui.label("Video bitrate");
+                ui.horizontal(|ui| {
+                    let mut bitrate = destination.bitrate.unwrap_or(stream::QUALITIES[q].2);
+                    if ui.add(egui::DragValue::new(&mut bitrate).range(1..=100).suffix(" Mbps")).changed() {
+                        destination.bitrate = Some(bitrate);
+                    }
+                    if ui.small_button("Preset").clicked() { destination.bitrate = None; }
+                });
+                ui.end_row();
+                ui.label("Video codec");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut destination.hevc, false, "H.264");
+                    ui.selectable_value(&mut destination.hevc, true, "H.265 (HEVC)");
+                });
+                ui.end_row();
                 ui.label("Source");
-                egui::ComboBox::from_id_salt("stream-source").selected_text(format!("Output {}", destination.source + 1))
-                    .show_ui(ui, |ui| for channel in 0..OUTPUT_COUNT {
-                        ui.selectable_value(&mut destination.source, channel, format!("Output {}", channel + 1));
-                    });
+                let label = destination.direct.and_then(|id| sources.iter().find(|(source, _)| *source == id))
+                    .map(|(_, name)| name.clone()).unwrap_or_else(|| format!("Output {}", destination.source + 1));
+                egui::ComboBox::from_id_salt("stream-source").selected_text(label).show_ui(ui, |ui| {
+                    for channel in 0..OUTPUT_COUNT {
+                        if ui.selectable_label(destination.direct.is_none() && destination.source == channel, format!("Output {}", channel + 1)).clicked() {
+                            destination.direct = None;
+                            destination.source = channel;
+                        }
+                    }
+                    ui.separator();
+                    for (source, name) in &sources {
+                        ui.selectable_value(&mut destination.direct, Some(*source), name);
+                    }
+                });
                 ui.end_row();
                 ui.label("Encoder");
-                ui.checkbox(&mut destination.hardware, stream::HARDWARE_ENCODER_LABEL);
+                setting_toggle(ui, &mut destination.hardware, stream::HARDWARE_ENCODER_LABEL);
                 ui.end_row();
             }));
-            ui.label(RichText::new("FFmpeg · H.264 with stereo AAC").size(11.0).color(TEXT_DIM));
+            ui.label(RichText::new("FFmpeg · RTMP/RTMPS · stereo AAC").size(11.0).color(TEXT_DIM));
             ui.label(&s.stream_status[index]);
             ui.horizontal(|ui| {
                 if ui.add_enabled(*active || !destination.url.trim().is_empty(),
@@ -5629,19 +6693,23 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
         let t = ctx.input(|i| i.time);
         egui::Window::new("MultiCorder").open(&mut open).collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(620.0).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(8.0);
             let cams: Vec<(u32, String)> = s.inputs.iter().filter(|i| matches!(i.kind, Kind::Device { .. })).map(|i| (i.id, format!("{} {}", s.number_of(i.id), i.title))).collect();
             let running = s.multicorder.is_some();
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    changed |= recording_format_tabs(ui, &mut s.cfg.mc_codec, true);
-                    egui::Grid::new("mc-setup").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        if s.cfg.mc_codec != media::RecordFormat::Wmv {
-                            ui.label("Profile:");
-                            changed |= recording_profile(ui, "mc-profile", &mut s.cfg.mc_codec);
-                            ui.end_row();
-                        }
-                        ui.label("Video Bit Rate:");
-                        changed |= ui.add(egui::DragValue::new(&mut s.cfg.mc_mbps).range(1..=100).suffix(" Mbps")).changed();
+                    changed |= recording_format_tabs(ui, &mut s.cfg.mc_codec);
+                    egui::Grid::new("mc-setup").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
+                        ui.label("Video codec");
+                        changed |= recording_profile(ui, "mc-profile", &mut s.cfg.mc_codec);
+                        ui.end_row();
+                        ui.label("Video bitrate");
+                        changed |= ui.add_enabled(s.cfg.mc_codec.ffmpeg_profile(false).bitrate,
+                            egui::DragValue::new(&mut s.cfg.mc_mbps).range(1..=100).suffix(" Mbps")).changed();
+                        ui.end_row();
+                        ui.label("Audio track");
+                        changed |= setting_toggle(ui, &mut s.cfg.record_audio[2],
+                            format!("{} · Stereo", s.cfg.mc_codec.audio_codec())).changed();
                         ui.end_row();
                         ui.label("New File Every:");
                         ui.horizontal(|ui| {
@@ -5662,13 +6730,13 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
             ui.separator();
             egui::ScrollArea::vertical().max_height(240.0).min_scrolled_height(146.0).show(ui, |ui| {
                 egui::Grid::new("mc-sources").num_columns(2).min_col_width(240.0)
-                    .striped(true).spacing([10.0, 5.0]).show(ui, |ui| {
+                    .striped(true).spacing([8.0, 8.0]).show(ui, |ui| {
                     ui.strong("Input");
                     ui.strong("Folder");
                     ui.end_row();
                     for (id, name) in cams {
                         let mut on = !s.mc_off.contains(&id);
-                        if ui.checkbox(&mut on, name).changed() {
+                        if setting_toggle(ui, &mut on, name).changed() {
                             if on { s.mc_off.remove(&id); } else { s.mc_off.insert(id); }
                         }
                         folder_line(ui, &s.cfg.mc_folder);
@@ -5676,7 +6744,7 @@ fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                     }
                     for channel in 0..OUTPUT_COUNT {
                         let source = src_name(s, s.cfg.outputs[channel].source);
-                        changed |= ui.checkbox(&mut s.cfg.mc_outputs[channel], format!("Output {} · {source}", channel + 1)).changed();
+                        changed |= setting_toggle(ui, &mut s.cfg.mc_outputs[channel], format!("Output {} · {source}", channel + 1)).changed();
                         folder_line(ui, &s.cfg.mc_folder);
                         ui.end_row();
                     }
@@ -5843,54 +6911,197 @@ fn new_preset_windows(ctx: &egui::Context, s: &mut Switcher) {
     }
 }
 
-fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encoder: &str, program_path: &str) {
-    if s.replay_open {
+fn replay_windows(ctx: &egui::Context, s: &mut Switcher) {
+    use replay::Action;
+    if s.replay_setup_open {
         let choices: Vec<_> = std::iter::once((MV_AUTO, "Off".into()))
             .chain(std::iter::once((SRC_OUTPUT, "Program".into())))
-            .chain(s.inputs.iter().map(|input| (input.id + 1, input.title.clone()))).collect();
-        egui::Window::new("Instant Replay").open(&mut s.replay_open).default_width(480.0).show(ctx, |ui| {
-            ui.collapsing("Angles", |ui| {
+            .chain(s.inputs.iter().filter(|input| !matches!(input.kind, Kind::Replay { .. }))
+                .map(|input| (input.id + 1, input.title.clone()))).collect();
+        egui::Window::new("Instant Replay Setup").open(&mut s.replay_setup_open).default_width(570.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
                 ui.add_enabled_ui(!s.replay_arm, |ui| {
-                    for (index, source) in s.replay_angles.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Camera {}", index + 1));
-                            let label = choices.iter().find(|(id, _)| id == source).map_or("Unavailable", |(_, label)| label.as_str());
-                            egui::ComboBox::from_id_salt(("replay-angle-source", index)).selected_text(label).show_ui(ui, |ui| {
-                                for (value, label) in &choices { ui.selectable_value(source, *value, label); }
-                            });
-                        });
-                    }
-                });
-            });
-            ui.checkbox(&mut s.replay_arm, "Record replay angles");
-            ui.horizontal(|ui| {
-                let ready = s.replay_arm && !s.replay_mark_in && !s.replay_mark;
-                if ui.add_enabled(ready && !s.replay_marking, egui::Button::new("Mark In")).clicked() { s.replay_mark_in = true; }
-                if ui.add_enabled(ready && s.replay_marking, egui::Button::new("Mark Out")).clicked() { s.replay_mark = true; }
-                if ui.add_enabled(ready && !s.replay_marking, egui::Button::new("Mark current segment")).clicked() { s.replay_mark = true; }
-            });
-            if let Some((name, _)) = s.replay_events.get(s.replay_event) {
-                let before = s.replay_event;
-                egui::ComboBox::from_id_salt("replay-event").selected_text(name).show_ui(ui, |ui| {
-                    for (index, (name, _)) in s.replay_events.iter().enumerate() {
-                        ui.selectable_value(&mut s.replay_event, index, name);
-                    }
-                });
-                if before != s.replay_event { s.replay_angle = 0; }
-                if let Some((_, angles)) = s.replay_events.get(s.replay_event) {
-                    ui.horizontal_wrapped(|ui| {
-                        for (index, angle) in angles.iter().enumerate() {
-                            ui.selectable_value(&mut s.replay_angle, index, angle);
+                    let setup = &mut s.replay_setup;
+                    ui.horizontal(|ui| {
+                        ui.label("Session Folder");
+                        ui.add(egui::TextEdit::singleline(&mut setup.folder).desired_width(280.0));
+                        if ui.button("Browse…").clicked() {
+                            s.browse_for = 3;
+                            s.browse_req = Some(media::PickKind::Folder);
                         }
                     });
-                }
-                if ui.add_enabled(s.replay_available, egui::Button::new("Save angle and add to Preview")).clicked() {
-                    s.replay_add = true;
-                }
-            }
+                    ui.horizontal(|ui| {
+                        if ui.button("New Session").clicked() { s.replay_load = Some(true); }
+                        if ui.button("Open Session").clicked() { s.replay_load = Some(false); }
+                        if !s.replay_session.is_empty() {
+                            ui.label(RichText::new("Recording uses the open session").color(TEXT_DIM));
+                        }
+                    });
+                    ui.separator();
+                    ui.strong("Recording Format");
+                    ui.horizontal_wrapped(|ui| {
+                        let size_label = setup.size.map_or("Project size".into(), |[w, h]| format!("{w}×{h}"));
+                        egui::ComboBox::from_id_salt("replay-size").selected_text(size_label).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut setup.size, None, "Project size");
+                            for [w, h] in [[1280, 720], [1920, 1080], [3840, 2160]] {
+                                ui.selectable_value(&mut setup.size, Some([w, h]), format!("{w}×{h}"));
+                            }
+                        });
+                        let rate = setup.fps.map_or("Project FPS".into(), |fps| format!("{fps} fps"));
+                        egui::ComboBox::from_id_salt("replay-fps").selected_text(rate).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut setup.fps, None, "Project FPS");
+                            for fps in [25.0, 29.97, 30.0, 50.0, 59.94, 60.0] {
+                                ui.selectable_value(&mut setup.fps, Some(fps), format!("{fps} fps"));
+                            }
+                        });
+                        egui::ComboBox::from_id_salt("replay-codec").selected_text(media::RecordFormat::parse(&setup.codec).codec())
+                            .show_ui(ui, |ui| {
+                                for format in [media::RecordFormat::H264, media::RecordFormat::Hevc] {
+                                    ui.selectable_value(&mut setup.codec, format.key().to_owned(), format.codec());
+                                }
+                            });
+                        ui.add(egui::DragValue::new(&mut setup.mbps).range(1..=100).suffix(" Mbps"));
+                    });
+                    ui.separator();
+                    ui.strong("Cameras");
+                    egui::Grid::new("replay-cameras").num_columns(4).show(ui, |ui| {
+                        for (index, source) in s.replay_angles.iter_mut().enumerate() {
+                            ui.label(format!("Camera {}", index + 1));
+                            let label = choices.iter().find(|(id, _)| id == source).map_or("Unavailable", |(_, label)| label.as_str());
+                            egui::ComboBox::from_id_salt(("replay-angle-source", index)).width(125.0)
+                                .selected_text(label).show_ui(ui, |ui| {
+                                    for (value, label) in &choices { ui.selectable_value(source, *value, label); }
+                                });
+                            if index % 2 == 1 { ui.end_row(); }
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Playback Audio Source");
+                        let label = match setup.audio { 0 => "Follow camera".into(), 1 => "Master".into(), n => format!("Camera {}", n - 1) };
+                        egui::ComboBox::from_id_salt("replay-audio-source").selected_text(label).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut setup.audio, 0, "Follow camera");
+                            ui.selectable_value(&mut setup.audio, 1, "Master");
+                            for angle in 0..8 {
+                                if s.replay_angles[angle] != MV_AUTO {
+                                    ui.selectable_value(&mut setup.audio, angle as u8 + 2, format!("Camera {}", angle + 1));
+                                }
+                            }
+                        });
+                        ui.label("Program transition");
+                        ui.add(egui::DragValue::new(&mut setup.transition_ms).range(0..=5000).suffix(" ms"));
+                        ui.checkbox(&mut setup.match_speed, "Match Replay Speed");
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Recording Buffer");
+                        ui.add(egui::DragValue::new(&mut setup.buffer_seconds).range(10..=3600).suffix(" s"));
+                        ui.checkbox(&mut setup.delete_old, "Delete old unmarked video");
+                    });
+                    let cameras = s.replay_angles.iter().filter(|&&source| source != MV_AUTO).count();
+                    let mb = cameras as u64 * u64::from(setup.mbps) * setup.buffer_seconds / 8;
+                    ui.label(format!("Estimated rolling video storage: {mb} MB"));
+                });
+            });
             ui.label(&s.replay_status);
         });
     }
+
+    if !s.replay_open { return; }
+    egui::Window::new("Instant Replay").open(&mut s.replay_open).default_width(670.0).show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Setup…").clicked() { s.replay_setup_open = true; }
+            if ui.add_enabled(!s.replay_session.is_empty() && !s.replay_read_only, egui::Button::new(if s.replay_arm { "Stop Recording" } else { "Record" })).clicked() {
+                s.replay_arm = !s.replay_arm;
+            }
+            if ui.add_enabled(s.replay_arm && !s.replay_marking, egui::Button::new("Mark In")).clicked() {
+                s.replay_command = Some(Action::MarkIn);
+            }
+            if ui.add_enabled(s.replay_arm && s.replay_marking, egui::Button::new("Mark Out")).clicked() {
+                s.replay_command = Some(Action::MarkOut);
+            }
+            if s.replay_marking && ui.button("Cancel Mark").clicked() { s.replay_command = Some(Action::CancelMark); }
+            for seconds in [5, 10, 20] {
+                if ui.add_enabled(s.replay_arm, egui::Button::new(format!("Last {seconds}s"))).clicked() {
+                    s.replay_command = Some(Action::MarkLast(seconds * 1000));
+                }
+            }
+        });
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            for (channel, name) in ["A", "B", "AB"].into_iter().enumerate() {
+                ui.selectable_value(&mut s.replay_channel, channel, name);
+            }
+            if ui.button("Pause / Resume").clicked() { s.replay_command = Some(Action::Pause(s.replay_channel)); }
+            if ui.button("Live buffer").clicked() { s.replay_command = Some(Action::Live); }
+            if ui.button("−1 frame").clicked() { s.replay_command = Some(Action::Step(-1)); }
+            if ui.button("+1 frame").clicked() { s.replay_command = Some(Action::Step(1)); }
+            if ui.button("Reverse").clicked() { s.replay_command = Some(Action::Reverse); }
+        });
+        for channel in 0..2 {
+            if s.replay_channel < 2 && s.replay_channel != channel { continue; }
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(["A", "B"][channel]);
+                egui::ComboBox::from_id_salt(("replay-playback-camera", channel))
+                    .selected_text(format!("Camera {}", s.replay_cameras[channel] + 1)).show_ui(ui, |ui| {
+                        for angle in 0..8 { ui.selectable_value(&mut s.replay_cameras[channel], angle, format!("Camera {}", angle + 1)); }
+                    });
+                for speed in [25, 33, 50, 75, 100] {
+                    ui.selectable_value(&mut s.replay_speed[channel], speed, format!("{speed}%"));
+                }
+                ui.add(egui::DragValue::new(&mut s.replay_speed[channel]).range(0..=100).suffix("%"));
+            });
+        }
+        ui.separator();
+        ui.strong("Events");
+        egui::ScrollArea::both().max_height(155.0).show(ui, |ui| {
+            egui::Grid::new("replay-events").striped(true).show(ui, |ui| {
+                for title in ["ID", "In", "Out", "Duration", "Speed", "1", "2", "3", "4", "5", "6", "7", "8", "Description"] {
+                    ui.strong(title);
+                }
+                ui.end_row();
+                for event in &s.replay_events {
+                    let row = ui.selectable_label(s.replay_event == Some(event.id), event.id.to_string());
+                    if row.clicked() {
+                        s.replay_event = Some(event.id);
+                        for channel in 0..2 {
+                            if s.replay_channel < 2 && channel != s.replay_channel { continue; }
+                            s.replay_speed[channel] = event.speed;
+                            if !event.angles[s.replay_cameras[channel]] {
+                                s.replay_cameras[channel] = event.angles.iter().position(|&enabled| enabled).unwrap_or(0);
+                            }
+                        }
+                    }
+                    if row.double_clicked() { s.replay_command = Some(Action::Play { event: event.id, program: false }); }
+                    for value in [event.start, event.end, event.end.saturating_sub(event.start)] {
+                        ui.label(format!("{:.3}", value as f64 / 1000.0));
+                    }
+                    ui.label(format!("{}%", event.speed));
+                    for &angle in &event.angles { ui.label(if angle { "●" } else { "·" }); }
+                    ui.label(&event.description);
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(event) = s.replay_events.iter_mut().find(|event| Some(event.id) == s.replay_event) {
+            let channel = s.replay_channel.min(1);
+            ui.horizontal_wrapped(|ui| {
+                let title = ui.add_enabled(!s.replay_read_only, egui::TextEdit::singleline(&mut event.description).desired_width(170.0));
+                let speed = ui.add_enabled(!s.replay_read_only, egui::DragValue::new(&mut event.speed).range(1..=100).prefix("Event ").suffix("%"));
+                if title.changed() || speed.changed() { s.replay_command = Some(Action::SaveEvent(event.clone())); }
+                if ui.button("Play").clicked() { s.replay_command = Some(Action::Play { event: event.id, program: false }); }
+                if ui.button("Play to Program").clicked() { s.replay_command = Some(Action::Play { event: event.id, program: true }); }
+                if ui.button("Export").clicked() {
+                    s.replay_command = Some(Action::Export { event: event.id, angle: s.replay_cameras[channel] });
+                }
+                if ui.add_enabled(!s.replay_read_only, egui::Button::new("Delete")).clicked() { s.replay_command = Some(Action::DeleteEvent(event.id)); }
+            });
+        }
+        ui.label(&s.replay_status);
+    });
+}
+
+fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encoder: &str, program_path: &str, mixer: &mut MixerControls) {
+    replay_windows(ctx, s);
     if let Some(report) = &s.import_report {
         let mut open = true;
         let mut close = false;
@@ -5947,6 +7158,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
         let mut done = false;
         egui::Window::new("Input Select").open(&mut open).collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).default_width(650.0).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(8.0);
             let body_height = (ctx.screen_rect().height() - 145.0).clamp(240.0, 510.0);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -6076,6 +7288,9 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                             });
                             ui.label(RichText::new(&d.ndi_status).size(11.0).color(TEXT_DIM));
                             ui.label(RichText::new(&d.omt_status).size(11.0).color(TEXT_DIM));
+                            if s.cfg.network_thumbnails {
+                                network_thumbnail_grid(ui, d);
+                            }
                         }
                         AddKind::StreamSrt => {
                             egui::Grid::new("srt-input-connection").spacing([12.0, 6.0]).show(ui, |ui| {
@@ -6190,16 +7405,34 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                 ui.label(RichText::new(format!("{} device(s) found on this computer", list.len())).size(11.0).color(TEXT_DIM));
                             }
                         }
-                        AddKind::VideoFile | AddKind::ImageFile => {
+                        AddKind::VideoFile | AddKind::ImageFile | AddKind::AudioFile => {
                             ui.horizontal(|ui| {
                                 ui.label("File");
                                 ui.add(egui::TextEdit::singleline(&mut s.add_dialog.path).desired_width(190.0));
                                 if ui.button("Browse…").clicked() {
-                                    s.browse_req = Some(if s.add_dialog.kind == AddKind::VideoFile { media::PickKind::Video } else { media::PickKind::Image });
+                                    s.browse_req = Some(match s.add_dialog.kind {
+                                        AddKind::VideoFile => media::PickKind::Video,
+                                        AddKind::AudioFile => media::PickKind::Audio,
+                                        _ => media::PickKind::Image,
+                                    });
                                 }
                             });
                         }
                         _ => {}
+                    }
+                    if let Some(index) = s.add_dialog.kind.history_group() {
+                        if !s.cfg.recent_media[index].is_empty() {
+                            egui::ComboBox::from_id_salt(("recent-media", index)).width(270.0)
+                                .selected_text("Recent media").show_ui(ui, |ui| {
+                                    for path in &s.cfg.recent_media[index] {
+                                        let name = std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy();
+                                        if ui.selectable_label(false, name).on_hover_text(path).clicked() {
+                                            if index == 2 { s.add_dialog.folder = path.clone(); }
+                                            else { s.add_dialog.path = path.clone(); }
+                                        }
+                                    }
+                                });
+                        }
                     }
                     if !s.dialog_error.is_empty() {
                         ui.label(RichText::new(&s.dialog_error).size(11.0).color(Color32::from_rgb(0xff, 0x9a, 0x9a)));
@@ -6222,6 +7455,17 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                 Ok(()) => {
                     if s.add_dialog.kind == AddKind::Replay {
                         s.replay_open = true;
+                    }
+                    if let Some(index) = s.add_dialog.kind.history_group() {
+                        let path = if index == 2 { &s.add_dialog.folder } else { &s.add_dialog.path };
+                        let path = path.trim();
+                        if !path.is_empty() {
+                            let history = &mut s.cfg.recent_media[index];
+                            history.retain(|entry| entry != path);
+                            history.insert(0, path.to_owned());
+                            history.truncate(16);
+                            s.save_settings();
+                        }
                     }
                     s.add_dialog.open = false;
                     s.dialog_error.clear();
@@ -6249,7 +7493,7 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
         // Snapshot of the input list for the Layers preview (draw_source resolves the layers).
         let all: Vec<Input> = s.inputs.clone();
         let t = ctx.input(|i| i.time);
-        let page_height = (ctx.screen_rect().height() - 230.0).clamp(200.0, 560.0);
+        let page_height = (ctx.screen_rect().height() - 150.0).clamp(160.0, 320.0);
         let clip = s.position_clipboard;
         let output = s.output;
         let project = { let (w, h) = s.cfg.out_dims(); ([w, h], s.cfg.frame_rate()) };
@@ -6261,13 +7505,15 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([760.0, page_height + 120.0])
+                .default_size([760.0, page_height + 58.0])
                 .min_width(540.0)
-                .min_height(320.0)
+                .min_height(235.0)
                 .max_height((ctx.screen_rect().height() - 30.0).max(340.0))
-                .default_pos(ctx.screen_rect().center() - Vec2::new(380.0, 280.0))
+                .default_pos(ctx.screen_rect().center() - Vec2::new(380.0, (page_height + 58.0) / 2.0))
                 .show(ctx, |ui| {
-                    ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+                    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), page_height + 24.0),
+                        egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         ui.vertical(|ui| {
                             ui.set_width(150.0);
                             settings_navigation(ui, &INPUT_PAGES, &INPUT_PAGES_BUILT, &[
@@ -6288,7 +7534,12 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                                 1 => input_colour_adjust(ui, inp),
                                 2 => input_colour_key(ui, inp),
                                 3 => input_colour_correction(ui, inp),
-                                4 => input_audio(ui, inp),
+                                4 => {
+                                    if inp.kind.has_audio() && ui.button("Audio Settings…").clicked() {
+                                        mixer.settings = Some(MixerSettings::Input(inp.id));
+                                    }
+                                    input_audio_general(ui, inp);
+                                }
                                 5 => input_effects(ui, inp, &mut page),
                                 6 => {
                                     position_editor(ui, "pos", &mut inp.place);
@@ -6323,7 +7574,8 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                         });
                     });
                     ui.separator();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 24.0),
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Close").clicked() {
                             close = true;
                         }
@@ -6346,17 +7598,19 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
         let mut close = false;
         // Keep the window inside the display: the page area shrinks first.
         let screen = ctx.screen_rect();
-        let page_height = (screen.height() - 230.0).clamp(200.0, 470.0);
+        let page_height = (screen.height() - 150.0).clamp(160.0, 320.0);
         let page_width = (screen.width() - 250.0).clamp(340.0, 500.0);
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([page_width + 210.0, page_height + 120.0])
+            .default_size([page_width + 210.0, page_height + 58.0])
             .min_width(520.0)
             .max_height((screen.height() - 40.0).max(300.0))
             .show(ctx, |ui| {
-                ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), page_height),
+                    egui::Layout::left_to_right(egui::Align::Min), |ui| {
                     // The original's sections (frmSettings.tMenu.*).
                     ui.vertical(|ui| {
                         ui.set_width(150.0);
@@ -6369,7 +7623,6 @@ fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encode
                     ui.separator();
                     ui.vertical(|ui| {
                         ui.set_width(page_width);
-                        ui.set_min_height(page_height);
                         egui::ScrollArea::vertical().id_salt("settings-page")
                             .auto_shrink([false, false]).max_height(page_height).show(ui, |ui| {
                             settings_page(ui, s, graphics_adapter, encoder, program_path);

@@ -147,7 +147,7 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
     sh.gpu_playback.store(gpu_playback, Ordering::Relaxed);
     sh.paused.store(paused, Ordering::Relaxed);
     sh.set_status("Starting…");
-    if let Source::File(path) = &src {
+    if let Source::File(path) | Source::FfmpegFile(path, _) = &src {
         let (source, path) = (sh.clone(), path.clone());
         std::thread::spawn(move || crate::audio::play_file(source, path));
     }
@@ -158,6 +158,8 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
         Source::Omt(address) => crate::omt::run_capture(s2, &address),
         Source::Srt(config) => crate::srt::run_capture(s2, config),
         Source::AudioDevice(device) => crate::audio::capture_device(s2, &device),
+        Source::AudioFile(path) => crate::audio::play_audio_input(s2, path),
+        Source::FfmpegFile(path, deinterlace) => crate::ffmpeg_media::play(&s2, &path, deinterlace),
         Source::Desktop => run_desktop(s2),
         Source::Sequence(folder, fps) => run_pictures(s2, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(s2, folder, false, 0.0, secs),
@@ -314,6 +316,9 @@ unsafe fn reader_attrs(manager: Option<&IMFDXGIDeviceManager>) -> Res<IMFAttribu
 
 unsafe fn open(src: &Source, manager: Option<&IMFDXGIDeviceManager>, sh: &Shared) -> Res<(IMFSourceReader, Dims)> {
     let attrs = reader_attrs(manager)?;
+    if matches!(src, Source::Device(..)) && CAPTURE_LOW_LATENCY.load(Ordering::Relaxed) {
+        attrs.SetUINT32(&MF_LOW_LATENCY, 1)?;
+    }
     let reader = open_reader(src, &attrs)?;
     let dev = match src {
         Source::Device(_, want) => Some((want.as_ref(), sh)),
@@ -571,7 +576,8 @@ fn run(sh: Arc<Shared>, src: Source) {
         if is_file {
             if let Some(ms) = sh.seek_ms.swap(0, Ordering::Relaxed).checked_sub(1) {
                 let duration = sh.dur_ms.load(Ordering::Relaxed);
-                let ms = if duration > 0 { ms.min(duration.saturating_sub(50)) } else { ms };
+                let margin = if sh.precise_seek.load(Ordering::Relaxed) { 1 } else { 50 };
+                let ms = if duration > 0 { ms.min(duration.saturating_sub(margin)) } else { ms };
                 let ts = (ms.min(i64::MAX as u64 / 10_000) * 10_000) as i64;
                 if let Some(r) = &reader {
                     match unsafe { r.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(ts)) } {
@@ -710,7 +716,8 @@ impl RecordFormat {
         match self {
             Self::H264 => MFVideoFormat_H264,
             Self::Hevc => MFVideoFormat_HEVC,
-            Self::Wmv => MFVideoFormat_WMV3,
+            Self::Wmv9 => MFVideoFormat_WMV3,
+            _ => unreachable!("FFmpeg profiles bypass the Media Foundation writer"),
         }
     }
 }
@@ -747,7 +754,7 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Optio
     inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par)?;
     inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4)?;
     wr.SetInputMediaType(idx, &inp, None)?;
-    let audio = if opts.format != RecordFormat::Wmv {
+    let audio = if opts.audio {
         let make_audio_type = |subtype, bytes_per_second, alignment| -> Res<IMFMediaType> {
             let ty = MFCreateMediaType()?;
             ty.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
@@ -759,7 +766,26 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Optio
             ty.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, alignment)?;
             Ok(ty)
         };
-        let target = make_audio_type(&MFAudioFormat_AAC, 16_000, 1)?;
+        let target = if opts.format == RecordFormat::Wmv9 {
+            let types = MFTranscodeGetAudioOutputAvailableTypes(&MFAudioFormat_WMAudioV8,
+                MFT_ENUM_FLAG_ALL.0 as u32, None::<&IMFAttributes>)?;
+            let mut chosen = None;
+            let mut best = 0;
+            for i in 0..types.GetElementCount()? {
+                let ty: IMFMediaType = types.GetElement(i)?.cast()?;
+                let bytes = ty.GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND).unwrap_or(0);
+                if ty.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).ok() == Some(crate::audio::RATE)
+                    && ty.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).ok() == Some(2)
+                    && bytes > best && bytes <= 24_000
+                {
+                    best = bytes;
+                    chosen = Some(ty);
+                }
+            }
+            chosen.ok_or_else(|| windows::core::Error::from(E_FAIL))?
+        } else {
+            make_audio_type(&MFAudioFormat_AAC, 16_000, 1)?
+        };
         let pcm = make_audio_type(&MFAudioFormat_PCM, crate::audio::RATE * 4, 4)?;
         let index = wr.AddStream(&target)?;
         wr.SetInputMediaType(index, &pcm, None)?;
@@ -809,6 +835,12 @@ unsafe fn encoder_name(writer: &IMFSinkWriter, stream: u32, format: RecordFormat
 pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, encoder: Arc<Mutex<String>>, opts: RecOpts,
     gpu: Arc<std::sync::atomic::AtomicBool>)
 {
+    if !opts.format.native_windows() {
+        if let Err(message) = crate::ffmpeg_media::record(&path, rx, &encoder, opts) {
+            *err.lock().unwrap() = message;
+        }
+        return;
+    }
     if !mf_init() {
         *err.lock().unwrap() = "Media Foundation not available".into();
         return;
@@ -839,7 +871,7 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
         if writer.is_none() {
             let w = (fw & !1).max(2);
             let h = (fh & !1).max(2);
-            let manager = if opts.hw && opts.format != RecordFormat::Wmv {
+            let manager = if opts.hw && opts.format != RecordFormat::Wmv9 {
                 unsafe { video_device_manager().ok() }
             } else {
                 None
@@ -1010,6 +1042,10 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
                 PickKind::PresetOpen => d.SetFileTypes(&[preset, all])?,
                 PickKind::PresetSave => unreachable!(),
                 PickKind::Video => d.SetFileTypes(&[video, all])?,
+                PickKind::Audio => d.SetFileTypes(&[
+                    COMDLG_FILTERSPEC { pszName: windows::core::w!("Audio files"), pszSpec: windows::core::w!("*.wav;*.mp3;*.flac;*.m4a;*.aac;*.ogg;*.opus;*.aif;*.aiff;*.wma") },
+                    all,
+                ])?,
                 PickKind::Image => d.SetFileTypes(&[image, all])?,
                 PickKind::Title => d.SetFileTypes(&[
                     COMDLG_FILTERSPEC { pszName: windows::core::w!("GT Designer titles"), pszSpec: windows::core::w!("*.gtzip") },

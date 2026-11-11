@@ -81,9 +81,13 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
     });
     let replay_angles = serde_json::to_string(&replay_angles).map_err(|error| error.to_string())?;
     writeln!(out, "  <LiveMixReplayAngles>{replay_angles}</LiveMixReplayAngles>").unwrap();
+    if !s.replay_session.is_empty() {
+        writeln!(out, "  <LiveMixReplaySession>{}</LiveMixReplaySession>", xml(&s.replay_session)).unwrap();
+    }
     for i in &s.inputs {
         let (kind, filename, colour, bars) = match &i.kind {
             Kind::VideoFile { path } => (0, path.as_str(), None, false),
+            Kind::AudioFile { path } => (5003, path.as_str(), None, false),
             Kind::ImageFile { path } => (1, path.as_str(), None, false),
             Kind::Photos { folder } => (2, folder.as_str(), None, false),
             Kind::ImageSequence { folder } => (21, folder.as_str(), None, false),
@@ -91,6 +95,7 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
             Kind::VideoList { .. } => (14, "", None, false),
             Kind::VideoDelay { .. } => (10, "", None, false),
             Kind::Telestrator { .. } => (5001, "", None, false),
+            Kind::Replay { .. } => (5002, "", None, false),
             Kind::Device { .. } => (5, "", None, false),
             Kind::Colour(c) => (12, "", Some(*c), false),
             Kind::Bars => (12, "", Some(Color32::BLACK), true),
@@ -98,6 +103,7 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         };
         out.push_str("  <Input");
         attr(&mut out, "Type", kind);
+        if let Kind::Replay { channel, .. } = i.kind { attr(&mut out, "LiveMixReplayChannel", channel); }
         attr(&mut out, "Key", guid()?);
         attr(&mut out, "State", 1);
         attr(&mut out, "OriginalTitle", &i.title);
@@ -107,12 +113,12 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         if !i.ptz_address.is_empty() { attr(&mut out, "LiveMixPtzAddress", &i.ptz_address); }
         if !i.on_program.is_empty() { attr(&mut out, "LiveMixOnProgram", &i.on_program); }
         // Input Settings > General / Colour Correction / Tally Lights / Advanced.
-        let flags: [(&str, bool); 9] = [
+        let flags: [(&str, bool); 10] = [
             ("LiveMixMirror", i.mirror), ("LiveMixSharpen", i.sharpen),
             ("LiveMixDeinterlace", i.deinterlace), ("LiveMixPlayActive", i.play_active),
             ("LiveMixPausePreview", i.pause_preview), ("LiveMixRestartActive", i.restart_active),
             ("LiveMixAutoMixAudio", i.auto_mix_audio), ("LiveMixRec601", i.rec601),
-            ("LiveMixPremultiplied", i.premultiplied),
+            ("LiveMixPremultiplied", i.premultiplied), ("LiveMixSoloPFL", i.solo_pfl),
         ];
         for (name, on) in flags {
             if on { attr(&mut out, name, "True"); }
@@ -193,13 +199,19 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
             let name = if tag == "RecordingSettings2" { format!("{} - 2", s.cfg.rec_name) }
                 else { s.cfg.rec_name.clone() };
             let file = folder.join(format!("{name}.{}", codec.extension()));
-            let tab = if codec == RecordFormat::Wmv { 2 } else { 4 };
+            let tab = match codec {
+                RecordFormat::Mjpeg | RecordFormat::MagicYuv => 0,
+                RecordFormat::Mpeg2Ts | RecordFormat::Mpeg2Ps => 1,
+                RecordFormat::Wmv | RecordFormat::Wmv9 => 2,
+                RecordFormat::H264 | RecordFormat::Hevc => 4,
+                _ => 5,
+            };
             writeln!(out, "    <Filename>{}</Filename><SelectedTab>{tab}</SelectedTab><MPEGBitRate>{bitrate}</MPEGBitRate><Interval>{}</Interval><Channel>{channel}</Channel>",
                 xml(&file.to_string_lossy()), s.cfg.rec_split_min).unwrap();
-            if codec != RecordFormat::Wmv {
+            if tab == 4 {
                 writeln!(out, "    <MP4Format>{}</MP4Format><HardwareAcceleration>{}</HardwareAcceleration>",
                     u8::from(codec == RecordFormat::Hevc), u8::from(s.cfg.hw_encoder)).unwrap();
-            } else {
+            } else if tab == 2 {
                 writeln!(out, "    <WMVBitRate>{}</WMVBitRate>", bitrate * 1_000_000).unwrap();
             }
         }
@@ -226,10 +238,12 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         else { s.number_of(source - 1) as u32 + 1 }
     };
     let mut routes = s.cfg.outputs.iter().map(|route| (route_code(route.source), route.overlays)).collect::<Vec<_>>();
-    routes.push((route_code(s.cfg.fs_source), s.cfg.fs_overlays));
+    routes.extend(s.cfg.fs_source.into_iter().zip(s.cfg.fs_overlays).map(|(source, overlays)| (route_code(source), overlays)));
     writeln!(local, "routes\t{}", serde_json::to_string(&routes).unwrap()).unwrap();
     let multi = (&s.cfg.mc_folder, s.cfg.mc_mbps, s.cfg.mc_split_min, s.cfg.mc_codec.key(), s.cfg.mc_outputs);
     writeln!(local, "multicorder\t{}", serde_json::to_string(&multi).unwrap()).unwrap();
+    let recording = (s.cfg.rec_codec.key(), s.cfg.rec_second_codec.key(), s.cfg.record_audio);
+    writeln!(local, "recording\t{}", serde_json::to_string(&recording).unwrap()).unwrap();
     write!(out, "  <!--{LOCAL}").unwrap();
     for byte in local.bytes() {
         write!(out, "{byte:02x}").unwrap();
@@ -262,7 +276,7 @@ impl ImportReport {
         let mut missing = Vec::new();
         for input in inputs {
             let paths: &[String] = match &input.kind {
-                Kind::VideoFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. } => std::slice::from_ref(path),
+                Kind::VideoFile { path } | Kind::AudioFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. } => std::slice::from_ref(path),
                 Kind::Photos { folder } | Kind::ImageSequence { folder } => std::slice::from_ref(folder),
                 Kind::VideoList { paths, .. } => paths,
                 _ => &[],
@@ -282,14 +296,21 @@ fn recording_slot<'a>(root: Node<'a, '_>, tag: &str) -> Option<(RecordFormat, us
     let read = |tag| child(node, tag).and_then(|n| n.text());
     let file = read("Filename").filter(|s| !s.is_empty())?;
     let tab = read("SelectedTab")?.parse::<u32>().ok()?;
-    let codec = match tab {
-        2 => RecordFormat::Wmv,
-        4 if read("MP4Format") == Some("1") => RecordFormat::Hevc,
-        4 => RecordFormat::H264,
+    let extension = Path::new(file).extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let codec = match (tab, extension.as_str()) {
+        (0, "avi") => RecordFormat::Mjpeg,
+        (1, "ts") => RecordFormat::Mpeg2Ts,
+        (1, "mpg" | "mpeg") => RecordFormat::Mpeg2Ps,
+        (2, _) => RecordFormat::parse("wmv"),
+        (4, _) if read("MP4Format") == Some("1") => RecordFormat::Hevc,
+        (4, _) => RecordFormat::H264,
+        (5, "mov") => RecordFormat::ProRes,
+        (5, "mxf") => RecordFormat::DnxHrMxf,
+        (5, "mkv") => RecordFormat::H264Mkv,
         _ => return None,
     };
     let channel = read("Channel").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(OUTPUT_COUNT - 1);
-    let mbps = if codec == RecordFormat::Wmv {
+    let mbps = if tab == 2 {
         read("WMVBitRate").and_then(|v| v.parse::<u32>().ok()).map(|v| v.saturating_add(500_000) / 1_000_000)
     } else {
         read("MPEGBitRate").and_then(|v| v.parse::<u32>().ok())
@@ -350,6 +371,9 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
                         resolution,
                     }
                 }
+                "5003" => Kind::AudioFile { path: resolve(file) },
+                "5002" => Kind::Replay { path: String::new(), channel: node.attribute("LiveMixReplayChannel")
+                    .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0).min(1) },
                 "5001" => Kind::Telestrator {
                     strokes: node.attribute("LiveMixTelestrator")
                         .and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default(),
@@ -411,6 +435,7 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
         input.pause_preview = bool_value(node.attribute("LiveMixPausePreview"));
         input.restart_active = bool_value(node.attribute("LiveMixRestartActive"));
         input.auto_mix_audio = bool_value(node.attribute("LiveMixAutoMixAudio"));
+        input.solo_pfl = bool_value(node.attribute("LiveMixSoloPFL"));
         input.rec601 = bool_value(node.attribute("LiveMixRec601"));
         input.premultiplied = bool_value(node.attribute("LiveMixPremultiplied"));
         input.flatten = bool_value(node.attribute("LiveMixFlatten"));
@@ -482,6 +507,13 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             imported.cfg.rec_second_mbps = bitrate;
         }
     }
+    if let Some(recording) = local.as_ref().and_then(|data| data.lines().find_map(|line| line.strip_prefix("recording\t")))
+        .and_then(|data| serde_json::from_str::<(String, String, [bool; 3])>(data).ok())
+    {
+        imported.cfg.rec_codec = RecordFormat::parse(&recording.0);
+        imported.cfg.rec_second_codec = RecordFormat::parse(&recording.1);
+        imported.cfg.record_audio = recording.2;
+    }
     if let Some(routes) = local.as_ref().and_then(|s| s.lines().find_map(|line| line.strip_prefix("routes\t")))
         .and_then(|v| serde_json::from_str::<Vec<(u32, bool)>>(v).ok())
     {
@@ -493,9 +525,9 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             route.source = route_source(source);
             route.overlays = overlays;
         }
-        if let Some(&(source, overlays)) = routes.get(OUTPUT_COUNT) {
-            imported.cfg.fs_source = route_source(source);
-            imported.cfg.fs_overlays = overlays;
+        for (slot, &(source, overlays)) in routes.iter().skip(OUTPUT_COUNT).take(2).enumerate() {
+            imported.cfg.fs_source[slot] = route_source(source);
+            imported.cfg.fs_overlays[slot] = overlays;
         }
     }
     if let Some((folder, bitrate, interval, codec, outputs)) = local.as_ref()
@@ -516,6 +548,10 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             if matches!(source, SRC_OUTPUT | MV_AUTO) { return source; }
             imported.inputs.get((source - 1) as usize).map_or(MV_AUTO, |input| input.id + 1)
         });
+    }
+    if let Some(folder) = child(root, "LiveMixReplaySession").and_then(|node| node.text()).filter(|folder| !folder.is_empty()) {
+        imported.replay_setup.folder = folder.to_owned();
+        imported.replay_load = Some(false);
     }
     imported.remote = s.remote.take();
     *s = imported;
@@ -635,21 +671,39 @@ mod tests {
         let id = s.inputs[0].id;
         s.remove_input(id);
         s.cfg.outputs[1].source = s.inputs[0].id + 1;
+        s.cfg.fs_source = [SRC_MV1, s.inputs[0].id + 1];
+        s.cfg.fs_overlays = [true, false];
         s.replay_angles[1] = s.inputs[0].id + 1;
         s.script = "Preview 1\nWait 100\nCut".into();
         s.inputs[0].on_program = "Wait 20\nPreview 1".into();
         s.inputs[0].ptz_address = "192.0.2.1:52381".into();
         s.inputs[0].colour_adjust.saturation = -0.5;
         s.assign_overlay(7, s.inputs[0].id, true);
+        s.cfg.rec_source = 1;
+        s.cfg.rec_codec = RecordFormat::MagicYuv;
+        s.cfg.rec_second = true;
+        s.cfg.rec_second_source = 2;
+        s.cfg.rec_second_codec = RecordFormat::HevcMkv;
+        s.cfg.mc_codec = RecordFormat::DnxHrMxf;
+        s.cfg.record_audio = [false, true, false];
         let saved = encode(&s).unwrap();
         let mut reopened = Switcher::empty();
         decode(&mut reopened, path, &saved).unwrap();
         assert_eq!(reopened.inputs[0].title, s.inputs[0].title);
         assert_eq!(reopened.script, s.script);
+        assert_eq!(reopened.cfg.rec_source, 1);
+        assert_eq!(reopened.cfg.rec_codec, RecordFormat::MagicYuv);
+        assert!(reopened.cfg.rec_second);
+        assert_eq!(reopened.cfg.rec_second_source, 2);
+        assert_eq!(reopened.cfg.rec_second_codec, RecordFormat::HevcMkv);
+        assert_eq!(reopened.cfg.mc_codec, RecordFormat::DnxHrMxf);
+        assert_eq!(reopened.cfg.record_audio, [false, true, false]);
         assert_eq!(reopened.inputs[0].on_program, s.inputs[0].on_program);
         assert_eq!(reopened.inputs[0].ptz_address, s.inputs[0].ptz_address);
         assert_eq!(reopened.inputs[0].colour_adjust, s.inputs[0].colour_adjust);
         assert_eq!(reopened.cfg.outputs[1].source, reopened.inputs[0].id + 1);
+        assert_eq!(reopened.cfg.fs_source, [SRC_MV1, reopened.inputs[0].id + 1]);
+        assert_eq!(reopened.cfg.fs_overlays, [true, false]);
         assert_eq!(reopened.replay_angles[1], reopened.inputs[0].id + 1);
         assert_eq!(reopened.overlays[7].assigned.map(|source| source.input), Some(reopened.inputs[0].id));
         let mut native_only = Switcher::empty();

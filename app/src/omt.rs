@@ -152,22 +152,27 @@ pub fn discover() -> Result<Vec<String>, String> {
 }
 
 pub fn run_capture(shared: Arc<Shared>, address: &str) {
-    if let Err(error) = receive(&shared, address) {
+    if let Err(error) = receive(&shared, address, false) {
         *shared.status.lock().unwrap() = error;
     }
 }
 
-fn receive(shared: &Shared, address: &str) -> Result<(), String> {
+pub fn thumbnail(shared: Arc<Shared>, address: &str) -> Result<(), String> {
+    receive(&shared, address, true)
+}
+
+fn receive(shared: &Shared, address: &str, thumbnail: bool) -> Result<(), String> {
     let api = api()?;
     let address = CString::new(address).map_err(|_| "Invalid OMT address")?;
     unsafe {
-        let receiver = (api.recv_create)(address.as_ptr(), VIDEO | AUDIO, 2, 0);
+        let media_types = if thumbnail { VIDEO } else { VIDEO | AUDIO };
+        let receiver = (api.recv_create)(address.as_ptr(), media_types, 2, 0);
         if receiver.is_null() { return Err("Could not create OMT receiver".into()); }
         *shared.status.lock().unwrap() = "Waiting for OMT video…".into();
         let mut last_frame = None;
         let mut audio_phase = 0;
         while !shared.stop.load(Relaxed) {
-            let media = (api.recv)(receiver, VIDEO | AUDIO, 100);
+            let media = (api.recv)(receiver, media_types, 100);
             if let Some(audio) = media.as_ref().filter(|frame| frame.frame_type == AUDIO && frame.codec == FPA1) {
                 let frames = audio.samples.max(0) as usize;
                 let channels = audio.channels.max(0) as usize;
@@ -182,6 +187,7 @@ fn receive(shared: &Shared, address: &str) -> Result<(), String> {
                 *shared.size.lock().unwrap() = (frame.w, frame.h);
                 *shared.frame.lock().unwrap() = Some(frame);
                 shared.seq.fetch_add(1, Relaxed);
+                if thumbnail { break; }
             } else if last_frame.is_some_and(|t: Instant| t.elapsed() >= Duration::from_secs(3)) {
                 last_frame = None;
                 *shared.status.lock().unwrap() = "Waiting for OMT signal…".into();

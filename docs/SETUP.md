@@ -27,6 +27,9 @@ Successful macOS CI runs offer `LiveMix-macOS-arm64.zip` in their artifacts. It 
 | Feature | Extra dependency |
 | --- | --- |
 | Embedded audio from video files on Windows, Mac media processing, RTMP/RTMPS and SRT | Install FFmpeg or point `LIVEMIX_FFMPEG` to the executable. For Mac playback metadata, keep `ffprobe` beside the selected `ffmpeg` executable. If LiveMix finds FFmpeg through PATH, make both commands available there. Verify that `ffmpeg -protocols` lists SRT for SRT use. |
+| Audio-only file inputs | Install FFmpeg and FFprobe. Set `LIVEMIX_FFPROBE` if FFprobe is installed in a separate location. |
+| Recording and file decoders | FFmpeg and FFprobe are required for the FFmpeg decoder path and extended recording formats. The recording profiles use the encoders provided by the installed FFmpeg build. Windows MP4 and WMV9 use Media Foundation. |
+| Replay playback and export | Install FFmpeg with the `libx264` encoder. Replay recording uses the platform recorder. Playback and export prepare an MP4 from the selected time range and angle. |
 | FFmpeg hardware streaming | Use a build with the encoder you need and a compatible driver. Windows tries NVENC, AMF and Quick Sync where available. Mac can use VideoToolbox. LiveMix checks whether the encoder can actually initialize. |
 | NDI | Install the platform's native NDI runtime. Windows also checks `NDI_RUNTIME_DIR_V6` and `NDI_RUNTIME_DIR_V5`. Mac can use `LIVEMIX_NDI_DIR` for the directory containing `libndi.dylib`. |
 | OMT | Supply matching native `libomt.dll` and `libvmx.dll` on Windows, or `libomt.dylib` and `libvmx.dylib` on macOS. Place both beside the executable or set `LIVEMIX_OMT_DIR` to their directory. [OMT releases](https://github.com/openmediatransport/libomtnet/releases) |

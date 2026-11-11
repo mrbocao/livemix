@@ -66,9 +66,14 @@ pub struct Buffer {
     live_end: Option<Instant>,
     live_latency: i64,
     file_epoch: u64,
+    live_resyncs: u64,
 }
 
 impl Buffer {
+    pub fn diagnostics(&self) -> (usize, u64) {
+        (self.data.len(), self.live_resyncs)
+    }
+
     pub fn set_effects(&mut self, effects: &Effects) {
         if self.effects != *effects {
             self.effects = effects.clone();
@@ -93,8 +98,11 @@ impl Buffer {
     }
 
     pub fn capture(&mut self, samples: &[Stereo]) {
+        self.capture_at(samples, Instant::now());
+    }
+
+    fn capture_at(&mut self, samples: &[Stereo], now: Instant) {
         if samples.is_empty() { return; }
-        let now = Instant::now();
         let duration = sample_duration(samples.len());
         let end = self.live_end.and_then(|previous| {
             let predicted = previous + duration;
@@ -106,7 +114,12 @@ impl Buffer {
             let step = sample_duration(correction.unsigned_abs() as usize);
             Some(if correction < 0 { predicted - step } else { predicted + step })
         });
-        if end.is_none() { self.data.clear(); }
+        if end.is_none() {
+            if self.live_end.is_some() {
+                self.live_resyncs += 1;
+            }
+            self.data.clear();
+        }
         self.live_end = Some(end.unwrap_or(now));
         self.live_latency = (samples.len() as i64).clamp(1440, 5760);
         self.append(samples.iter().copied());
@@ -185,9 +198,13 @@ pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool,
     mixed.into_iter().map(|[l, r]| [l.round() as i16, r.round() as i16]).collect()
 }
 
-pub fn peak(packet: &[Stereo]) -> f32 {
-    packet.iter().flatten().map(|value| f32::from(value.unsigned_abs()) / 32768.0)
-        .fold(0.0, f32::max)
+pub fn stereo_peaks(packet: &[Stereo]) -> [f32; 2] {
+    let mut peaks = [0u16; 2];
+    for &[left, right] in packet {
+        peaks[0] = peaks[0].max(left.unsigned_abs());
+        peaks[1] = peaks[1].max(right.unsigned_abs());
+    }
+    peaks.map(|peak| f32::from(peak) / 32768.0)
 }
 
 #[cfg(test)]
@@ -211,16 +228,23 @@ pub fn test_tone(frames: usize) -> Packet {
     }).collect()
 }
 
-pub fn input_peak((shared, file, gain): (&crate::media::Shared, bool, f32), at: Instant) -> f32 {
-    let mut peak = 0u16;
+#[cfg(test)]
+pub fn input_peak(source: (&crate::media::Shared, bool, f32), at: Instant) -> f32 {
+    let [left, right] = input_peaks(source, at);
+    left.max(right)
+}
+
+pub fn input_peaks((shared, file, gain): (&crate::media::Shared, bool, f32), at: Instant) -> [f32; 2] {
+    let mut peaks = [0u16; 2];
     if gain > 0.0 {
-        if let Ok(buffer) = shared.audio.lock() {
-            buffer.read(shared, at, 960, file, |_, [l, r]| {
-                peak = peak.max(l.unsigned_abs()).max(r.unsigned_abs());
+        if let Ok(buffer) = shared.audio.try_lock() {
+            buffer.read(shared, at, 960, file, |_, [left, right]| {
+                peaks[0] = peaks[0].max(left.unsigned_abs());
+                peaks[1] = peaks[1].max(right.unsigned_abs());
             });
         }
     }
-    f32::from(peak) * gain / 32768.0
+    peaks.map(|peak| f32::from(peak) * gain / 32768.0)
 }
 
 pub(crate) fn pcm(bytes: &[u8]) -> impl Iterator<Item = Stereo> + '_ {
@@ -243,6 +267,13 @@ fn audio_device_identity(device: &cpal::Device) -> Option<(String, String)> {
 
 const NATIVE_RATE: cpal::SampleRate = cpal::SampleRate(RATE);
 
+type CapturedAudio = (Instant, Vec<Stereo>);
+
+struct InputQueue {
+    ready: std::sync::mpsc::SyncSender<CapturedAudio>,
+    free: std::sync::mpsc::Receiver<Vec<Stereo>>,
+}
+
 pub fn capture_device(shared: Arc<crate::media::Shared>, id: &str) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let result = (|| -> Result<(), String> {
@@ -254,37 +285,52 @@ pub fn capture_device(shared: Arc<crate::media::Shared>, id: &str) {
             ranges.filter(|range| range.channels() == default.channels() && range.sample_format() == default.sample_format())
                 .find_map(|range| range.try_with_sample_rate(NATIVE_RATE))
         }).unwrap_or(default);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(8);
+        let (free_tx, free_rx) = std::sync::mpsc::sync_channel(8);
+        for _ in 0..8 {
+            let _ = free_tx.try_send(Vec::with_capacity(4096));
+        }
+        let queue = InputQueue { ready: ready_tx, free: free_rx };
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => input_stream::<f32>(&device, config.config(), &shared),
-            cpal::SampleFormat::I16 => input_stream::<i16>(&device, config.config(), &shared),
-            cpal::SampleFormat::I32 => input_stream::<i32>(&device, config.config(), &shared),
-            cpal::SampleFormat::U16 => input_stream::<u16>(&device, config.config(), &shared),
+            cpal::SampleFormat::F32 => input_stream::<f32>(&device, config.config(), &shared, queue),
+            cpal::SampleFormat::I16 => input_stream::<i16>(&device, config.config(), &shared, queue),
+            cpal::SampleFormat::I32 => input_stream::<i32>(&device, config.config(), &shared, queue),
+            cpal::SampleFormat::U16 => input_stream::<u16>(&device, config.config(), &shared, queue),
             _ => return Err("Unsupported audio input sample format".into()),
         }?;
         shared.set_status("");
         stream.play().map_err(|e| e.to_string())?;
-        while !shared.stop.load(Relaxed) { std::thread::sleep(Duration::from_millis(40)); }
+        while !shared.stop.load(Relaxed) {
+            match ready_rx.recv_timeout(Duration::from_millis(40)) {
+                Ok((at, mut samples)) => {
+                    shared.audio.lock().unwrap().capture_at(&samples, at);
+                    samples.clear();
+                    let _ = free_tx.try_send(samples);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         Ok(())
     })();
     if let Err(error) = result { shared.set_status(format!("Audio input: {error}")); }
 }
 
 fn input_stream<T>(device: &cpal::Device, config: cpal::StreamConfig,
-    shared: &Arc<crate::media::Shared>) -> Result<cpal::Stream, String>
+    shared: &Arc<crate::media::Shared>, queue: InputQueue) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample,
     i16: cpal::FromSample<T>,
 {
     use cpal::traits::DeviceTrait;
     use cpal::Sample;
-    let source = shared.clone();
     let errors = shared.clone();
     let channels = usize::from(config.channels);
     let rate = config.sample_rate.0;
     let mut phase = 0;
-    let mut samples = Vec::new();
     device.build_input_stream(&config, move |data: &[T], _| {
-        samples.clear();
+        let at = Instant::now();
+        let Ok(mut samples) = queue.free.try_recv() else { return };
         for frame in data.chunks_exact(channels) {
             let left = i16::from_sample(frame[0]);
             let right = i16::from_sample(frame[usize::from(channels > 1)]);
@@ -294,7 +340,7 @@ where
                 phase -= rate;
             }
         }
-        if let Ok(mut buffer) = source.audio.try_lock() { buffer.capture(&samples); }
+        let _ = queue.ready.try_send((at, samples));
     }, move |error| errors.set_status(format!("Audio input: {error}")), None).map_err(|e| e.to_string())
 }
 
@@ -302,14 +348,23 @@ type MonitorSource = (Arc<crate::media::Shared>, bool, f32);
 
 pub struct Monitor {
     _stream: cpal::Stream,
-    pub sources: Arc<Mutex<Vec<MonitorSource>>>,
+    pub sources: Arc<Mutex<Arc<[MonitorSource]>>>,
     pub error: Arc<Mutex<Option<String>>>,
 }
 
+pub fn output_devices() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::default_host().output_devices().into_iter().flatten().filter_map(|device| device.name().ok()).collect()
+}
+
 impl Monitor {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(name: &str) -> Result<Self, String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-        let device = cpal::default_host().default_output_device().ok_or("No system audio output")?;
+        let host = cpal::default_host();
+        let device = if name.is_empty() { host.default_output_device() } else {
+            host.output_devices().map_err(|error| error.to_string())?
+                .find(|device| device.name().is_ok_and(|current| current == name))
+        }.ok_or("Headphone output device is unavailable")?;
         let default = device.default_output_config().map_err(|e| e.to_string())?;
         let config = device.supported_output_configs().ok().and_then(|ranges| {
             ranges.filter(|range| range.channels() == default.channels() && range.sample_format() == default.sample_format())
@@ -330,7 +385,7 @@ impl Monitor {
 }
 
 fn monitor_stream<T>(device: &cpal::Device, config: cpal::StreamConfig,
-    sources: &Arc<Mutex<Vec<MonitorSource>>>, error: &Arc<Mutex<Option<String>>>)
+    sources: &Arc<Mutex<Arc<[MonitorSource]>>>, error: &Arc<Mutex<Option<String>>>)
     -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<i16>,
@@ -339,23 +394,27 @@ where
     let sources = sources.clone();
     let error = error.clone();
     let channels = usize::from(config.channels);
-    let rate = config.sample_rate.0 as usize;
-    // Kept so a rare lock miss repeats the previous block instead of dropping to
-    // silence, which is heard as a click.
-    let mut last: Option<Packet> = None;
+    let rate = u64::from(config.sample_rate.0);
+    let mut sources_snapshot = Arc::<[MonitorSource]>::default();
+    let mut clock = MonitorClock::default();
     device.build_output_stream(&config, move |data: &mut [T], _| {
-        let frames = (data.len() / channels * RATE as usize).div_ceil(rate);
-        let packet = match sources.try_lock() {
-            Ok(sources) => {
-                let packet = mix(sources.iter().map(|(source, file, gain)| (&**source, *file, *gain)),
-                    Instant::now(), frames);
-                last = Some(packet.clone());
-                Some(packet)
-            }
-            Err(_) => last.clone(),
-        };
+        let count = data.len() / channels;
+        if count == 0 { return; }
+        let (at, frames, phase) = clock.block(Instant::now(), count, rate);
+        if let Ok(latest) = sources.try_lock() {
+            sources_snapshot = latest.clone();
+        }
+        let packet = mix(sources_snapshot.iter().map(|(source, file, gain)| (&**source, *file, *gain)), at, frames);
         for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
-            let [l, r] = packet.as_ref().and_then(|p| p.get(i * RATE as usize / rate)).copied().unwrap_or_default();
+            let position = phase + i as u64 * u64::from(RATE);
+            let offset = (position / rate) as usize;
+            let weight = (position % rate) as i32;
+            let interpolate = |channel: usize| {
+                let first = i32::from(packet[offset][channel]);
+                let second = i32::from(packet[offset + 1][channel]);
+                (first + ((second - first) as i64 * i64::from(weight) / rate as i64) as i32) as i16
+            };
+            let [l, r] = [interpolate(0), interpolate(1)];
             frame.fill(T::from_sample(0));
             if channels == 1 {
                 frame[0] = T::from_sample(((i32::from(l) + i32::from(r)) / 2) as i16);
@@ -365,6 +424,96 @@ where
             }
         }
     }, move |err| *error.lock().unwrap() = Some(err.to_string()), None).map_err(|e| e.to_string())
+}
+
+#[derive(Default)]
+struct MonitorClock {
+    origin: Option<Instant>,
+    output_frames: u64,
+}
+
+impl MonitorClock {
+    fn block(&mut self, now: Instant, count: usize, rate: u64) -> (Instant, usize, u64) {
+        let count = count as u64;
+        let duration = |frames| Duration::from_secs_f64(frames as f64 / rate as f64);
+        if self.origin.is_none_or(|origin| signed_frames(now, origin + duration(self.output_frames + count)).abs() > 5760) {
+            self.origin = Some(now - duration(count));
+            self.output_frames = 0;
+        }
+        let first = self.output_frames * u64::from(RATE);
+        self.output_frames += count;
+        let last = (self.output_frames - 1) * u64::from(RATE);
+        let end = last / rate + 2;
+        let at = self.origin.unwrap() + sample_duration(end as usize);
+        (at, (end - first / rate) as usize, first % rate)
+    }
+}
+
+pub(crate) fn ffprobe_command() -> std::process::Command {
+    let decoder = crate::stream::command();
+    let probe_name = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+    let sibling = std::path::Path::new(decoder.get_program()).with_file_name(probe_name);
+    let probe = std::env::var_os("LIVEMIX_FFPROBE").map(std::path::PathBuf::from)
+        .or_else(|| sibling.is_file().then(|| sibling.clone()))
+        .or_else(|| std::fs::read_dir(sibling.parent()?).ok()?.flatten()
+            .map(|entry| entry.path().join("bin").join(probe_name)).find(|path| path.is_file()))
+        .unwrap_or_else(|| probe_name.into());
+    let mut command = std::process::Command::new(probe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
+
+pub fn play_audio_input(shared: Arc<crate::media::Shared>, path: String) {
+    let mut command = ffprobe_command();
+    let duration = command.args(["-v", "error", "-select_streams", "a:0", "-show_entries",
+        "stream=codec_type:format=duration", "-of", "json", "-i"]).arg(&path).output().ok()
+        .filter(|output| output.status.success()).and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+        .filter(|data| data["streams"][0]["codec_type"] == "audio")
+        .and_then(|data| data["format"]["duration"].as_str()?.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
+    let Some(duration) = duration else {
+        shared.set_status("Cannot open audio. Check the file and FFprobe installation.");
+        return;
+    };
+    let duration_ms = (duration * 1000.0) as u64;
+    shared.dur_ms.store(duration_ms, Relaxed);
+    shared.set_status("Audio file");
+    mark_position(&shared, 0);
+    let source = shared.clone();
+    std::thread::scope(|scope| {
+        scope.spawn(move || play_file(source, path));
+        let mut last = Instant::now();
+        let mut position = 0.0;
+        while !shared.stop.load(Relaxed) {
+            let now = Instant::now();
+            let seek = shared.seek_ms.swap(0, Relaxed).checked_sub(1);
+            let restart = shared.restart.swap(false, Relaxed);
+            if let Some(target) = seek.or(restart.then_some(0)) {
+                position = target.min(duration_ms.saturating_sub(1)) as f64;
+                shared.pos_ms.store(position as u64, Relaxed);
+                shared.ended.store(false, Relaxed);
+                reset_position(&shared);
+                mark_position(&shared, position as u64);
+            } else if !shared.paused.load(Relaxed) && !shared.ended.load(Relaxed) {
+                position = (position + now.duration_since(last).as_secs_f64() * 1000.0).min(duration_ms as f64);
+                shared.pos_ms.store(position as u64, Relaxed);
+                mark_position(&shared, position as u64);
+                if position >= duration_ms as f64 {
+                    if shared.looping.load(Relaxed) {
+                        shared.restart.store(true, Relaxed);
+                    } else {
+                        shared.ended.store(true, Relaxed);
+                    }
+                }
+            }
+            last = now;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
 }
 
 pub fn play_file(shared: Arc<crate::media::Shared>, path: String) {
@@ -491,6 +640,47 @@ pub fn write_pcm(mut output: impl Write, samples: &[Stereo], count: usize) -> st
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires FFmpeg and FFprobe"]
+    fn audio_file_input_plays_and_seeks() {
+        let path = std::env::temp_dir().join(format!("livemix-audio-test-{}.wav", std::process::id()));
+        let created = crate::stream::command().args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", "2", "-c:a", "pcm_s16le"]).arg(&path).output().unwrap();
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let shared = crate::media::start_for_gl(crate::media::Source::AudioFile(path.to_string_lossy().into_owned()), true);
+        let end = Instant::now() + Duration::from_secs(5);
+        while shared.dur_ms.load(Relaxed) == 0 && Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+        assert_eq!(shared.dur_ms.load(Relaxed), 2000, "{}", shared.status.lock().unwrap());
+        shared.seek_ms.store(1001, Relaxed);
+        let end = Instant::now() + Duration::from_secs(3);
+        while shared.pos_ms.load(Relaxed) < 1000 && Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+        assert_eq!(shared.pos_ms.load(Relaxed), 1000);
+        shared.paused.store(false, Relaxed);
+        let end = Instant::now() + Duration::from_millis(900);
+        let mut peak = 0.0_f32;
+        while Instant::now() < end && peak < 0.02 {
+            peak = input_peak((&shared, true, 1.0), Instant::now());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shared.stop.store(true, Relaxed);
+        assert!(peak > 0.02);
+        for _ in 0..20 {
+            if std::fs::remove_file(&path).is_ok() { break; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn monitor_clock_preserves_phase_through_callback_jitter() {
+        let mut clock = MonitorClock::default();
+        let start = Instant::now();
+        let (first, frames, phase) = clock.block(start, 127, 44_100);
+        assert_eq!(phase, 0);
+        assert_eq!(frames, 139);
+        let (second, _, phase) = clock.block(start + Duration::from_millis(10), 127, 44_100);
+        assert_eq!(phase, 127 * 48_000 % 44_100);
+        assert_eq!(signed_frames(second, first), 138);
+    }
     #[test]
     fn audio_clock_keeps_fractional_video_rates() {
         let counts: usize = (0..60_000).map(|slot| frames_for_slot(slot, 60_000, 1001)).sum();

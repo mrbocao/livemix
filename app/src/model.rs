@@ -116,12 +116,13 @@ pub enum Kind {
     Device { link: String, blackmagic: bool },
     /// A real video file.
     VideoFile { path: String },
+    AudioFile { path: String },
     /// A real picture file.
     ImageFile { path: String },
     /// "List": several video files played one after another (original's Video List input).
     VideoList { paths: Vec<String>, idx: usize },
     /// "Instant Replay": the selected replay event angle, played like a video file.
-    Replay { path: String },
+    Replay { path: String, channel: usize },
     /// "NDI / Desktop Capture": the whole Windows desktop.
     Desktop,
     /// "Image Sequence / Stinger": a folder of numbered pictures played as video.
@@ -159,14 +160,14 @@ pub struct InputTrigger {
 impl Kind {
     pub fn playable(&self) -> bool {
         match self {
-            Kind::Replay { path } => !path.is_empty(),
-            _ => matches!(self, Kind::Video { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::ImageSequence { .. } | Kind::Photos { .. }),
+            Kind::Replay { path, .. } => !path.is_empty(),
+            _ => matches!(self, Kind::Video { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::ImageSequence { .. } | Kind::Photos { .. }),
         }
     }
     pub fn has_audio(&self) -> bool {
         match self {
-            Kind::Replay { path } => !path.is_empty(),
-            _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. }),
+            Kind::Replay { path, .. } => !path.is_empty(),
+            _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. }),
         }
     }
     /// The input a Video Delay copies (None for every other kind).
@@ -175,7 +176,7 @@ impl Kind {
     }
     pub fn keyable(&self) -> bool {
         match self {
-            Kind::Replay { path } => !path.is_empty(),
+            Kind::Replay { path, .. } => !path.is_empty(),
             _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop),
         }
     }
@@ -189,10 +190,10 @@ impl Kind {
     /// Inputs whose picture comes from a media thread (camera, files, desktop…).
     pub fn streamed(&self) -> bool {
         match self {
-            Kind::Replay { path } => !path.is_empty(),
+            Kind::Replay { path, .. } => !path.is_empty(),
             _ => matches!(
                 self,
-                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. }
+                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. }
             ),
         }
     }
@@ -358,6 +359,8 @@ pub struct Input {
     pub pos: f32,
     pub duration: f32,
     pub audio_on: bool,
+    pub solo: bool,
+    pub solo_pfl: bool,
     pub volume: f32,
     pub audio_effects: crate::audio::Effects,
     pub ptz_address: String,
@@ -387,7 +390,7 @@ pub struct Input {
     pub click_action: u8,
     pub delay_frames: u32,
     /// Live dBFS peak, filled in each frame for the Audio page's meter.
-    pub level: f32,
+    pub level: [f32; 2],
     pub bus_m: bool,
     pub bus_a: bool,
     pub bus_b: bool,
@@ -435,6 +438,8 @@ impl Input {
             pos: 0.0,
             duration: 60.0,
             audio_on: true,
+            solo: false,
+            solo_pfl: false,
             volume: 80.0,
             audio_effects: Default::default(),
             ptz_address: String::new(),
@@ -455,7 +460,7 @@ impl Input {
             effects_source: false,
             click_action: 0,
             delay_frames: 0,
-            level: 0.0,
+            level: [0.0; 2],
             bus_m: true,
             bus_a: false,
             bus_b: false,
@@ -844,12 +849,21 @@ impl AddKind {
         }
     }
     /// Built in this version?
+    pub fn history_group(self) -> Option<usize> {
+        match self {
+            Self::VideoFile => Some(0),
+            Self::ImageFile => Some(1),
+            Self::Photos | Self::ImageSequence => Some(2),
+            Self::AudioFile => Some(3),
+            _ => None,
+        }
+    }
+
     pub fn available(self) -> bool {
         !matches!(
             self,
             AddKind::Dvd
                 | AddKind::PowerPoint
-                | AddKind::AudioFile
                 | AddKind::VirtualSet
                 | AddKind::WebBrowser
                 | AddKind::VideoCall
@@ -874,10 +888,10 @@ impl AddKind {
             AddKind::TestImage => "A drawn stand-in still picture.",
             AddKind::Dvd => "Play a DVD disc — not available in this version.",
             AddKind::StreamSrt => "Receive H.264 or HEVC video from an SRT source.",
-            AddKind::Replay => "Show the selected Instant Replay event angle as an input. Configure angles and mark events in the Replay window.",
+            AddKind::Replay => "Create Replay A and Replay B and open the Instant Replay session setup.",
             AddKind::VideoDelay => "A delayed copy of another input. Pick the source, the buffer length and the resolution the picture is stored at.",
             AddKind::PowerPoint => "PowerPoint slides — not available in this version (export the slides as pictures and use Photos).",
-            AddKind::AudioFile => "An audio file — not available in this version (audio is not built yet).",
+            AddKind::AudioFile => "An audio file such as WAV, MP3, FLAC or AAC. Requires FFmpeg and FFprobe.",
             AddKind::AudioInput => "A microphone, USB audio interface or line input.",
             AddKind::VirtualSet => "Virtual studio sets — not available in this version.",
             AddKind::WebBrowser => "A web page as an input — not available in this version.",
@@ -911,6 +925,7 @@ pub struct AddDialog {
     pub device: usize,
     pub ndi_source: Option<String>,
     pub ndi_sources: Vec<String>,
+    pub thumbnails: std::collections::HashMap<String, eframe::egui::TextureHandle>,
     pub ndi_scan: bool,
     pub ndi_status: String,
     pub omt_sources: Vec<String>,
@@ -957,7 +972,7 @@ pub struct Switcher {
     pub playlist: Option<f64>,
     pub playlist_secs: f32,
     /// Fullscreen display (top bar "Fullscreen"): its own borderless window filling the chosen screen.
-    pub fullscreen: bool,
+    pub fullscreen: [bool; 2],
     /// Setup windows of the gear buttons next to Record, Stream, MultiCorder and PlayList
     /// (frmmain cmdRecSetup, cmdStreamingSetup, cmdMultiCorderSetup, cmdPlayListSetup).
     pub rec_setup: bool,
@@ -978,6 +993,7 @@ pub struct Switcher {
     pub add_dialog: AddDialog,
     pub filter: Option<u8>,
     pub confirm_close: Option<u32>,
+    pub program_audio_level: [f32; 2],
     pub master_volume: f32,
     pub master_on: bool,
     pub pause_preview: bool,
@@ -1027,15 +1043,19 @@ pub struct Switcher {
     pub replay_open: bool,
     pub replay_arm: bool,
     pub replay_angles: [u32; REPLAY_ANGLES],
-    pub replay_mark_in: bool,
-    pub replay_mark: bool,
-    pub replay_add: bool,
-    pub replay_available: bool,
+    pub replay_setup: crate::replay::Setup,
+    pub replay_setup_open: bool,
+    pub replay_session: String,
+    pub replay_read_only: bool,
+    pub replay_load: Option<bool>,
     pub replay_status: String,
-    pub replay_events: Vec<(String, Vec<String>)>,
-    pub replay_event: usize,
-    pub replay_angle: usize,
+    pub replay_events: Vec<crate::replay::Event>,
+    pub replay_event: Option<u64>,
+    pub replay_command: Option<crate::replay::Action>,
     pub replay_marking: bool,
+    pub replay_channel: usize,
+    pub replay_cameras: [usize; 2],
+    pub replay_speed: [u8; 2],
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
     pub confirm_stop: Option<&'static str>,
     /// Position copied in Input Settings (Copy / Paste buttons of the original).
@@ -1250,11 +1270,42 @@ pub enum InterfaceTheme {
     #[default]
     Classic,
     Modern,
+    Graphite,
+    Slate,
+    Midnight,
+}
+
+impl InterfaceTheme {
+    pub const ALL: [Self; 5] = [Self::Classic, Self::Modern, Self::Graphite, Self::Slate, Self::Midnight];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Modern => "Modern",
+            Self::Graphite => "Graphite",
+            Self::Slate => "Slate",
+            Self::Midnight => "Midnight",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub theme: InterfaceTheme,
+    pub preview_colour: eframe::egui::Color32,
+    pub output_colour: eframe::egui::Color32,
+    pub network_thumbnails: bool,
+    pub low_latency_capture: bool,
+    pub ffmpeg_extensions: String,
+    pub ffmpeg_all_files: bool,
+    pub decoder_deinterlace: u8,
+    pub record_audio: [bool; 3],
+    pub production_clock: bool,
+    pub default_audio_bus: usize,
+    pub default_audio_delay_ms: u32,
+    pub default_auto_mix: bool,
+    pub headphones_device: String,
+    pub recent_media: [Vec<String>; 4],
     /// InputSize = 208x156 (ms::.cctor @0x12e000 falls back to 200x150).
     pub input_w: f32,
     pub input_h: f32,
@@ -1281,6 +1332,7 @@ pub struct Settings {
     pub ftb_alert: bool,
     /// Fullscreen = False, External = False (start-up options), Maximise = True.
     pub start_fullscreen: bool,
+    pub start_fullscreen2: bool,
     pub start_external: bool,
     pub start_maximised: bool,
     /// External window source (config OutputsExternal, empty = Output): SRC_OUTPUT, SRC_PREVIEW,
@@ -1292,13 +1344,15 @@ pub struct Settings {
     pub omt_quality: [u8; OUTPUT_COUNT],
     pub srt_outputs: [crate::srt::Settings; OUTPUT_COUNT],
     /// Fullscreen display source (config OutputsFullscreen, empty = Output), same codes.
-    pub fs_source: u32,
-    pub fs_overlays: bool,
+    pub fs_source: [u32; 2],
+    pub fs_overlays: [bool; 2],
     /// Screen the Fullscreen display fills (frmSettings lblOutputScreen "Display:"),
     /// index into the monitor list; estimated default: the second screen when there is one.
-    pub fs_display: u8,
+    pub fs_display: [usize; 2],
     /// MultiView 1 and 2 layout (config MultiViewLayout / MultiViewLayout2 = 0 = Pro).
     pub mv_layout: [u8; 2],
+    pub mv_audio_program: [bool; 2],
+    pub mv_audio_inputs: [bool; 2],
     /// "Customise Layout" (config MultiViewInputs): what each small box shows.
     /// MV_AUTO = the next input in list order, otherwise a source code as above.
     pub mv_boxes: [Vec<u32>; 2],
@@ -1370,6 +1424,20 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             theme: InterfaceTheme::Classic,
+            preview_colour: crate::render::PREVIEW,
+            output_colour: crate::render::OUTPUT,
+            network_thumbnails: true,
+            low_latency_capture: false,
+            ffmpeg_extensions: String::new(),
+            ffmpeg_all_files: false,
+            decoder_deinterlace: 0,
+            record_audio: [true; 3],
+            production_clock: true,
+            default_audio_bus: 0,
+            default_audio_delay_ms: 0,
+            default_auto_mix: false,
+            headphones_device: String::new(),
+            recent_media: Default::default(),
             input_w: 208.0,
             input_h: 156.0,
             input_numbers: true,
@@ -1386,6 +1454,7 @@ impl Default for Settings {
             recording_alert: false,
             ftb_alert: false,
             start_fullscreen: false,
+            start_fullscreen2: false,
             start_external: false,
             start_maximised: true,
             outputs: [OutputRoute::default(); OUTPUT_COUNT],
@@ -1394,10 +1463,12 @@ impl Default for Settings {
             omt_outputs: [false; OUTPUT_COUNT],
             omt_quality: [0; OUTPUT_COUNT],
             srt_outputs: Default::default(),
-            fs_source: SRC_OUTPUT,
-            fs_overlays: true,
-            fs_display: 1,
+            fs_source: [SRC_OUTPUT; 2],
+            fs_overlays: [true; 2],
+            fs_display: [1, 2],
             mv_layout: [0, 0],
+            mv_audio_program: [false; 2],
+            mv_audio_inputs: [false; 2],
             mv_boxes: [Vec::new(), Vec::new()],
             ext_on_top: false,
             ext_hide_cursor: false,
@@ -1471,7 +1542,21 @@ impl Switcher {
         let c = &self.cfg;
         let b = |v: bool| if v { "1" } else { "0" };
         let lines = [
-            format!("theme={}", if c.theme == InterfaceTheme::Modern { "modern" } else { "classic" }),
+            format!("theme={}", c.theme.label().to_ascii_lowercase()),
+            format!("preview_colour={:02x}{:02x}{:02x}", c.preview_colour.r(), c.preview_colour.g(), c.preview_colour.b()),
+            format!("output_colour={:02x}{:02x}{:02x}", c.output_colour.r(), c.output_colour.g(), c.output_colour.b()),
+            format!("network_thumbnails={}", b(c.network_thumbnails)),
+            format!("low_latency_capture={}", b(c.low_latency_capture)),
+            format!("ffmpeg_extensions={}", serde_json::to_string(&c.ffmpeg_extensions).unwrap_or_default()),
+            format!("ffmpeg_all_files={}", b(c.ffmpeg_all_files)),
+            format!("decoder_deinterlace={}", c.decoder_deinterlace),
+            format!("record_audio={}", c.record_audio.map(b).join(",")),
+            format!("production_clock={}", b(c.production_clock)),
+            format!("default_audio_bus={}", c.default_audio_bus),
+            format!("default_audio_delay_ms={}", c.default_audio_delay_ms),
+            format!("default_auto_mix={}", b(c.default_auto_mix)),
+            format!("headphones_device={}", serde_json::to_string(&c.headphones_device).unwrap_or_default()),
+            format!("recent_media={}", serde_json::to_string(&c.recent_media).unwrap_or_default()),
             format!("input_size={}x{}", c.input_w, c.input_h),
             format!("input_numbers={}", b(c.input_numbers)),
             format!("input_close_confirm={}", b(c.input_close_confirm)),
@@ -1487,6 +1572,7 @@ impl Switcher {
             format!("recording_alert={}", b(c.recording_alert)),
             format!("ftb_alert={}", b(c.ftb_alert)),
             format!("start_fullscreen={}", b(c.start_fullscreen)),
+            format!("start_fullscreen2={}", b(c.start_fullscreen2)),
             format!("start_external={}", b(c.start_external)),
             format!("start_maximised={}", b(c.start_maximised)),
             format!("ext_source={}", c.outputs[0].source),
@@ -1503,9 +1589,14 @@ impl Switcher {
             format!("ext_on_top={}", b(c.ext_on_top)),
             format!("ext_hide_cursor={}", b(c.ext_hide_cursor)),
             format!("ext_size={}", c.ext_size),
-            format!("fs_source={}", c.fs_source),
-            format!("fs_overlays={}", b(c.fs_overlays)),
-            format!("fs_display={}", c.fs_display),
+            format!("fs_source={}", c.fs_source[0]),
+            format!("fs_overlays={}", b(c.fs_overlays[0])),
+            format!("fs_display={}", c.fs_display[0]),
+            format!("fs_source2={}", c.fs_source[1]),
+            format!("fs_overlays2={}", b(c.fs_overlays[1])),
+            format!("fs_display2={}", c.fs_display[1]),
+            format!("mv_audio_program={},{}", c.mv_audio_program[0] as u8, c.mv_audio_program[1] as u8),
+            format!("mv_audio_inputs={},{}", c.mv_audio_inputs[0] as u8, c.mv_audio_inputs[1] as u8),
             format!("mv_layout={},{}", c.mv_layout[0], c.mv_layout[1]),
             format!("mv_boxes1={}", c.mv_boxes[0].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")),
             format!("mv_boxes2={}", c.mv_boxes[1].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")),
@@ -1526,7 +1617,8 @@ impl Switcher {
             format!("mc_outputs={}", c.mc_outputs.iter().map(|on| if *on { '1' } else { '0' }).collect::<String>()),
             format!("streams={}", serde_json::Value::Array(c.streams.iter().map(|d|
                 serde_json::json!({"provider": d.provider, "url": d.url, "key": d.key,
-                    "quality": d.quality, "source": d.source, "hardware": d.hardware})).collect())),
+                    "quality": d.quality, "source": d.source, "hardware": d.hardware, "hevc": d.hevc,
+                    "direct": d.direct, "bitrate": d.bitrate})).collect())),
             format!("playlist_loop={}", b(c.playlist_loop)),
             format!("out_size={}", c.out_size),
             format!("out_rate={}", c.out_rate),
@@ -1562,7 +1654,35 @@ impl Switcher {
             let on = v == "1";
             let c = &mut self.cfg;
             match k {
-                "theme" => c.theme = if v == "modern" { InterfaceTheme::Modern } else { InterfaceTheme::Classic },
+                "theme" => c.theme = InterfaceTheme::ALL.into_iter()
+                    .find(|theme| theme.label().eq_ignore_ascii_case(v)).unwrap_or_default(),
+                "preview_colour" | "output_colour" => {
+                    if let Ok(rgb) = u32::from_str_radix(v, 16) {
+                        let [_, r, g, b] = rgb.to_be_bytes();
+                        let colour = eframe::egui::Color32::from_rgb(r, g, b);
+                        if k == "preview_colour" { c.preview_colour = colour; } else { c.output_colour = colour; }
+                    }
+                }
+                "network_thumbnails" => c.network_thumbnails = on,
+                "low_latency_capture" => c.low_latency_capture = on,
+                "ffmpeg_extensions" => c.ffmpeg_extensions = serde_json::from_str(v).unwrap_or_default(),
+                "ffmpeg_all_files" => c.ffmpeg_all_files = on,
+                "decoder_deinterlace" => c.decoder_deinterlace = v.parse::<u8>().unwrap_or(0).min(2),
+                "record_audio" => {
+                    for (enabled, flag) in c.record_audio.iter_mut().zip(v.split(',')) {
+                        *enabled = flag == "1";
+                    }
+                }
+                "production_clock" => c.production_clock = on,
+                "default_audio_bus" => c.default_audio_bus = v.parse::<usize>().unwrap_or(0).min(2),
+                "default_audio_delay_ms" => c.default_audio_delay_ms = v.parse::<u32>().unwrap_or(0).min(1000),
+                "default_auto_mix" => c.default_auto_mix = on,
+                "headphones_device" => c.headphones_device = serde_json::from_str(v).unwrap_or_default(),
+                "recent_media" => {
+                    if let Ok(history) = serde_json::from_str::<[Vec<String>; 4]>(v) {
+                        c.recent_media = history.map(|items| items.into_iter().take(16).collect());
+                    }
+                }
                 "input_size" => {
                     if let Some((w, h)) = v.split_once('x') {
                         c.input_w = w.parse::<f32>().unwrap_or(208.0).clamp(120.0, 480.0);
@@ -1583,6 +1703,7 @@ impl Switcher {
                 "recording_alert" => c.recording_alert = on,
                 "ftb_alert" => c.ftb_alert = on,
                 "start_fullscreen" => c.start_fullscreen = on,
+                "start_fullscreen2" => c.start_fullscreen2 = on,
                 "start_external" => c.start_external = on,
                 "start_maximised" => c.start_maximised = on,
                 "ext_source" => c.outputs[0].source = v.parse().unwrap_or(SRC_OUTPUT),
@@ -1620,9 +1741,18 @@ impl Switcher {
                 "ext_on_top" => c.ext_on_top = on,
                 "ext_hide_cursor" => c.ext_hide_cursor = on,
                 "ext_size" => c.ext_size = v.parse().unwrap_or(0),
-                "fs_source" => c.fs_source = v.parse().unwrap_or(SRC_OUTPUT),
-                "fs_overlays" => c.fs_overlays = on,
-                "fs_display" => c.fs_display = v.parse().unwrap_or(1),
+                "fs_source" | "fs_source2" => c.fs_source[usize::from(k.ends_with('2'))] = v.parse().unwrap_or(SRC_OUTPUT),
+                "fs_overlays" | "fs_overlays2" => c.fs_overlays[usize::from(k.ends_with('2'))] = on,
+                "fs_display" | "fs_display2" => {
+                    let slot = usize::from(k.ends_with('2'));
+                    c.fs_display[slot] = v.parse().unwrap_or(slot + 1);
+                }
+                "mv_audio_program" | "mv_audio_inputs" => {
+                    let flags = if k == "mv_audio_program" { &mut c.mv_audio_program } else { &mut c.mv_audio_inputs };
+                    for (flag, value) in flags.iter_mut().zip(v.split(',')) {
+                        *flag = value == "1";
+                    }
+                }
                 "mv_layout" => {
                     for (k, p) in v.split(',').take(2).enumerate() {
                         c.mv_layout[k] = p.parse::<u8>().unwrap_or(0).min(MV_LAYOUTS.len() as u8 - 1);
@@ -1657,9 +1787,12 @@ impl Switcher {
                             destination.provider = stream["provider"].as_u64().unwrap_or(0).min(3) as u8;
                             destination.url = stream["url"].as_str().unwrap_or("").into();
                             destination.key = stream["key"].as_str().unwrap_or("").into();
-                            destination.quality = stream["quality"].as_u64().unwrap_or(1).min(2) as u8;
+                            destination.quality = stream["quality"].as_u64().unwrap_or(1).min(crate::stream::QUALITIES.len() as u64 - 1) as u8;
                             destination.source = stream["source"].as_u64().unwrap_or(0).min((OUTPUT_COUNT - 1) as u64) as usize;
                             destination.hardware = stream["hardware"].as_bool().unwrap_or(false);
+                            destination.hevc = stream["hevc"].as_bool().unwrap_or(false);
+                            destination.direct = stream["direct"].as_u64().and_then(|value| u32::try_from(value).ok());
+                            destination.bitrate = stream["bitrate"].as_u64().map(|value| value.clamp(1, 100) as u32);
                         }
                     }
                 }
@@ -1745,7 +1878,7 @@ impl Switcher {
             multicorder: None,
             playlist: None,
             playlist_secs: PLAYLIST_DEFAULT_SECS,
-            fullscreen: false,
+            fullscreen: [false; 2],
             rec_setup: false,
             stream_setup: false,
             stream_slot: 0,
@@ -1772,6 +1905,7 @@ impl Switcher {
                 device: 0,
                 ndi_source: None,
                 ndi_sources: Vec::new(),
+                thumbnails: Default::default(),
                 ndi_scan: true,
                 ndi_status: String::new(),
                 omt_sources: Vec::new(),
@@ -1787,6 +1921,7 @@ impl Switcher {
             },
             filter: None,
             confirm_close: None,
+            program_audio_level: [0.0; 2],
             master_volume: 85.0,
             master_on: true,
             pause_preview: true,
@@ -1826,15 +1961,19 @@ impl Switcher {
             replay_open: false,
             replay_arm: false,
             replay_angles: [SRC_OUTPUT, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO],
-            replay_mark_in: false,
-            replay_mark: false,
-            replay_add: false,
-            replay_available: false,
+            replay_setup: Default::default(),
+            replay_setup_open: false,
+            replay_session: String::new(),
+            replay_read_only: false,
+            replay_load: None,
             replay_status: String::new(),
             replay_events: Vec::new(),
-            replay_event: 0,
-            replay_angle: 0,
+            replay_event: None,
+            replay_command: None,
             replay_marking: false,
+            replay_channel: 0,
+            replay_cameras: [0, 0],
+            replay_speed: [100, 100],
             confirm_stop: None,
             position_clipboard: None,
             cfg: Settings::default(),
@@ -1908,6 +2047,20 @@ impl Switcher {
 
     // ------------------------------------------------------------ transitions
 
+    pub fn automatic_audio_gain(&self, input: &Input) -> f32 {
+        if !input.auto_mix_audio {
+            return 1.0;
+        }
+        if let Some(transition) = &self.trans {
+            if transition.stinger.is_none() && transition.effect != Effect::Cut {
+                let progress = (transition.progress / FULL).clamp(0.0, 1.0);
+                return f32::from(transition.from == Some(input.id)) * (1.0 - progress)
+                    + f32::from(transition.to == input.id) * progress;
+            }
+        }
+        f32::from(self.output == Some(input.id))
+    }
+
     fn on_transition_start(&mut self, to: u32) {
         let (play, restart) = (self.play_active, self.restart_active);
         if let Some(i) = self.input_mut(to) {
@@ -1919,11 +2072,6 @@ impl Switcher {
                 if play || i.play_active {
                     i.playing = true;
                 }
-            }
-            // Input Settings > General: Automatically mix audio.
-            if i.auto_mix_audio {
-                i.audio_on = true;
-                i.bus_m = true;
             }
         }
     }
@@ -2279,8 +2427,11 @@ impl Switcher {
                 *b = MV_AUTO;
             }
         }
+        for stream in &mut self.cfg.streams {
+            if stream.direct == Some(id + 1) { stream.direct = None; }
+        }
         for src in self.cfg.outputs.iter_mut().map(|out| &mut out.source)
-            .chain(std::iter::once(&mut self.cfg.fs_source))
+            .chain(self.cfg.fs_source.iter_mut())
         {
             if *src == id + 1 {
                 *src = SRC_OUTPUT;
@@ -2427,6 +2578,18 @@ impl Switcher {
     }
 
     /// Adds the input described by the Add Input dialog. Returns an error to show, if any.
+    pub fn ensure_replay_inputs(&mut self) -> [u32; 2] {
+        std::array::from_fn(|channel| {
+            if let Some(input) = self.inputs.iter().find(|input| {
+                matches!(input.kind, Kind::Replay { channel: existing, .. } if existing == channel)
+            }) {
+                return input.id;
+            }
+            self.add(Input::new(0, if channel == 0 { "Replay A" } else { "Replay B" },
+                Kind::Replay { path: String::new(), channel }))
+        })
+    }
+
     pub fn add_from_dialog(&mut self) -> Result<(), String> {
         let devices = self.dialog_devices();
         let d = &self.add_dialog;
@@ -2468,12 +2631,24 @@ impl Switcher {
                 Some(link) => (Kind::Device { link: link.clone(), blackmagic: false }, link[4..].to_owned()),
                 None => (Kind::Desktop, "Desktop Capture".into()),
             },
+            AddKind::AudioFile => {
+                let path = std::path::Path::new(d.path.trim());
+                if !path.is_file() { return Err("Choose an audio file first".into()); }
+                let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                (Kind::AudioFile { path: d.path.trim().into() }, name)
+            }
             AddKind::StreamSrt => {
                 d.srt.url()?;
                 let link = format!("srt:{}", serde_json::to_string(&d.srt).map_err(|e| e.to_string())?);
                 (Kind::Device { link, blackmagic: false }, d.srt.label())
             }
-            AddKind::Replay => (Kind::Replay { path: String::new() }, "Instant Replay".into()),
+            AddKind::Replay => {
+                self.ensure_replay_inputs();
+                self.replay_open = true;
+                self.replay_setup_open = true;
+                self.add_dialog.name.clear();
+                return Ok(());
+            }
             AddKind::ImageSequence | AddKind::Photos => {
                 let f = d.folder.trim().to_string();
                 if f.is_empty() || !std::path::Path::new(&f).is_dir() {
@@ -2522,6 +2697,13 @@ impl Switcher {
         };
         let name = if d.name.trim().is_empty() { default_name } else { d.name.trim().to_string() };
         let mut i = Input::new(0, &name, kind);
+        if i.kind.has_audio() {
+            i.bus_m = self.cfg.default_audio_bus == 0;
+            i.bus_a = self.cfg.default_audio_bus == 1;
+            i.bus_b = self.cfg.default_audio_bus == 2;
+            i.audio_effects.delay_ms = self.cfg.default_audio_delay_ms as f32;
+            i.auto_mix_audio = self.cfg.default_auto_mix;
+        }
         if d.kind == AddKind::Replay {
             i.playing = true;
         }
@@ -2681,11 +2863,12 @@ impl Switcher {
                 Kind::Camera(s) => ("camera", s.to_string(), String::new()),
                 Kind::Video { hue } => ("video", hue.to_string(), String::new()),
                 Kind::Image(s) => ("image", s.to_string(), String::new()),
+                Kind::AudioFile { path } => ("audiofile", path.clone(), String::new()),
                 Kind::Device { link, blackmagic } => ("device", link.clone(), (*blackmagic as u8).to_string()),
                 Kind::VideoFile { path } => ("videofile", path.clone(), String::new()),
                 Kind::ImageFile { path } => ("imagefile", path.clone(), String::new()),
                 Kind::VideoList { paths, .. } => ("list", paths.join("|"), String::new()),
-                Kind::Replay { path } => ("replay", path.clone(), String::new()),
+                Kind::Replay { channel, .. } => ("replay", String::new(), channel.to_string()),
                 Kind::Desktop => ("desktop", String::new(), String::new()),
                 Kind::ImageSequence { folder } => ("imagesequence", folder.clone(), String::new()),
                 Kind::Photos { folder } => ("photos", folder.clone(), String::new()),
@@ -2734,7 +2917,8 @@ impl Switcher {
                 | (i.rec601 as u16) << 7
                 | (i.premultiplied as u16) << 8
                 | (i.flatten as u16) << 9
-                | (i.effects_source as u16) << 10;
+                | (i.effects_source as u16) << 10
+                | (i.solo_pfl as u16) << 11;
             if bits != 0 {
                 out.push_str(&format!("input_flags\t{}\t{}\n", n + 1, bits));
             }
@@ -2854,11 +3038,12 @@ impl Switcher {
                         "camera" => Kind::Camera(f[3].parse().unwrap_or(1)),
                         "video" => Kind::Video { hue: f[3].parse().unwrap_or(0.5) },
                         "image" => Kind::Image(f[3].parse().unwrap_or(1)),
+                        "audiofile" => Kind::AudioFile { path: f[3].into() },
                         "device" => Kind::Device { link: f[3].into(), blackmagic: f[4] == "1" },
                         "videofile" => Kind::VideoFile { path: f[3].into() },
                         "imagefile" => Kind::ImageFile { path: f[3].into() },
                         "list" => Kind::VideoList { paths: f[3].split('|').filter(|p| !p.is_empty()).map(String::from).collect(), idx: 0 },
-                        "replay" => Kind::Replay { path: f[3].into() },
+                        "replay" => Kind::Replay { path: String::new(), channel: f[4].parse::<usize>().unwrap_or(0).min(1) },
                         "desktop" => Kind::Desktop,
                         "imagesequence" => Kind::ImageSequence { folder: f[3].into() },
                         "photos" => Kind::Photos { folder: f[3].into() },
@@ -2973,6 +3158,7 @@ impl Switcher {
                         i.premultiplied = bits & 256 != 0;
                         i.flatten = bits & 512 != 0;
                         i.effects_source = bits & 1024 != 0;
+                        i.solo_pfl = bits & 2048 != 0;
                     }
                 }
                 Some("aspect") if f.len() >= 3 => {
@@ -3083,6 +3269,25 @@ fn clean(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_audio_follows_program_without_changing_mute_or_bus() {
+        let mut s = Switcher::demo();
+        let from = s.output.unwrap();
+        let to = s.preview.unwrap();
+        for id in [from, to] {
+            s.input_mut(id).unwrap().auto_mix_audio = true;
+        }
+        s.input_mut(to).unwrap().audio_on = false;
+        s.input_mut(to).unwrap().bus_m = false;
+        assert_eq!(s.automatic_audio_gain(s.input(from).unwrap()), 1.0);
+        assert_eq!(s.automatic_audio_gain(s.input(to).unwrap()), 0.0);
+        s.start_transition(Effect::Fade, 500);
+        s.trans.as_mut().unwrap().progress = FULL * 0.25;
+        assert_eq!(s.automatic_audio_gain(s.input(from).unwrap()), 0.75);
+        assert_eq!(s.automatic_audio_gain(s.input(to).unwrap()), 0.25);
+        assert!(!s.input(to).unwrap().audio_on);
+        assert!(!s.input(to).unwrap().bus_m);
+    }
     use super::*;
 
     #[test]

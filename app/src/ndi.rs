@@ -201,19 +201,23 @@ const BGRA: u32 = u32::from_le_bytes(*b"BGRA");
 const BGRX: u32 = u32::from_le_bytes(*b"BGRX");
 
 pub fn run_capture(shared: Arc<Shared>, name: &str) {
-    let result = receive(&shared, name);
+    let result = receive(&shared, name, false);
     if let Err(error) = result {
         *shared.status.lock().unwrap() = error;
     }
 }
 
-fn receive(shared: &Shared, name: &str) -> Result<(), String> {
+pub fn thumbnail(shared: Arc<Shared>, name: &str) -> Result<(), String> {
+    receive(&shared, name, true)
+}
+
+fn receive(shared: &Shared, name: &str, thumbnail: bool) -> Result<(), String> {
     let api = api()?;
     let name = CString::new(name).map_err(|_| "Invalid NDI source name")?;
     unsafe {
         let recv = (api.recv_create)(&ReceiveSettings {
             source: Source { name: name.as_ptr(), address: null() },
-            color_format: 0, bandwidth: 100, allow_fields: false, receiver_name: null(),
+            color_format: 0, bandwidth: if thumbnail { 0 } else { 100 }, allow_fields: false, receiver_name: null(),
         });
         if recv.is_null() { return Err("Could not open NDI source".into()); }
         let mut last_frame = Instant::now();
@@ -236,8 +240,9 @@ fn receive(shared: &Shared, name: &str) -> Result<(), String> {
                     }
                 }
                 (api.recv_free)(recv, &video);
+                if thumbnail && receiving { break; }
             } else if kind == 2 {
-                if audio.fourcc == FLTP {
+                if !thumbnail && audio.fourcc == FLTP {
                     crate::audio::capture_planar(shared, audio.data, audio.samples as usize, audio.stride as usize,
                         audio.channels as usize, audio.rate as usize, NDI_PCM_SCALE, &mut audio_phase);
                 }

@@ -15,11 +15,14 @@ pub struct Destination {
     pub quality: u8,
     pub source: usize,
     pub hardware: bool,
+    pub hevc: bool,
+    pub direct: Option<u32>,
+    pub bitrate: Option<u32>,
 }
 
 impl Default for Destination {
     fn default() -> Self {
-        Self { provider: 0, url: String::new(), key: String::new(), quality: 1, source: 0, hardware: false }
+        Self { provider: 0, url: String::new(), key: String::new(), quality: 1, source: 0, hardware: false, hevc: false, direct: None, bitrate: None }
     }
 }
 
@@ -31,7 +34,13 @@ impl std::fmt::Debug for Destination {
     }
 }
 
-pub const COUNT: usize = 3;
+pub const COUNT: usize = 5;
+pub const QUALITIES: [(&str, [u32; 2], u32); 10] = [
+    ("720p", [1280, 720], 3), ("1080p", [1920, 1080], 6), ("1080p High", [1920, 1080], 9),
+    ("240p", [426, 240], 1), ("360p", [640, 360], 2), ("480p", [854, 480], 3),
+    ("540p", [960, 540], 4), ("900p", [1600, 900], 5), ("1440p", [2560, 1440], 15),
+    ("2160p (4K)", [3840, 2160], 30),
+];
 pub const HARDWARE_ENCODER_LABEL: &str = if cfg!(target_os = "macos") {
     "Use Apple VideoToolbox when available"
 } else {
@@ -95,13 +104,13 @@ impl Output {
             }).collect::<Vec<_>>().join("|");
             ("tee", slaves)
         };
-        let (height, mbps) = [(720, 3), (1080, 6), (1080, 9)][usize::from(dest.quality).min(2)];
-        Ok(Self::start_encoder(Encoding { url, muxer, height: Some(height), kbps: mbps * 1000,
-            audio_kbps: 128, gop_seconds: 2, hardware: dest.hardware, hevc: false }, size, fps))
+        let (_, resolution, mbps) = QUALITIES[usize::from(dest.quality).min(QUALITIES.len() - 1)];
+        Ok(Self::start_encoder(Encoding { url, muxer, resolution: Some(resolution), kbps: dest.bitrate.unwrap_or(mbps) * 1000,
+            audio_kbps: 128, gop_seconds: 2, hardware: dest.hardware, hevc: dest.hevc }, size, fps))
     }
 
     pub fn start_srt(config: &crate::srt::Settings, size: [u32; 2], fps: f64) -> Result<Self, String> {
-        Ok(Self::start_encoder(Encoding { url: config.connection.url()?, muxer: "mpegts", height: None,
+        Ok(Self::start_encoder(Encoding { url: config.connection.url()?, muxer: "mpegts", resolution: None,
             kbps: config.video_kbps, audio_kbps: config.audio_kbps, gop_seconds: config.gop_seconds,
             hardware: config.hardware, hevc: config.hevc }, size, fps))
     }
@@ -148,7 +157,7 @@ impl Output {
 struct Encoding {
     url: String,
     muxer: &'static str,
-    height: Option<u32>,
+    resolution: Option<[u32; 2]>,
     kbps: u32,
     audio_kbps: u32,
     gop_seconds: u32,
@@ -191,8 +200,7 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<(NetworkFrame, crate::
     if encoder == cpu {
         cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
     }
-    if let Some(height) = encoding.height {
-        let width = height * 16 / 9;
+    if let Some([width, height]) = encoding.resolution {
         cmd.args(["-vf", &format!("scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")]);
     }
     if encoding.muxer == "tee" { cmd.args(["-flags", "+global_header", "-use_fifo", "1"]); }
@@ -264,12 +272,13 @@ fn hardware_encoder_available(encoder: &str) -> bool {
 #[test]
 #[ignore = "requires an FFmpeg build with RTMP listen support"]
 fn ffmpeg_rtmp_loopback() {
-    rtmp_loopback(1);
-    rtmp_loopback(2);
+    rtmp_loopback(1, false);
+    rtmp_loopback(5, false);
+    rtmp_loopback(1, true);
 }
 
 #[cfg(test)]
-fn rtmp_loopback(count: usize) {
+fn rtmp_loopback(count: usize, hevc: bool) {
     use std::net::TcpListener;
     use std::time::Instant;
     let mut servers = Vec::new();
@@ -284,7 +293,7 @@ fn rtmp_loopback(count: usize) {
             "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-t", "1", "-f", "flv"])
             .arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
         servers.push((server, path));
-        destinations.push(Destination { url, quality: 0, ..Default::default() });
+        destinations.push(Destination { url, quality: 4, hevc, ..Default::default() });
     }
     std::thread::sleep(Duration::from_millis(250));
     let destinations: Vec<_> = destinations.iter().collect();

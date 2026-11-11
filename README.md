@@ -8,6 +8,8 @@ LiveMix is a Rust live video production switcher for Windows and Apple Silicon M
 
 ## Start here
 
+Test builds for Windows x64 and Apple Silicon are published under [GitHub Releases](https://github.com/mrbocao/livemix/releases). See the setup guide below for FFmpeg, device runtimes and platform requirements.
+
 | Guide | What it covers |
 | --- | --- |
 | [Setup and dependencies](docs/SETUP.md) | Windows and Mac builds, FFmpeg, NDI, OMT, DeckLink, permissions and GPU setup |

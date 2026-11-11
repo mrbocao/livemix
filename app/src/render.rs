@@ -30,7 +30,6 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9a, 0xa2, 0xaa);
 pub const PREVIEW: Color32 = Color32::from_rgb(0xff, 0x8c, 0x00);
 /// config ActiveColour = DarkGreen
 pub const OUTPUT: Color32 = Color32::from_rgb(0x00, 0x64, 0x00);
-pub const OUTPUT_BRIGHT: Color32 = Color32::from_rgb(0x00, 0x64, 0x00);
 
 pub fn clock(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
@@ -271,7 +270,7 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             }
             p.text(r.center(), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.11).max(6.0)), fade(Color32::from_white_alpha(230), a));
         }
-        Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::VideoDelay { .. } => {
+        Kind::AudioFile { .. } | Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::VideoDelay { .. } => {
             let keyed = inp.key.on || matches!(inp.kind, Kind::ImageFile { .. } | Kind::ImageSequence { .. });
             match inp.tex {
                 Some((tex, [tw, th])) if tw > 0 && th > 0 => {
