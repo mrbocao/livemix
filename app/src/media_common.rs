@@ -16,8 +16,9 @@ pub struct Shared {
     #[cfg(windows)]
     pub(crate) gpu_playback: AtomicBool,
     #[cfg(windows)]
-    pub(crate) cpu_colour: AtomicBool,
+    pub(crate) cpu_frames_required: AtomicBool,
     pub video_adapter: Mutex<Option<String>>,
+    pub decoder: Mutex<String>,
     pub audio: Mutex<crate::audio::Buffer>,
     /// Smoothed mapping between the system clock and the file's media position.
     pub audio_position: Mutex<Option<crate::audio::AudioClock>>,
@@ -109,8 +110,13 @@ pub enum Source {
     Omt(String),
     Srt(crate::srt::Connection),
     File(String),
+    #[cfg(windows)]
+    AutoFile(String, u8),
+    #[cfg(windows)]
+    DirectShowFile(String, crate::vmix_settings::DirectShow, u8),
     FfmpegFile(String, u8),
     AudioFile(String),
+    Presentation(String),
     AudioDevice(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
@@ -133,13 +139,15 @@ pub(crate) struct RecFrame {
 }
 
 /// Writes frames to a file on a bounded, independent encoder queue.
+pub(crate) type ReplayIndex = Arc<Mutex<Vec<(Instant, u64)>>>;
+
 pub struct Recorder {
     pub(crate) tx: SyncSender<RecFrame>,
     pub path: String,
     pub error: Arc<Mutex<String>>,
     encoder: Arc<Mutex<String>>,
     dropped: AtomicU64,
-    timeline: Option<Arc<std::sync::OnceLock<Instant>>>,
+    pub(crate) replay_index: Option<ReplayIndex>,
     #[cfg(windows)]
     gpu: Arc<AtomicBool>,
 }
@@ -159,11 +167,10 @@ impl Recorder {
     }
 
     pub(crate) fn spawn_writer(path: String, opts: RecOpts) -> (Recorder, std::thread::JoinHandle<()>) {
-        Self::spawn_writer_with_timeline(path, opts, None)
+        Self::spawn_writer_indexed(path, opts, false)
     }
 
-    pub(crate) fn spawn_writer_with_timeline(path: String, opts: RecOpts,
-        timeline: Option<Arc<std::sync::OnceLock<Instant>>>) -> (Recorder, std::thread::JoinHandle<()>)
+    pub(crate) fn spawn_writer_indexed(path: String, opts: RecOpts, indexed: bool) -> (Recorder, std::thread::JoinHandle<()>)
     {
         // Keep the UI responsive and bound memory if the encoder falls behind.
         let (tx, rx) = sync_channel(3);
@@ -175,11 +182,13 @@ impl Recorder {
         let gpu = Arc::new(AtomicBool::new(opts.hw && matches!(opts.format, RecordFormat::H264 | RecordFormat::Hevc)));
         #[cfg(windows)]
         let gpu_worker = gpu.clone();
-        let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts,
+        let replay_index: Option<ReplayIndex> = indexed.then(Default::default);
+        let index = replay_index.clone();
+        let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts, index,
             #[cfg(windows)]
             gpu_worker,
         ));
-        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0), timeline,
+        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0), replay_index,
             #[cfg(windows)]
             gpu,
         }, worker)
@@ -215,10 +224,7 @@ impl Recorder {
         for recorder in recorders { recorder.enqueue(frame.clone()); }
     }
 
-    fn enqueue(&self, mut frame: RecFrame) {
-        if let Some(timeline) = &self.timeline {
-            frame.timeline_origin = Some(*timeline.get_or_init(|| frame.captured_at));
-        }
+    fn enqueue(&self, frame: RecFrame) {
         if matches!(self.tx.try_send(frame), Err(std::sync::mpsc::TrySendError::Full(_))) {
             self.note_dropped_frames(1);
         }
@@ -387,9 +393,12 @@ pub const NEW_FILE_EVERY: [u32; 8] = [0, 1, 5, 10, 15, 20, 30, 60];
 pub enum PickKind {
     Video,
     Audio,
+    Presentation,
     Image,
     Title,
     PresetOpen,
+    SettingsOpen,
+    SettingsSave,
     PresetSave,
     /// Several video files (List input); answer is the paths joined by '\n'.
     VideoMany,
@@ -431,6 +440,11 @@ pub(crate) fn run_pictures(sh: Arc<Shared>, folder: String, sequence: bool, fps:
             shown = false;
             sh.ended.store(false, Ordering::Relaxed);
         }
+        if let Some(ms) = sh.seek_ms.swap(0, Ordering::Relaxed).checked_sub(1) {
+            i = ((ms / (step.as_millis() as u64).max(1)) as usize).min(files.len() - 1);
+            shown = false;
+            sh.ended.store(false, Ordering::Relaxed);
+        }
         let paused = sh.paused.load(Ordering::Relaxed) || sh.ended.load(Ordering::Relaxed);
         if paused && shown {
             std::thread::sleep(Duration::from_millis(15));
@@ -448,7 +462,8 @@ pub(crate) fn run_pictures(sh: Arc<Shared>, folder: String, sequence: bool, fps:
         sh.pos_ms.store(step.as_millis() as u64 * i as u64, Ordering::Relaxed);
         if !sh.paused.load(Ordering::Relaxed) {
             // wait for the next picture (keep reacting to stop / pause / restart)
-            while t0.elapsed() < step && !sh.stop.load(Ordering::Relaxed) && !sh.restart.load(Ordering::Relaxed) {
+            while t0.elapsed() < step && !sh.stop.load(Ordering::Relaxed) && !sh.restart.load(Ordering::Relaxed)
+                && sh.seek_ms.load(Ordering::Relaxed) == 0 {
                 std::thread::sleep(Duration::from_millis(5).min(step));
             }
             if i + 1 < files.len() {

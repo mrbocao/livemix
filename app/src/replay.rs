@@ -18,12 +18,16 @@ pub struct Setup {
     pub delete_old: bool,
     pub transition_ms: u32,
     pub match_speed: bool,
+    pub show_live_sources: bool,
+    pub advanced: bool,
+    pub play_to_program: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
         Self { folder: String::new(), size: None, fps: None, mbps: 25, codec: "h264".into(),
-            audio: 0, buffer_seconds: 120, delete_old: true, transition_ms: 0, match_speed: false }
+            audio: 0, buffer_seconds: 120, delete_old: true, transition_ms: 0, match_speed: false,
+            show_live_sources: false, advanced: false, play_to_program: false }
     }
 }
 
@@ -32,6 +36,40 @@ pub struct Segment {
     pub start: u64,
     pub end: u64,
     pub files: [Option<String>; 8],
+    #[serde(default)]
+    pub frames: [Vec<FrameStamp>; 8],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrameStamp {
+    pub show_ms: u64,
+    pub media_ms: u64,
+}
+
+impl Segment {
+    pub fn seek_time(&self, angle: usize, time: u64) -> u64 {
+        let show = time.saturating_sub(self.start);
+        let Some(frames) = self.frames.get(angle).filter(|frames| !frames.is_empty()) else { return show; };
+        frames[frames.partition_point(|frame| frame.show_ms <= show).saturating_sub(1)].media_ms
+    }
+
+    pub fn show_time(&self, angle: usize, time: u64) -> u64 {
+        let position = self.frames.get(angle).filter(|frames| !frames.is_empty()).map_or(time, |frames| {
+            let frame = &frames[frames.partition_point(|frame| frame.media_ms <= time).saturating_sub(1)];
+            frame.show_ms.saturating_add(time.saturating_sub(frame.media_ms))
+        });
+        self.start.saturating_add(position).min(self.end)
+    }
+
+    fn cut_end(&self, angle: usize, time: u64) -> u64 {
+        let show = time.saturating_sub(self.start);
+        let Some(frames) = self.frames.get(angle).filter(|frames| !frames.is_empty()) else { return show; };
+        let first = frames.partition_point(|frame| frame.show_ms < show);
+        frames.get(first).map_or_else(
+            || frames.last().unwrap().media_ms.saturating_add(show.saturating_sub(frames.last().unwrap().show_ms)),
+            |frame| frame.media_ms,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -91,6 +129,13 @@ impl Session {
         session.setup.size = session.setup.size.filter(|[w, h]| (16..=7680).contains(w) && (16..=4320).contains(h));
         session.segments.retain(|segment| segment.start < segment.end);
         session.segments.sort_by_key(|segment| segment.start);
+        for segment in &mut session.segments {
+            for frames in &mut segment.frames {
+                if !frames.windows(2).all(|pair| pair[0].show_ms <= pair[1].show_ms && pair[0].media_ms <= pair[1].media_ms) {
+                    frames.clear();
+                }
+            }
+        }
         session.events.retain(|event| event.start < event.end);
         for event in &mut session.events { event.speed = event.speed.clamp(1, 100); }
         session.next_id = session.next_id.max(session.events.iter().map(|event| event.id).max().unwrap_or(0).saturating_add(1));
@@ -105,10 +150,10 @@ impl Session {
             .map_err(|err| err.to_string())
     }
 
-    pub fn new_event(&mut self, start: u64, end: u64) -> u64 {
+    pub fn new_event_with_angles(&mut self, start: u64, end: u64, provisional: [bool; 8]) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        let angles = std::array::from_fn(|angle| self.segments.iter()
+        let angles = std::array::from_fn(|angle| provisional[angle] || self.segments.iter()
             .any(|segment| segment.end > start && segment.start < end && segment.files[angle].is_some()));
         self.events.insert(0, Event { id, start, end, description: format!("Event {id}"), speed: 100, angles });
         id
@@ -199,7 +244,7 @@ pub fn native_session(folder: &Path) -> Result<Session, String> {
             (*camera == angle && *time == start).then(|| path.as_ref().map(|path| path.to_string_lossy().into_owned())).flatten()
         }));
         if files.iter().any(Option::is_some) {
-            session.segments.push(Segment { start: start - origin, end: end - origin, files });
+            session.segments.push(Segment { start: start - origin, end: end - origin, files, frames: Default::default() });
         }
     }
     for event in &mut session.events {
@@ -287,8 +332,8 @@ pub fn event_media(folder: &Path, segments: &[Segment], event: &Event, angle: us
         }
         let path = segment.files.get(angle).and_then(Option::as_deref).and_then(|file| indexed_path(folder, file))
             .and_then(|path| path.canonicalize().ok()).ok_or("Camera media is missing for this range")?;
-        let start = cursor.saturating_sub(segment.start);
-        let end = event.end.min(segment.end) - segment.start;
+        let start = segment.seek_time(angle, cursor);
+        let end = segment.cut_end(angle, event.end.min(segment.end)).max(start.saturating_add(1));
         let path = native.prepare(path, output)?.canonicalize().map_err(|error| error.to_string())?;
         let name = path.to_str().ok_or("Invalid replay filename")?;
         let name = name.strip_prefix(r"\\?\").unwrap_or(name).replace('\\', "/");
@@ -337,8 +382,14 @@ pub enum Action {
     DeleteEvent(u64),
     Play { event: u64, program: bool },
     Pause(usize),
+    SetPlaying(usize, bool),
+    Stop(usize),
     Live,
     Step(i8),
+    Seek(u64),
+    Jog(usize, i8),
+    Cue(usize, u64),
+    TakeCue(usize),
     Reverse,
     Export { event: u64, angle: usize },
 }
@@ -346,6 +397,27 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_marks_hold_the_previous_picture_across_asymmetric_drops() {
+        let mut segment = Segment { start: 4000, end: 8000, files: Default::default(), frames: Default::default() };
+        segment.frames[0] = vec![
+            FrameStamp { show_ms: 10, media_ms: 0 },
+            FrameStamp { show_ms: 40, media_ms: 30 },
+            FrameStamp { show_ms: 200, media_ms: 190 },
+        ];
+        segment.frames[1] = vec![
+            FrameStamp { show_ms: 40, media_ms: 0 },
+            FrameStamp { show_ms: 120, media_ms: 80 },
+            FrameStamp { show_ms: 200, media_ms: 160 },
+        ];
+        assert_eq!(segment.seek_time(0, 4140), 30);
+        assert_eq!(segment.seek_time(1, 4140), 80);
+        assert_eq!(segment.cut_end(0, 4140), 190);
+        assert_eq!(segment.cut_end(1, 4140), 160);
+        assert_eq!(segment.show_time(0, 190), segment.show_time(1, 160));
+        assert_eq!(segment.seek_time(2, 4140), 140);
+    }
 
     #[test]
     fn native_manifest_loads_markers_and_existing_media_read_only() {
@@ -412,7 +484,7 @@ mod tests {
             assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
             let mut files = std::array::from_fn(|_| None);
             files[0] = Some(name);
-            Segment { start: index * 1000, end: (index + 1) * 1000, files }
+            Segment { start: index * 1000, end: (index + 1) * 1000, files, frames: Default::default() }
         }).collect::<Vec<_>>();
         let event = Event { id: 1, start: 760, end: 1240, description: String::new(), speed: 50, angles: [true; 8] };
         let target = root.join("result.mp4");

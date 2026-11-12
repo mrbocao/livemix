@@ -959,3 +959,21 @@ fn draw_text(p: &Painter, view: View, text: &Text, value: &str, scale: f32) {
     }
     p.galley(pos, galley, text.color.gamma_multiply(view.opacity));
 }
+
+#[test]
+#[ignore = "requires operator-supplied GT title fixtures"]
+fn report_priority_gt_templates() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("LIVEMIX_GT_FIXTURES").expect("Set LIVEMIX_GT_FIXTURES"),
+    );
+    for name in [
+        "GT Title/Spinner 180.gtzip",
+        "GT Stingers/Stinger 2- Havin a blinder Blue.gtzip",
+        "GT ScoreBoard/Scoreboard 3- Lineup 12.gtzip",
+        "GT ScoreBoard/Scoreboard 13- The Extreme.gtzip",
+        "GT Social/Social 1- Kimono.gtzip",
+    ] {
+        let document = Document::load(&directory.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        println!("{name}: {} fields, unsupported: {:?}", document.fields.len(), document.unsupported);
+    }
+}

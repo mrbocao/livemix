@@ -21,8 +21,9 @@ pub struct Event {
     pub value: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
+    #[default]
     NoteOn,
     NoteOff,
     ControlChange,
@@ -55,15 +56,22 @@ impl Input {
 
     /// Devices currently visible to the system. Call after `set_devices` so stale
     /// selections can be ignored.
-    pub fn devices(&self) -> Vec<DeviceInfo> {
-        Backend::devices()
-    }
-
     /// Drains the events received since the last call.
     pub fn poll(&mut self) -> Vec<Event> {
         let mut queue = self.event_queue.lock().unwrap_or_else(|error| error.into_inner());
         queue.drain(..).collect()
     }
+}
+
+pub fn output_devices() -> Vec<DeviceInfo> {
+    platform::Output::devices()
+}
+
+pub use platform::Output;
+
+pub fn message(kind: Kind, channel: u8, note: u8, value: u8) -> [u8; 3] {
+    let status = match kind { Kind::NoteOn => 0x90, Kind::NoteOff => 0x80, Kind::ControlChange => 0xB0 };
+    [status | channel.min(15), note.min(127), value.min(127)]
 }
 
 /// Splits a short-message stream into note/controller events. Exposed for tests; also
@@ -116,13 +124,29 @@ mod platform {
         pid: u16,
         version: u32,
         name: [u16; 32],
+        support: u32,
+    }
+
+    #[repr(C)]
+    struct MidiOutCaps {
+        mid: u16,
+        pid: u16,
+        version: u32,
+        name: [u16; 32],
         technology: u16,
-        reserved: u16,
+        voices: u16,
+        notes: u16,
+        channel_mask: u16,
         support: u32,
     }
 
     #[link(name = "winmm")]
     extern "system" {
+        fn midiOutGetNumDevs() -> u32;
+        fn midiOutGetDevCapsW(device: usize, caps: *mut MidiOutCaps, size: u32) -> u32;
+        fn midiOutOpen(handle: *mut usize, device: u32, callback: usize, instance: usize, flags: u32) -> u32;
+        fn midiOutShortMsg(handle: usize, message: u32) -> u32;
+        fn midiOutClose(handle: usize) -> u32;
         fn midiInGetNumDevs() -> u32;
         fn midiInGetDevCapsW(device: usize, caps: *mut MidiInCaps, size: u32) -> u32;
         fn midiInOpen(handle: *mut usize, device: u32, callback: usize, instance: usize,
@@ -131,6 +155,38 @@ mod platform {
         fn midiInStop(handle: usize) -> u32;
         fn midiInReset(handle: usize) -> u32;
         fn midiInClose(handle: usize) -> u32;
+    }
+
+    pub struct Output(usize);
+
+    impl Output {
+        pub fn devices() -> Vec<DeviceInfo> {
+            (0..unsafe { midiOutGetNumDevs() } as usize).filter_map(|index| unsafe {
+                let mut caps: MidiOutCaps = std::mem::zeroed();
+                if midiOutGetDevCapsW(index, &mut caps, std::mem::size_of::<MidiOutCaps>() as u32) != 0 {
+                    return None;
+                }
+                let length = caps.name.iter().position(|&c| c == 0).unwrap_or(caps.name.len());
+                Some(DeviceInfo { index, name: String::from_utf16_lossy(&caps.name[..length]) })
+            }).collect()
+        }
+
+        pub fn open(index: usize) -> Result<Self, String> {
+            let mut handle = 0;
+            let code = unsafe { midiOutOpen(&mut handle, index as u32, 0, 0, 0) };
+            if code == 0 { Ok(Self(handle)) } else { Err(format!("WinMM MIDI output error {code}")) }
+        }
+
+        pub fn send(&self, [status, data1, data2]: [u8; 3]) -> Result<(), String> {
+            let code = unsafe { midiOutShortMsg(self.0, u32::from_le_bytes([status, data1, data2, 0])) };
+            if code == 0 { Ok(()) } else { Err(format!("WinMM MIDI send error {code}")) }
+        }
+    }
+
+    impl Drop for Output {
+        fn drop(&mut self) {
+            unsafe { midiOutClose(self.0); }
+        }
     }
 
     struct Context {
@@ -214,7 +270,7 @@ mod platform {
                 let context = Box::into_raw(Box::new(Context { events: self.events.clone() }));
                 let mut handle = 0usize;
                 let result = unsafe {
-                    midiInOpen(&mut handle, index as u32, callback as usize, context as usize,
+                    midiInOpen(&mut handle, index as u32, callback as *const () as usize, context as usize,
                         CALLBACK_FUNCTION)
                 };
                 if result != 0 {
@@ -259,6 +315,13 @@ mod platform {
         fn MIDIPortConnectSource(port: MidiPortRef, source: MidiEndpointRef,
             connection: *mut c_void) -> OsStatus;
         fn MIDIPortDisconnectSource(port: MidiPortRef, source: MidiEndpointRef) -> OsStatus;
+        fn MIDIOutputPortCreate(client: MidiClientRef, name: CfStringRef, port: *mut MidiPortRef) -> OsStatus;
+        fn MIDIGetNumberOfDestinations() -> usize;
+        fn MIDIGetDestination(index: usize) -> MidiEndpointRef;
+        fn MIDIPacketListInit(list: *mut u8) -> *mut u8;
+        fn MIDIPacketListAdd(list: *mut u8, size: usize, current: *mut u8, time: u64,
+            length: usize, data: *const u8) -> *mut u8;
+        fn MIDISend(port: MidiPortRef, destination: MidiEndpointRef, list: *const u8) -> OsStatus;
         fn MIDIGetNumberOfSources() -> usize;
         fn MIDIGetSource(index: usize) -> MidiEndpointRef;
         fn MIDIObjectGetStringProperty(object: u32, property: CfStringRef,
@@ -278,6 +341,62 @@ mod platform {
     fn cf_string(text: &str) -> CfStringRef {
         let Ok(c_text) = std::ffi::CString::new(text) else { return std::ptr::null() };
         unsafe { CFStringCreateWithCString(std::ptr::null(), c_text.as_ptr(), UTF8) }
+    }
+
+    pub struct Output {
+        client: MidiClientRef,
+        port: MidiPortRef,
+        endpoint: MidiEndpointRef,
+    }
+
+    impl Output {
+        pub fn devices() -> Vec<DeviceInfo> {
+            (0..unsafe { MIDIGetNumberOfDestinations() }).filter_map(|index| {
+                let endpoint = unsafe { MIDIGetDestination(index) };
+                (endpoint != 0).then(|| DeviceInfo { index, name: device_name(endpoint) })
+            }).collect()
+        }
+
+        pub fn open(index: usize) -> Result<Self, String> {
+            let endpoint = unsafe { MIDIGetDestination(index) };
+            if endpoint == 0 { return Err("MIDI destination not available".into()); }
+            let name = cf_string("LiveMix Output");
+            let mut client = 0;
+            let mut port = 0;
+            let code = unsafe {
+                let mut code = MIDIClientCreate(name, std::ptr::null(), std::ptr::null_mut(), &mut client);
+                if code == 0 { code = MIDIOutputPortCreate(client, name, &mut port); }
+                CFRelease(name);
+                code
+            };
+            if code == 0 { return Ok(Self { client, port, endpoint }); }
+            if client != 0 { unsafe { MIDIClientDispose(client); } }
+            Err(format!("CoreMIDI output error {code}"))
+        }
+
+        pub fn send(&self, message: [u8; 3]) -> Result<(), String> {
+            let mut storage = [0_u64; 4];
+            let list = storage.as_mut_ptr().cast::<u8>();
+            let code = unsafe {
+                let packet = MIDIPacketListInit(list);
+                if MIDIPacketListAdd(list, std::mem::size_of_val(&storage), packet, 0,
+                    message.len(), message.as_ptr()).is_null()
+                {
+                    return Err("Could not create MIDI packet".into());
+                }
+                MIDISend(self.port, self.endpoint, list)
+            };
+            if code == 0 { Ok(()) } else { Err(format!("CoreMIDI send error {code}")) }
+        }
+    }
+
+    impl Drop for Output {
+        fn drop(&mut self) {
+            unsafe {
+                MIDIPortDispose(self.port);
+                MIDIClientDispose(self.client);
+            }
+        }
     }
 
     fn device_name(endpoint: MidiEndpointRef) -> String {
@@ -315,7 +434,7 @@ mod platform {
         let count = *(packet_list as *const u32);
         let mut packet = packet_list.add(4);
         for _ in 0..count.min(512) {
-            let length = *(packet.add(8) as *const u16) as usize;
+            let length = (packet.add(8) as *const u16).read_unaligned() as usize;
             let data = packet.add(10);
             let bytes = std::slice::from_raw_parts(data, length.min(4096));
             let mut events = context.events.lock().unwrap_or_else(|error| error.into_inner());
@@ -418,6 +537,14 @@ mod platform {
 #[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use super::*;
+
+    pub struct Output;
+
+    impl Output {
+        pub fn devices() -> Vec<DeviceInfo> { Vec::new() }
+        pub fn open(_index: usize) -> Result<Self, String> { Err("MIDI is unavailable".into()) }
+        pub fn send(&self, _message: [u8; 3]) -> Result<(), String> { Err("MIDI is unavailable".into()) }
+    }
 
     pub struct Backend;
 

@@ -116,6 +116,22 @@ pub fn draw_plain(p: &Painter, r: Rect, inp: &Input, t: f64) {
 }
 
 fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input], depth: u32, cue: Cue) {
+    let set = matches!(inp.kind, Kind::VirtualSet { .. });
+    let viewport = if set { p.with_clip_rect(r) } else { p.clone() };
+    let p = &viewport;
+    let r = if let Kind::VirtualSet { camera, previous, changed_at } = inp.kind {
+        let view = |camera| match camera {
+            1 => (1.42, 0.28),
+            2 => (1.42, -0.28),
+            _ => (1.0, 0.0),
+        };
+        let (from_zoom, from_x) = view(previous);
+        let (to_zoom, to_x) = view(camera);
+        let x = ((t - changed_at) / 0.45).clamp(0.0, 1.0) as f32;
+        let mix = x * x * (3.0 - 2.0 * x);
+        let center = r.center() + egui::vec2(r.width() * (from_x + (to_x - from_x) * mix), 0.0);
+        Rect::from_center_size(center, r.size() * (from_zoom + (to_zoom - from_zoom) * mix))
+    } else { r };
     let sr = place_rect(r, &inp.place);
     let clip = crop_rect(sr, &inp.place).intersect(p.clip_rect());
     if clip.width() > 0.0 && clip.height() > 0.0 {
@@ -127,7 +143,8 @@ fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input]
     }
     for l in inp.layers.iter().filter(|l| l.on) {
         let Some(li) = l.input.filter(|id| *id != inp.id).and_then(|id| all.iter().find(|i| i.id == id)) else { continue };
-        let lr = place_rect(r, &l.place);
+        let placed = place_rect(r, &l.place);
+        let lr = Rect::from_center_size(placed.center(), placed.size() * egui::vec2(l.scale[0], l.scale[1]));
         let lc = crop_rect(lr, &l.place).intersect(p.clip_rect());
         if lc.width() > 0.0 && lc.height() > 0.0 {
             draw_layered(&p.with_clip_rect(lc), lr, li, a, t, all, depth + 1, Cue::Rest);
@@ -169,6 +186,13 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
     let h = r.height();
     let w = r.width();
     match &inp.kind {
+        Kind::VirtualSet { .. } => {
+            p.rect_filled(r, 0.0, fade(Color32::from_rgb(16, 24, 36), a));
+            let wall = Rect::from_min_max(r.lerp_inside(egui::vec2(0.06, 0.09)), r.lerp_inside(egui::vec2(0.94, 0.79)));
+            p.rect_filled(wall, 0.0, fade(Color32::from_rgb(30, 59, 80), a));
+            let floor = Rect::from_min_max(r.lerp_inside(egui::vec2(0.0, 0.79)), r.max);
+            p.rect_filled(floor, 0.0, fade(Color32::from_rgb(24, 29, 36), a));
+        }
         Kind::Colour(c) => {
             p.rect_filled(r, 0.0, fade(*c, a));
         }
@@ -270,7 +294,7 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             }
             p.text(r.center(), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.11).max(6.0)), fade(Color32::from_white_alpha(230), a));
         }
-        Kind::AudioFile { .. } | Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::VideoDelay { .. } => {
+        Kind::AudioFile { .. } | Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. } | Kind::VideoDelay { .. } => {
             let keyed = inp.key.on || matches!(inp.kind, Kind::ImageFile { .. } | Kind::ImageSequence { .. });
             match inp.tex {
                 Some((tex, [tw, th])) if tw > 0 && th > 0 => {

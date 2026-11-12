@@ -1,15 +1,17 @@
-use crate::model::{Effect, Switcher};
+use crate::model::Switcher;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}};
+use std::cell::Cell;
+use std::sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
 #[derive(Clone, Copy)]
 enum Step {
     Preview(usize),
     Cut,
     Fade(u32),
+    Overlay(usize),
     Wait(u32),
 }
 
@@ -24,6 +26,8 @@ fn parse(script: &str) -> Result<VecDeque<Step>, String> {
             [op] if op.eq_ignore_ascii_case("cut") => Some(Step::Cut),
             [op, n] if op.eq_ignore_ascii_case("preview") => n.parse::<usize>().ok().filter(|n| *n > 0).map(Step::Preview),
             [op, ms] if op.eq_ignore_ascii_case("fade") => ms.parse::<u32>().ok().filter(|ms| (1..=60_000).contains(ms)).map(Step::Fade),
+            [op, n] if op.eq_ignore_ascii_case("overlay") => n.parse::<usize>().ok()
+                .filter(|n| (1..=crate::model::OVERLAY_CHANNELS).contains(n)).map(Step::Overlay),
             [op, ms] if op.eq_ignore_ascii_case("wait") => ms.parse::<u32>().ok().filter(|ms| *ms <= 60_000).map(Step::Wait),
             _ => None,
         };
@@ -76,20 +80,21 @@ impl State {
             if let Some(step) = state.steps.pop_front() {
                 match step {
                     Step::Preview(index) => {
-                        if let Some(input) = switcher.inputs.get(index - 1) {
-                            switcher.preview = Some(input.id);
-                        } else {
+                        if let Err(error) = switcher.perform_action(&format!("Preview {index}"), 0.0) {
                             state.stop();
-                            switcher.notice(&format!("Script input {index} is unavailable"));
+                            switcher.notice(&error);
                         }
                     }
                     Step::Cut => {
-                        switcher.start_transition(Effect::Cut, 0);
+                        let _ = switcher.perform_action("Cut", 0.0);
                         state.waiting_for_transition = switcher.trans.is_some();
                     }
                     Step::Fade(ms) => {
-                        switcher.start_transition(Effect::Fade, ms);
+                        let _ = switcher.perform_action(&format!("Fade {ms}"), 0.0);
                         state.waiting_for_transition = switcher.trans.is_some();
+                    }
+                    Step::Overlay(channel) => {
+                        let _ = switcher.perform_action(&format!("Overlay {channel}"), 0.0);
                     }
                     Step::Wait(ms) => state.until = Some(now + Duration::from_millis(u64::from(ms))),
                 }
@@ -101,11 +106,46 @@ impl State {
 
 pub const WEB_ADDRESS: &str = "127.0.0.1:8088";
 const WEB_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>LiveMix control</title>
-<h1>LiveMix control</h1><label>Preview input <input id="input" type="number" min="1" value="1"></label>
+<h1>LiveMix control</h1>
+<p id="tally"></p><label>Preview input <select id="input"></select></label>
 <button onclick="send('Preview '+document.querySelector('#input').value)">Preview</button>
 <button onclick="send('Cut')">Cut</button><button onclick="send('Fade 500')">Fade</button>
-<p><a href="/telestrator/">Telestrator</a></p>
+<p id="overlays"></p><p><a href="/telestrator/">Telestrator</a></p>
 <p id="status" role="status"></p><script>
+let previous;
+async function refresh() {
+  try {
+    const response = await fetch('/state', {cache:'no-store'});
+    const state = await response.json();
+    if (state.inputs && JSON.stringify(state) !== previous) {
+      previous = JSON.stringify(state);
+      const input = document.querySelector('#input');
+      const selected = input.value;
+      input.replaceChildren(...state.inputs.map(source => new Option(
+        source.number + ' · ' + source.name, source.number)));
+      if ([...input.options].some(option => option.value === selected)) input.value = selected;
+      const name = id => state.inputs.find(source => source.id === id)?.name ?? '—';
+      document.querySelector('#tally').textContent = 'Program: ' + name(state.program)
+        + ' | Preview: ' + name(state.preview)
+        + (state.recording ? ' | REC' : '') + (state.streaming ? ' | STREAM' : '');
+      document.querySelector('#overlays').replaceChildren(...state.overlays.map((overlay, index) => {
+        const button = document.createElement('button');
+        button.textContent = 'Overlay ' + (index + 1);
+        button.disabled = !overlay.assigned && !overlay.on;
+        button.setAttribute('aria-pressed', overlay.on);
+        if (overlay.on) button.style.fontWeight = 'bold';
+        button.onclick = () => send('Overlay ' + (index + 1));
+        return button;
+      }));
+    }
+  } catch {
+    previous = undefined;
+    document.querySelector('#tally').textContent = 'LiveMix disconnected';
+  } finally {
+    setTimeout(refresh, 500);
+  }
+}
+refresh();
 async function send(command) {
   const status = document.querySelector('#status');
   try {
@@ -229,6 +269,8 @@ pub struct StrokeMessage {
 pub struct Remote {
     requests: mpsc::Receiver<String>,
     strokes: mpsc::Receiver<StrokeMessage>,
+    snapshot: Arc<Mutex<String>>,
+    last_publish: Cell<Option<Instant>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -244,17 +286,38 @@ impl Remote {
         let (stroke_tx, strokes) = mpsc::sync_channel(64);
         let stop = Arc::new(AtomicBool::new(false));
         let running = stop.clone();
+        let snapshot = Arc::new(Mutex::new("{}".into()));
+        let worker_snapshot = snapshot.clone();
         std::thread::spawn(move || {
             while !running.load(Ordering::Acquire) {
                 match listener.accept() {
-                    Ok((socket, _)) => { let _ = request(socket, &tx, &stroke_tx); }
+                    Ok((socket, _)) => { let _ = request(socket, &tx, &stroke_tx, &worker_snapshot); }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock =>
                         std::thread::sleep(Duration::from_millis(25)),
                     Err(_) => break,
                 }
             }
         });
-        Ok(Self { requests, strokes, stop })
+        Ok(Self { requests, strokes, stop, snapshot, last_publish: Cell::new(None) })
+    }
+
+    pub fn publish(&self, switcher: &Switcher, now: Instant) {
+        if self.last_publish.get().is_some_and(|last| now.duration_since(last) < Duration::from_millis(250)) {
+            return;
+        }
+        self.last_publish.set(Some(now));
+        let inputs: Vec<_> = switcher.inputs.iter().enumerate().map(|(index, input)| {
+            serde_json::json!({ "id": input.id, "number": index + 1, "name": input.title })
+        }).collect();
+        let overlays: Vec<_> = switcher.overlays.iter().map(|overlay| {
+            serde_json::json!({ "assigned": overlay.assigned.is_some(), "on": overlay.on })
+        }).collect();
+        let snapshot = serde_json::json!({
+            "inputs": inputs, "program": switcher.output, "preview": switcher.preview,
+            "overlays": overlays, "recording": switcher.rec.is_some(),
+            "streaming": switcher.stream_active.contains(&true)
+        }).to_string();
+        *self.snapshot.lock().unwrap() = snapshot;
     }
 
     pub fn receive(&self) -> Option<String> {
@@ -268,7 +331,7 @@ impl Remote {
 }
 
 fn request(mut socket: TcpStream, tx: &mpsc::SyncSender<String>,
-    strokes: &mpsc::SyncSender<StrokeMessage>) -> std::io::Result<()> {
+    strokes: &mpsc::SyncSender<StrokeMessage>, snapshot: &Mutex<String>) -> std::io::Result<()> {
     let timeout = Some(Duration::from_millis(250));
     socket.set_read_timeout(timeout)?;
     socket.set_write_timeout(timeout)?;
@@ -288,6 +351,10 @@ fn request(mut socket: TcpStream, tx: &mpsc::SyncSender<String>,
             if header.eq_ignore_ascii_case("X-LiveMix-Control") { authorized = value.trim() == "1"; }
             if header.eq_ignore_ascii_case("Content-Length") { size = value.trim().parse::<usize>().ok(); }
         }
+    }
+    if host && request_line.starts_with("GET /state HTTP/1.") {
+        let snapshot = snapshot.lock().unwrap().clone();
+        return response(&mut socket, "200 OK", "application/json", &snapshot);
     }
     let (status, mime, body) = if host && request_line.starts_with("GET / HTTP/1.") {
         ("200 OK", "text/html", WEB_PAGE)
@@ -355,7 +422,7 @@ fn web_controller_accepts_a_local_command() {
     let address = listener.local_addr().unwrap();
     let (send, receive) = mpsc::sync_channel(1);
     let (stroke_send, _stroke_receive) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || request(listener.accept().unwrap().0, &send, &stroke_send).unwrap());
+    let worker = std::thread::spawn(move || request(listener.accept().unwrap().0, &send, &stroke_send, &Mutex::new("{}".into())).unwrap());
     let mut client = TcpStream::connect(address).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     write!(client, "POST /command HTTP/1.1\r\nHost: {WEB_ADDRESS}\r\nX-LiveMix-Control: 1\r\nContent-Length: 3\r\n\r\nCut").unwrap();
@@ -364,4 +431,26 @@ fn web_controller_accepts_a_local_command() {
     assert!(response.starts_with("HTTP/1.1 202"));
     assert_eq!(receive.recv_timeout(Duration::from_secs(1)).unwrap(), "Cut");
     worker.join().unwrap();
+}
+
+#[test]
+fn web_state_requires_the_local_host() {
+    for host in [WEB_ADDRESS, "example.invalid"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (send, _receive) = mpsc::sync_channel(1);
+            let (strokes, _receive_strokes) = mpsc::sync_channel(1);
+            request(listener.accept().unwrap().0, &send, &strokes,
+                &Mutex::new(r#"{"program":3}"#.into())).unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(client, "GET /state HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply.starts_with("HTTP/1.1 200"), host == WEB_ADDRESS);
+        assert_eq!(reply.ends_with(r#"{"program":3}"#), host == WEB_ADDRESS);
+        worker.join().unwrap();
+    }
 }

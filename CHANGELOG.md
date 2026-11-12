@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+- Index Replay frames per angle using capture time and the encoder's file position, including when frames are dropped.
+- Added static PowerPoint and LibreOffice presentation inputs with manual slide navigation.
+- Added Virtual Set inputs with configurable scene layers and animated wide, left and right views.
+- Added a MediaMTX end-to-end test for two RTMP destinations sharing one encoder and one SRT output.
+
+- Kept D3D11 video textures on the GPU while applying chroma key and colour adjustments, with the existing CPU path as fallback.
+- Rendered the waveform, RGB parade and vectorscope on the GPU when available. Matched the reference scope texture dimensions and retained the CPU fallback.
+
+- Added vMix 28 XML settings import and export for mapped preferences alongside native JSON backups.
+- Added an optional DirectShow video decoder on Windows with MPEG-2 and H.264 selection, a filter blocklist and FFmpeg fallback.
+
+- Added Settings import, export and confirmed reset with a backup of the previous preferences. Exports omit RTMP destinations and keys and SRT secrets.
+- Added per-input decoder diagnostics, including Windows Media Foundation fallback to FFmpeg before the first picture.
+- Added live Program, Preview, recording, streaming and overlay status to the local Web Controller, with overlay controls.
+- Made unsupported GT features visible in the title editor and reused mix buffers in the headphone audio callback.
+- Added a Program readback frame counter and adjusted spacing in Add Input, Input Settings and External settings.
+
+- Added English and Brazilian Portuguese interface options with a persistent language setting and contributor translation catalogs.
+
+- Added the Replay A compact strip with recording, marks, last-event playback, speed and setup.
+- Added editable keyboard and MIDI bindings, learn mode, partial shortcut template import, a searchable function reference and shared action dispatch.
+- Added configurable MIDI Note and CC feedback for tally and operating states.
+
+- Added Master/source audio selection per stream, a YouTube stereo AAC profile at 44.1 kHz, and copyable RTMP/RTMPS and SRT diagnostics.
+- Added live camera previews in the Replay controller and improved recovery and reporting for the Last preset button.
+- Expanded vMix shortcut commands for layers, routing, title text, audio and Replay event management.
+
+- Added session-level Replay monitor options and an optional advanced view with camera assignment and independent Replay B cue, jog and take controls.
+- Changed Last to load a separate automatic project recovery preset, refreshed every minute and before New or normal shutdown.
+
+- Exposed independent A/B replay speed controls from 0% to 100%, with 0% pausing the selected channel.
+- Added a recorded-position slider for marking replay events from retained footage.
+- Replay marks appear immediately. Normal-speed playback on an individual channel opens the recorded segments directly and closes an active segment early only when playback needs it.
+
 ## 0.0001.alpha
 
 ### Production and operator controls

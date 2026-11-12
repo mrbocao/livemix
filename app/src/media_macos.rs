@@ -52,6 +52,7 @@ pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
         Source::Srt(config) => crate::srt::run_capture(worker, config),
         Source::AudioDevice(device) => crate::audio::capture_device(worker, &device),
         Source::AudioFile(path) => crate::audio::play_audio_input(worker, path),
+        Source::Presentation(path) => crate::slides::run(worker, path),
         Source::Sequence(folder, fps) => run_pictures(worker, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(worker, folder, false, 0.0, secs),
         Source::Desktop => {
@@ -91,9 +92,9 @@ fn capture(shared: &Shared, index: &str, mode: Option<CamMode>) {
 }
 
 pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, error: Arc<Mutex<String>>,
-    status: Arc<Mutex<String>>, opts: RecOpts)
+    status: Arc<Mutex<String>>, opts: RecOpts, index: Option<ReplayIndex>)
 {
-    if let Err(message) = crate::ffmpeg_media::record(&path, rx, &status, opts) {
+    if let Err(message) = crate::ffmpeg_media::record(&path, rx, &status, opts, index.as_ref()) {
         *error.lock().unwrap() = message;
     }
 }
@@ -119,6 +120,9 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
     std::thread::spawn(move || {
         let path = match kind {
             PickKind::Folder => select_file("POSIX path of (choose folder)", None),
+            PickKind::SettingsSave => select_file(SAVE, Some("LiveMix-settings.json")).map(|p| {
+                if p.to_ascii_lowercase().ends_with(".json") || p.to_ascii_lowercase().ends_with(".config") { p } else { format!("{p}.json") }
+            }),
             PickKind::PresetSave => select_file(SAVE, Some("Untitled.vmix")).map(|p| {
                 if p.to_ascii_lowercase().ends_with(".vmix") { p } else { format!("{p}.vmix") }
             }),

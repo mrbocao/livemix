@@ -90,6 +90,8 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
             Kind::AudioFile { path } => (5003, path.as_str(), None, false),
             Kind::ImageFile { path } => (1, path.as_str(), None, false),
             Kind::Photos { folder } => (2, folder.as_str(), None, false),
+            Kind::Presentation { path } => (5004, path.as_str(), None, false),
+            Kind::VirtualSet { .. } => (5005, "", None, false),
             Kind::ImageSequence { folder } => (21, folder.as_str(), None, false),
             Kind::GtTitle { path, .. } => (9000, path.as_str(), None, false),
             Kind::VideoList { .. } => (14, "", None, false),
@@ -103,6 +105,7 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         };
         out.push_str("  <Input");
         attr(&mut out, "Type", kind);
+        if let Kind::VirtualSet { camera, .. } = i.kind { attr(&mut out, "LiveMixSetCamera", camera); }
         if let Kind::Replay { channel, .. } = i.kind { attr(&mut out, "LiveMixReplayChannel", channel); }
         attr(&mut out, "Key", guid()?);
         attr(&mut out, "State", 1);
@@ -278,6 +281,7 @@ impl ImportReport {
             let paths: &[String] = match &input.kind {
                 Kind::VideoFile { path } | Kind::AudioFile { path } | Kind::ImageFile { path } | Kind::GtTitle { path, .. } => std::slice::from_ref(path),
                 Kind::Photos { folder } | Kind::ImageSequence { folder } => std::slice::from_ref(folder),
+                Kind::Presentation { path } => std::slice::from_ref(path),
                 Kind::VideoList { paths, .. } => paths,
                 _ => &[],
             };
@@ -350,6 +354,11 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
                 "0" | "16" => Kind::VideoFile { path: resolve(file) },
                 "1" => Kind::ImageFile { path: resolve(file) },
                 "2" => Kind::Photos { folder: resolve(file) },
+                "5004" => Kind::Presentation { path: resolve(file) },
+                "5005" => {
+                    let camera = node.attribute("LiveMixSetCamera").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0).min(2);
+                    Kind::VirtualSet { camera, previous: camera, changed_at: 0.0 }
+                }
                 "21" => Kind::ImageSequence { folder: resolve(file) },
                 "5" => Kind::Device {
                     link: node.attribute("CapturePath").unwrap_or_default().trim_start_matches("@device:pnp:").into(),

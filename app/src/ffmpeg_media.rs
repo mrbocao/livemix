@@ -26,6 +26,10 @@ fn video_metadata(path: &str) -> (f64, u64) {
 }
 
 pub(crate) fn play(shared: &Shared, path: &str, deinterlace: u8) {
+    play_with_reason(shared, path, deinterlace, None);
+}
+
+pub(crate) fn play_with_reason(shared: &Shared, path: &str, deinterlace: u8, fallback: Option<&str>) {
     let (fps, duration) = video_metadata(path);
     shared.dur_ms.store(duration, Relaxed);
     let mut position = 0;
@@ -46,6 +50,12 @@ pub(crate) fn play(shared: &Shared, path: &str, deinterlace: u8) {
             if shared.stop.load(Relaxed) || shared.restart.load(Relaxed) || shared.seek_ms.load(Relaxed) != 0 {
                 return false;
             }
+            if count == 0 {
+                let method = match deinterlace { 1 => " · BWDIF", 2 => " · YADIF", _ => "" };
+                let mut decoder = format!("FFmpeg · software{method}");
+                if let Some(reason) = fallback { decoder.push_str(&format!(" · fallback: {reason}")); }
+                *shared.decoder.lock().unwrap() = decoder;
+            }
             publish(shared, frame);
             let ms = position + (count as f64 * 1000.0 / fps) as u64;
             shared.pos_ms.store(ms, Relaxed);
@@ -62,7 +72,8 @@ pub(crate) fn play(shared: &Shared, path: &str, deinterlace: u8) {
             continue;
         }
         if !read {
-            shared.set_status("FFmpeg could not decode this video. Check the file and FFmpeg installation.");
+            let reason = fallback.map_or_else(String::new, |reason| format!("{reason}. "));
+            shared.set_status(format!("{reason}FFmpeg could not decode this video. Check the file and FFmpeg installation."));
             break;
         }
         if shared.looping.load(Relaxed) && !shared.paused.load(Relaxed) {
@@ -130,7 +141,7 @@ pub(crate) fn publish(shared: &Shared, mut frame: Frame) {
     shared.seq.fetch_add(1, Relaxed);
 }
 
-pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecOpts) -> Result<(), String> {
+pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecOpts, index: Option<&crate::media_common::ReplayIndex>) -> Result<(), String> {
     let Ok(first) = rx.recv() else { return Ok(()) };
     let profile = opts.format.ffmpeg_profile(opts.hw);
     let encoder = profile.video;
@@ -161,6 +172,7 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
         let mut pipe = crate::audio::AvPipe::new(child.stdin.take().unwrap(), first.w as u32, first.h as u32, n, d)?;
         let mut next = 0_u64;
         let mut previous: Option<Arc<Vec<u8>>> = None;
+        let mut written = 0;
         for frame in std::iter::once(first).chain(rx) {
             if (frame.w, frame.h, frame.bgra) != dimensions { continue; }
             let slot = (frame.captured_at.saturating_duration_since(start).as_secs_f64()
@@ -171,9 +183,17 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
                 for pixel in Arc::make_mut(&mut pixels).chunks_exact_mut(4) { pixel.swap(0, 2); }
             }
             if let Some(previous) = &previous {
-                for _ in 0..(slot - next).min(u64::from(n / d).max(1)) { pipe.frame(previous, &[])?; }
+                let limit = u64::from(n / d).max(1) * if index.is_some() { 12 } else { 1 };
+                for _ in 0..(slot - next).min(limit) {
+                    pipe.frame(previous, &[])?;
+                    written += 1;
+                }
             }
             pipe.frame(&pixels, &frame.audio)?;
+            if let Some(index) = index {
+                index.lock().unwrap().push((frame.captured_at, written * 1000 * u64::from(d) / u64::from(n)));
+            }
+            written += 1;
             previous = Some(pixels);
             next = slot + 1;
         }
@@ -221,11 +241,11 @@ fn recording_profiles_mux_video_and_stereo_audio() {
         if format == RecordFormat::Wmv9 {
             let error = Arc::new(Mutex::new(String::new()));
             crate::media::record_thread(path.to_str().unwrap().to_owned(), rx, error.clone(),
-                Arc::default(), opts, Arc::default());
+                Arc::default(), opts, None, Arc::default());
             let error = error.lock().unwrap().clone();
             assert!(error.is_empty(), "{error}");
         } else {
-            record(path.to_str().unwrap(), rx, &Mutex::new(String::new()), opts)
+            record(path.to_str().unwrap(), rx, &Mutex::new(String::new()), opts, None)
                 .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         }
         #[cfg(not(windows))]

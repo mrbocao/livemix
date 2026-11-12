@@ -129,6 +129,8 @@ pub enum Kind {
     ImageSequence { folder: String },
     /// "Photos": a slideshow of the pictures in a folder.
     Photos { folder: String },
+    Presentation { path: String },
+    VirtualSet { camera: u8, previous: u8, changed_at: f64 },
     /// "Video Delay" (vMix.VideoType 10): a delayed copy of another input. The original
     /// buffers the source at the chosen resolution for `seconds` (frmInput tVideoDelay).
     VideoDelay { source: Option<u32>, seconds: f32, resolution: [u32; 2] },
@@ -193,7 +195,7 @@ impl Kind {
             Kind::Replay { path, .. } => !path.is_empty(),
             _ => matches!(
                 self,
-                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. }
+                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. }
             ),
         }
     }
@@ -278,6 +280,7 @@ pub struct Layer {
     pub on: bool,
     pub input: Option<u32>,
     pub place: Position,
+    pub scale: [f32; 2],
     pub border: bool,
     pub border_colour: [u8; 3],
     /// Border thickness as a fraction of the layer's width (0.02 = 2 %).
@@ -286,13 +289,25 @@ pub struct Layer {
 
 impl Default for Layer {
     fn default() -> Self {
-        Layer { on: false, input: None, place: Position::default(), border: false,
+        Layer { on: false, input: None, place: Position::default(), scale: [1.0; 2], border: false,
             border_colour: [0xff, 0xff, 0xff], border_width: 0.02 }
     }
 }
 
 /// Number of layers per input (ShortcutFunction SetLayer1..SetLayer10).
 pub const LAYERS: usize = 10;
+
+#[test]
+fn last_preset_entry_handles_windows_text_markers() {
+    let path = "C:\\Projetos\\Transmissão ao vivo.vmix";
+    assert_eq!(last_preset_entry(&format!("\u{feff}{path}\r\n")), Some(path.into()));
+    assert_eq!(last_preset_entry(" \r\n"), None);
+}
+
+fn last_preset_entry(text: &str) -> Option<std::path::PathBuf> {
+    let path = text.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']);
+    (!path.trim().is_empty()).then(|| std::path::PathBuf::from(path))
+}
 
 /// Picture treatment of one input. `brightness`/`contrast`/`saturation` are the Colour Adjust
 /// page; `red`/`green`/`blue`/`alpha`/`black`/`white` are the Colour Correction page's
@@ -400,6 +415,7 @@ pub struct Input {
     pub prev_tex: Option<(eframe::egui::TextureId, [usize; 2], f32)>,
     /// "Starting…", "No signal …" etc. for real inputs.
     pub status: String,
+    pub decoder: String,
     pub restart_req: bool,
     pub seek_ms: Option<u64>,
     pub key: Key,
@@ -467,6 +483,7 @@ impl Input {
             tex: None,
             prev_tex: None,
             status: String::new(),
+            decoder: String::new(),
             restart_req: false,
             seek_ms: None,
             key: Key::default(),
@@ -863,8 +880,6 @@ impl AddKind {
         !matches!(
             self,
             AddKind::Dvd
-                | AddKind::PowerPoint
-                | AddKind::VirtualSet
                 | AddKind::WebBrowser
                 | AddKind::VideoCall
                 | AddKind::Zoom
@@ -890,10 +905,10 @@ impl AddKind {
             AddKind::StreamSrt => "Receive H.264 or HEVC video from an SRT source.",
             AddKind::Replay => "Create Replay A and Replay B and open the Instant Replay session setup.",
             AddKind::VideoDelay => "A delayed copy of another input. Pick the source, the buffer length and the resolution the picture is stored at.",
-            AddKind::PowerPoint => "PowerPoint slides — not available in this version (export the slides as pictures and use Photos).",
+            AddKind::PowerPoint => "Convert a presentation into static slides and advance them manually.",
             AddKind::AudioFile => "An audio file such as WAV, MP3, FLAC or AAC. Requires FFmpeg and FFprobe.",
             AddKind::AudioInput => "A microphone, USB audio interface or line input.",
-            AddKind::VirtualSet => "Virtual studio sets — not available in this version.",
+            AddKind::VirtualSet => "Compose a backdrop, two presenter layers and a foreground with animated camera presets.",
             AddKind::WebBrowser => "A web page as an input — not available in this version.",
             AddKind::VideoCall => "Remote guests by video call — not available in this version.",
             AddKind::Zoom => "Zoom meeting participants — not available in this version.",
@@ -980,6 +995,7 @@ pub struct Switcher {
     pub stream_slot: usize,
     pub stream_active: [bool; crate::stream::COUNT],
     pub stream_status: [String; crate::stream::COUNT],
+    pub stream_logs: [String; crate::stream::COUNT],
     pub mc_setup: bool,
     pub playlist_setup: bool,
     /// Inputs left out of the MultiCorder / the PlayList (ticked off in their setup windows).
@@ -1033,6 +1049,7 @@ pub struct Switcher {
     pub omt_status: [String; OUTPUT_COUNT],
     pub srt_active: [bool; OUTPUT_COUNT],
     pub srt_status: [String; OUTPUT_COUNT],
+    pub srt_logs: [String; OUTPUT_COUNT],
     pub srt_setup: Option<usize>,
     /// Input whose settings window (name, green-screen key) is open.
     pub settings_input: Option<u32>,
@@ -1042,6 +1059,7 @@ pub struct Switcher {
     pub remote: Option<crate::automation::Remote>,
     pub replay_open: bool,
     pub replay_arm: bool,
+    pub replay_live: bool,
     pub replay_angles: [u32; REPLAY_ANGLES],
     pub replay_setup: crate::replay::Setup,
     pub replay_setup_open: bool,
@@ -1055,6 +1073,7 @@ pub struct Switcher {
     pub replay_marking: bool,
     pub replay_channel: usize,
     pub replay_cameras: [usize; 2],
+    pub replay_timeline: Option<(u64, u64, u64)>,
     pub replay_speed: [u8; 2],
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
     pub confirm_stop: Option<&'static str>,
@@ -1219,6 +1238,7 @@ pub struct ShortcutBinding {
     pub action: String,
     /// 0 = no MIDI binding, 1..=16 = MIDI channel as shown in the original.
     pub midi_channel: u8,
+    pub midi_kind: crate::midi::Kind,
     /// Note number (0..=127). For ControlChange this is the controller number.
     pub midi_note: u8,
     /// Optional value match (velocity / controller value).
@@ -1292,6 +1312,7 @@ impl InterfaceTheme {
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub theme: InterfaceTheme,
+    pub language: crate::locale::Language,
     pub preview_colour: eframe::egui::Color32,
     pub output_colour: eframe::egui::Color32,
     pub network_thumbnails: bool,
@@ -1299,6 +1320,7 @@ pub struct Settings {
     pub ffmpeg_extensions: String,
     pub ffmpeg_all_files: bool,
     pub decoder_deinterlace: u8,
+    pub directshow: crate::vmix_settings::DirectShow,
     pub record_audio: [bool; 3],
     pub production_clock: bool,
     pub default_audio_bus: usize,
@@ -1418,12 +1440,14 @@ pub struct Settings {
     pub midi_enabled: bool,
     /// Checked MIDI devices (indexes from `midi::Input::devices`).
     pub midi_devices: Vec<usize>,
+    pub midi_feedback: Vec<crate::controls::Feedback>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             theme: InterfaceTheme::Classic,
+            language: Default::default(),
             preview_colour: crate::render::PREVIEW,
             output_colour: crate::render::OUTPUT,
             network_thumbnails: true,
@@ -1431,6 +1455,7 @@ impl Default for Settings {
             ffmpeg_extensions: String::new(),
             ffmpeg_all_files: false,
             decoder_deinterlace: 0,
+            directshow: Default::default(),
             record_audio: [true; 3],
             production_clock: true,
             default_audio_bus: 0,
@@ -1507,6 +1532,7 @@ impl Default for Settings {
             shortcuts: default_shortcuts(),
             midi_enabled: false,
             midi_devices: Vec::new(),
+            midi_feedback: Vec::new(),
         }
     }
 }
@@ -1533,16 +1559,137 @@ impl Settings {
 }
 
 impl Switcher {
+    fn portable_settings(&self) -> Result<String, String> {
+        let mut lines = Vec::new();
+        for line in self.settings_text().lines() {
+            let (key, value) = line.split_once('=').ok_or("Invalid setting")?;
+            if matches!(key, "streams" | "srt_outputs") {
+                let mut entries: Vec<serde_json::Value> = serde_json::from_str(value).map_err(|error| error.to_string())?;
+                for entry in &mut entries {
+                    if key == "streams" {
+                        entry["url"] = "".into();
+                        entry["key"] = "".into();
+                    } else {
+                        entry["connection"]["passphrase"] = "".into();
+                        entry["connection"]["stream_id"] = "".into();
+                    }
+                }
+                lines.push(format!("{key}={}", serde_json::to_string(&entries).map_err(|error| error.to_string())?));
+            } else {
+                lines.push(line.to_owned());
+            }
+        }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1, "application": "LiveMix", "settings": lines.join("\n")
+        })).map_err(|error| error.to_string())
+    }
+
+    fn parse_portable_settings(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Portable {
+            schema: u32,
+            application: String,
+            settings: String,
+        }
+        let file: Portable = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|error| format!("Invalid settings file: {error}"))?;
+        if file.schema != 1 || file.application != "LiveMix" {
+            return Err("Unsupported settings file version".into());
+        }
+        let mut candidate = Self::empty();
+        candidate.apply_settings_text(&file.settings);
+        let canonical = candidate.settings_text();
+        let known: std::collections::HashMap<_, _> = canonical.lines().filter_map(|line| line.split_once('=')).collect();
+        let mut seen = std::collections::HashSet::new();
+        for line in file.settings.lines() {
+            let (key, value) = line.split_once('=').ok_or("Invalid setting line")?;
+            if !seen.insert(key) { return Err(format!("Duplicate setting: {key}")); }
+            let matches = known.get(key).is_some_and(|canonical| {
+                if matches!(key, "srt_outputs" | "streams" | "directshow") {
+                    serde_json::from_str::<serde_json::Value>(canonical).ok()
+                        .zip(serde_json::from_str::<serde_json::Value>(value).ok())
+                        .is_some_and(|(canonical, actual)| canonical == actual)
+                } else {
+                    *canonical == value
+                }
+            });
+            if !matches {
+                return Err(format!("Unknown or invalid setting: {key}"));
+            }
+        }
+        if seen.is_empty() { return Err("Settings file is empty".into()); }
+        Ok(candidate)
+    }
+
+    pub fn export_settings_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let text = if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("config")) {
+            crate::vmix_settings::export(&self.cfg)
+        } else {
+            self.portable_settings()?
+        };
+        crate::preset::write_file(path, text.as_bytes())
+    }
+
+    pub fn import_settings_from(&mut self, path: &std::path::Path) -> Result<String, String> {
+        use std::io::Read;
+        const MAX_SETTINGS_BYTES: u64 = 1_048_576;
+        let mut text = String::new();
+        std::fs::File::open(path).and_then(|file| file.take(MAX_SETTINGS_BYTES + 1).read_to_string(&mut text))
+            .map_err(|error| error.to_string())?;
+        if text.len() as u64 > MAX_SETTINGS_BYTES { return Err("Settings file is too large".into()); }
+        if text.trim_start_matches('\u{feff}').trim_start().starts_with('<') {
+            let report = crate::vmix_settings::import(text.trim_start_matches('\u{feff}'), &self.cfg)?;
+            let mut candidate = Self::empty();
+            candidate.cfg = report.settings;
+            self.replace_settings(candidate)?;
+            Ok(format!("vMix settings imported: {} applied, {} skipped", report.imported, report.skipped))
+        } else {
+            self.replace_settings(Self::parse_portable_settings(&text)?)?;
+            Ok("LiveMix settings imported".into())
+        }
+    }
+
+    pub fn reset_settings(&mut self) -> Result<(), String> {
+        self.replace_settings(Self::empty())
+    }
+
+    fn replace_settings(&mut self, mut candidate: Self) -> Result<(), String> {
+        if self.outputs_busy() || self.cfg.ndi_outputs.contains(&true) || self.cfg.omt_outputs.contains(&true) {
+            return Err(STOP_OUTPUTS_MSG.into());
+        }
+        candidate.cfg.ndi_outputs.fill(false);
+        candidate.cfg.omt_outputs.fill(false);
+        let path = Self::settings_path();
+        if path.is_file() {
+            let previous = std::fs::read(&path).map_err(|error| error.to_string())?;
+            crate::preset::write_file(&path.with_file_name("settings.previous.txt"), &previous)?;
+        }
+        let text = candidate.settings_text();
+        crate::preset::write_file(&path, text.as_bytes())?;
+        let page = self.cfg.page;
+        self.cfg = candidate.cfg;
+        self.cfg.page = page;
+        self.apply_settings_text(&text);
+        set_output_fps(self.cfg.rate());
+        Ok(())
+    }
+
     fn settings_path() -> std::path::PathBuf {
         crate::media::storage_folder().join("settings.txt")
     }
 
     /// Saves the Settings window options (key=value lines).
     pub fn save_settings(&self) {
+        let _ = crate::preset::write_file(&Self::settings_path(), self.settings_text().as_bytes());
+    }
+
+    fn settings_text(&self) -> String {
         let c = &self.cfg;
         let b = |v: bool| if v { "1" } else { "0" };
         let lines = [
             format!("theme={}", c.theme.label().to_ascii_lowercase()),
+            format!("language={}", c.language.code()),
             format!("preview_colour={:02x}{:02x}{:02x}", c.preview_colour.r(), c.preview_colour.g(), c.preview_colour.b()),
             format!("output_colour={:02x}{:02x}{:02x}", c.output_colour.r(), c.output_colour.g(), c.output_colour.b()),
             format!("network_thumbnails={}", b(c.network_thumbnails)),
@@ -1550,6 +1697,7 @@ impl Switcher {
             format!("ffmpeg_extensions={}", serde_json::to_string(&c.ffmpeg_extensions).unwrap_or_default()),
             format!("ffmpeg_all_files={}", b(c.ffmpeg_all_files)),
             format!("decoder_deinterlace={}", c.decoder_deinterlace),
+            format!("directshow={}", serde_json::to_string(&c.directshow).unwrap_or_default()),
             format!("record_audio={}", c.record_audio.map(b).join(",")),
             format!("production_clock={}", b(c.production_clock)),
             format!("default_audio_bus={}", c.default_audio_bus),
@@ -1618,7 +1766,7 @@ impl Switcher {
             format!("streams={}", serde_json::Value::Array(c.streams.iter().map(|d|
                 serde_json::json!({"provider": d.provider, "url": d.url, "key": d.key,
                     "quality": d.quality, "source": d.source, "hardware": d.hardware, "hevc": d.hevc,
-                    "direct": d.direct, "bitrate": d.bitrate})).collect())),
+                    "direct": d.direct, "bitrate": d.bitrate, "source_audio": d.source_audio})).collect())),
             format!("playlist_loop={}", b(c.playlist_loop)),
             format!("out_size={}", c.out_size),
             format!("out_rate={}", c.out_rate),
@@ -1642,18 +1790,27 @@ impl Switcher {
             format!("shortcuts={}", serde_json::to_string(&c.shortcuts).unwrap_or_default()),
             format!("midi_enabled={}", b(c.midi_enabled)),
             format!("midi_devices={}", serde_json::to_string(&c.midi_devices).unwrap_or_default()),
+            format!("midi_feedback={}", serde_json::to_string(&c.midi_feedback).unwrap_or_default()),
         ];
-        let _ = std::fs::write(Self::settings_path(), lines.join("\n"));
+        lines.join("\n")
     }
 
     /// Loads saved Settings window options, if any.
     pub fn load_settings(&mut self) {
         let Ok(text) = std::fs::read_to_string(Self::settings_path()) else { return };
+        self.apply_settings_text(&text);
+    }
+
+    fn apply_settings_text(&mut self, text: &str) {
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             let on = v == "1";
             let c = &mut self.cfg;
             match k {
+                "directshow" => {
+                    if let Ok(settings) = serde_json::from_str(v) { c.directshow = settings; }
+                }
+                "language" => c.language = crate::locale::Language::from_code(v),
                 "theme" => c.theme = InterfaceTheme::ALL.into_iter()
                     .find(|theme| theme.label().eq_ignore_ascii_case(v)).unwrap_or_default(),
                 "preview_colour" | "output_colour" => {
@@ -1790,6 +1947,7 @@ impl Switcher {
                             destination.quality = stream["quality"].as_u64().unwrap_or(1).min(crate::stream::QUALITIES.len() as u64 - 1) as u8;
                             destination.source = stream["source"].as_u64().unwrap_or(0).min((OUTPUT_COUNT - 1) as u64) as usize;
                             destination.hardware = stream["hardware"].as_bool().unwrap_or(false);
+                            destination.source_audio = stream["source_audio"].as_bool().unwrap_or(false);
                             destination.hevc = stream["hevc"].as_bool().unwrap_or(false);
                             destination.direct = stream["direct"].as_u64().and_then(|value| u32::try_from(value).ok());
                             destination.bitrate = stream["bitrate"].as_u64().map(|value| value.clamp(1, 100) as u32);
@@ -1829,6 +1987,9 @@ impl Switcher {
                     if let Ok(rows) = serde_json::from_str(v) { c.shortcuts = rows; }
                 }
                 "midi_enabled" => c.midi_enabled = on,
+                "midi_feedback" => {
+                    if let Ok(rows) = serde_json::from_str(v) { c.midi_feedback = rows; }
+                }
                 "midi_devices" => {
                     if let Ok(devices) = serde_json::from_str(v) { c.midi_devices = devices; }
                 }
@@ -1884,6 +2045,7 @@ impl Switcher {
             stream_slot: 0,
             stream_active: Default::default(),
             stream_status: Default::default(),
+            stream_logs: Default::default(),
             mc_setup: false,
             playlist_setup: false,
             mc_off: Default::default(),
@@ -1952,6 +2114,7 @@ impl Switcher {
             omt_status: Default::default(),
             srt_active: Default::default(),
             srt_status: Default::default(),
+            srt_logs: Default::default(),
             srt_setup: None,
             settings_input: None,
             import_report: None,
@@ -1960,6 +2123,7 @@ impl Switcher {
             remote: None,
             replay_open: false,
             replay_arm: false,
+            replay_live: true,
             replay_angles: [SRC_OUTPUT, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO],
             replay_setup: Default::default(),
             replay_setup_open: false,
@@ -1973,6 +2137,7 @@ impl Switcher {
             replay_marking: false,
             replay_channel: 0,
             replay_cameras: [0, 0],
+            replay_timeline: None,
             replay_speed: [100, 100],
             confirm_stop: None,
             position_clipboard: None,
@@ -2194,10 +2359,28 @@ impl Switcher {
         }
         let fields: Vec<&str> = text.split_whitespace().collect();
         let op = fields.first().copied().unwrap_or_default().to_ascii_lowercase();
+        let op = match op.as_str() {
+            "previewinput" => "preview",
+            "setvolume" => "volume",
+            "setmastervolume" => "mastervolume",
+            "setfader" => "tbar",
+            "replayjumpframes" => "replaystep",
+            name => name,
+        };
         let number = |text: &str| text.parse::<usize>().ok().filter(|n| *n >= 1);
         let duration = |text: &str| text.parse::<u32>().ok().filter(|ms| *ms <= 60_000);
-        let target = |s: &Self, n: usize| s.inputs.get(n - 1).map(|input| input.id);
-        match (op.as_str(), fields.len()) {
+        let target = |s: &Self, value: &str| {
+            if let Some(id) = value.strip_prefix('@').and_then(|id| id.parse::<u32>().ok()) {
+                s.input(id).map(|input| input.id)
+            } else {
+                number(value).and_then(|n| s.inputs.get(n - 1)).map(|input| input.id)
+            }
+        };
+        let input = |s: &Self, value: &str| target(s, value).ok_or_else(|| format!("Input {value} is unavailable"));
+        let value = |text: &str, max| text.parse::<u32>().ok().filter(|n| *n <= max)
+            .ok_or_else(|| format!("Invalid value {text:?}"));
+        use crate::replay::Action;
+        match (op, fields.len()) {
             ("cut", 1) | ("cutpreview", 1) => self.start_transition(Effect::Cut, 0),
             ("previewnext", 1) | ("previewinputnext", 1) => self.preview_step(1),
             ("previewprevious", 1) | ("previewinputprevious", 1) => self.preview_step(-1),
@@ -2222,17 +2405,13 @@ impl Switcher {
             ("stopmulticorder", 1) => self.multicorder = None,
             ("fadetoblack", 1) | ("ftb", 1) => self.ftb_on = !self.ftb_on,
             ("preview", 2) => {
-                let n = number(fields[1]).ok_or_else(|| format!("Invalid input in {text:?}"))?;
-                let id = target(self, n).ok_or_else(|| format!("Input {n} is unavailable"))?;
-                self.preview = Some(id);
+                self.preview = Some(input(self, fields[1])?);
             }
             ("cutdirect", 2) | ("cut", 2) => {
-                let n = number(fields[1]).ok_or_else(|| format!("Invalid input in {text:?}"))?;
-                if n == 0 {
+                if fields[1] == "0" {
                     self.start_transition(Effect::Cut, 0);
                 } else {
-                    let id = target(self, n).ok_or_else(|| format!("Input {n} is unavailable"))?;
-                    self.cut_direct(id);
+                    self.cut_direct(input(self, fields[1])?);
                 }
             }
             ("fade", 2) => {
@@ -2240,13 +2419,11 @@ impl Switcher {
                 self.start_transition(Effect::Fade, ms);
             }
             ("fadedirect", 3) | ("fade", 3) => {
-                let n = number(fields[1]).ok_or_else(|| format!("Invalid input in {text:?}"))?;
                 let ms = duration(fields[2]).ok_or_else(|| format!("Invalid duration in {text:?}"))?;
-                if n == 0 {
+                if fields[1] == "0" {
                     self.start_transition(Effect::Fade, ms);
                 } else {
-                    let id = target(self, n).ok_or_else(|| format!("Input {n} is unavailable"))?;
-                    self.transition_input(id, Effect::Fade, ms);
+                    self.transition_input(input(self, fields[1])?, Effect::Fade, ms);
                 }
             }
             ("overlay", 2) => {
@@ -2262,9 +2439,208 @@ impl Switcher {
                     return Err(format!("Output {n} does not exist"));
                 }
             }
-            _ => return Err(format!("Unknown action {text:?}")),
+            ("quickplay", 1) => self.start_transition(self.quickplay_effect, self.quickplay_ms),
+            ("quickplay", 2) => self.transition_input(input(self, fields[1])?, self.quickplay_effect, self.quickplay_ms),
+            ("transition", 2) => {
+                let slot = value(fields[1], 4)?;
+                if slot == 0 { return Err("Transition slots start at 1".into()); }
+                self.start_transition_button(slot as usize - 1);
+            }
+            ("play" | "pause" | "playpause" | "restart" | "loop" | "audio" | "audioon" | "audiooff" | "volume", 2 | 3) => {
+                let id = input(self, fields[1])?;
+                let volume = if op == "volume" {
+                    Some(value(fields.get(2).copied().unwrap_or_default(), 100)?)
+                } else { None };
+                let item = self.input_mut(id).unwrap();
+                match op {
+                    "play" => item.playing = true,
+                    "pause" => item.playing = false,
+                    "playpause" => item.playing = !item.playing,
+                    "restart" => { item.pos = 0.0; item.seek_ms = Some(0); item.playing = true; }
+                    "loop" => item.loop_on = !item.loop_on,
+                    "audio" => item.audio_on = !item.audio_on,
+                    "audioon" => item.audio_on = true,
+                    "audiooff" => item.audio_on = false,
+                    "volume" => item.volume = volume.unwrap() as f32,
+                    _ => unreachable!(),
+                }
+            }
+            ("startstoprecording", 1) => self.rec = if self.rec.is_some() { None } else { Some(now) },
+            ("startstopmulticorder", 1) => self.multicorder = if self.multicorder.is_some() { None } else { Some(now) },
+            ("startstopstreaming", 1) => self.stream_active[0] = !self.stream_active[0],
+            ("startplaylist", 1) => self.playlist = Some(now),
+            ("stopplaylist", 1) => self.playlist = None,
+            ("audiomixershowhide", 1) => self.show_mixer = !self.show_mixer,
+            ("fullscreen" | "fullscreenon" | "fullscreenoff", 1 | 2) => {
+                let slot = fields.get(1).map_or(Ok(1), |arg| value(arg, 2))?;
+                if slot == 0 { return Err("Fullscreen slots start at 1".into()); }
+                let slot = slot as usize - 1;
+                if op == "fullscreen" || self.fullscreen[slot] != (op == "fullscreenon") {
+                    crate::toggle_fullscreen(self, slot);
+                }
+            }
+            ("startexternal" | "stopexternal" | "startstopexternal", 1 | 2) => {
+                let channel = fields.get(1).map_or(Ok(1), |arg| value(arg, OUTPUT_COUNT as u32))?;
+                if channel == 0 { return Err("Output channels start at 1".into()); }
+                let channel = channel as usize - 1;
+                let active = self.external[channel].open || self.decklink_active[channel];
+                if op == "startstopexternal" || active != (op == "startexternal") {
+                    self.toggle_external_route(channel);
+                }
+            }
+            ("loopon" | "loopoff" | "audioauto" | "audioautoon" | "audioautooff", 2) => {
+                let id = input(self, fields[1])?;
+                let item = self.input_mut(id).unwrap();
+                match op {
+                    "loopon" | "loopoff" => item.loop_on = op == "loopon",
+                    "audioauto" => item.auto_mix_audio = !item.auto_mix_audio,
+                    _ => item.auto_mix_audio = op == "audioautoon",
+                }
+            }
+            ("overlayinputalloff", 1) => {
+                for overlay in &mut self.overlays { overlay.on = false; }
+            }
+            ("setzoom" | "setpanx" | "setpany", 3) => {
+                let id = input(self, fields[1])?;
+                let scalar = fields[2].parse::<f32>().ok().filter(|v| v.is_finite()).ok_or("Invalid position value")?;
+                let position = &mut self.input_mut(id).unwrap().place;
+                match op {
+                    "setzoom" => position.zoom = scalar.clamp(0.0025, 5.0),
+                    "setpanx" => position.pan_x = scalar.clamp(-2.0, 2.0),
+                    _ => position.pan_y = scalar.clamp(-2.0, 2.0),
+                }
+            }
+            ("replayshowhide", 1) => self.replay_open = !self.replay_open,
+            ("replaymarkcancel", 1) => self.replay_command = Some(Action::CancelMark),
+            ("replaystartstoprecording", 1) => {
+                if self.replay_session.is_empty() || self.replay_read_only {
+                    return Err("Open a writable Replay session first".into());
+                }
+                self.replay_arm = !self.replay_arm;
+            }
+            ("replayplayselectedevent" | "replayplayselectedeventtooutput" | "replaydeleteselectedevent", 1) => {
+                let event = self.replay_event.ok_or("Select a Replay event first")?;
+                self.replay_command = Some(if op == "replaydeleteselectedevent" {
+                    Action::DeleteEvent(event)
+                } else { Action::Play { event, program: op.ends_with("tooutput") } });
+            }
+            ("replayselectfirstevent" | "replayselectlastevent" | "replayselectpreviousevent" | "replayselectnextevent", 1) => {
+                if !self.replay_events.is_empty() {
+                    let last = self.replay_events.len() - 1;
+                    let current = self.replay_events.iter().position(|event| Some(event.id) == self.replay_event);
+                    let index = match op {
+                        "replayselectfirstevent" => 0,
+                        "replayselectlastevent" => last,
+                        "replayselectpreviousevent" => current.map_or(last, |index| index.saturating_sub(1)),
+                        _ => current.map_or(0, |index| (index + 1).min(last)),
+                    };
+                    self.replay_event = Some(self.replay_events[index].id);
+                }
+            }
+            ("mastervolume", 2) => self.master_volume = value(fields[1], 100)? as f32,
+            ("masteraudio", 1) => self.master_on = !self.master_on,
+            ("tbar", 2) => self.set_tbar(value(fields[1], 100)? as f32 / 100.0),
+            ("snapshot", 1) => self.snapshot_req = true,
+            ("replaystartrecording" | "replaystoprecording", 1) => {
+                if self.replay_session.is_empty() || self.replay_read_only {
+                    return Err("Open a writable Replay session first".into());
+                }
+                self.replay_arm = op == "replaystartrecording";
+            }
+            ("replaymarkin", 1) => self.replay_command = Some(Action::MarkIn),
+            ("replaymarkout", 1) => self.replay_command = Some(Action::MarkOut),
+            ("replaymarklast", 2) => self.replay_command = Some(Action::MarkLast(u64::from(value(fields[1], 3600)?) * 1000)),
+            ("replayplaylast" | "replayplaylastevent" | "replayplaylasteventtooutput", 1) => {
+                let event = self.replay_events.iter().max_by_key(|event| (event.end, event.id)).ok_or("No saved Replay event")?.id;
+                self.replay_command = Some(Action::Play { event, program: op != "replayplaylastevent" });
+            }
+            ("replayselectchannela" | "replayselectchannelb" | "replayselectchannelab", 1) => {
+                self.replay_channel = match op { "replayselectchannela" => 0, "replayselectchannelb" => 1, _ => 2 };
+            }
+            ("replayplaypause", 1) => self.replay_command = Some(Action::Pause(self.replay_channel)),
+            ("replayplay" | "replaypause", 1) => self.replay_command = Some(Action::SetPlaying(self.replay_channel, op == "replayplay")),
+            ("replaystopevents", 1) => self.replay_command = Some(Action::Stop(self.replay_channel)),
+            ("replaylive", 1) => self.replay_command = Some(Action::Live),
+            ("replayreverse", 1) => self.replay_command = Some(Action::Reverse),
+            ("replaystep", 2) => {
+                let frames = fields[1].parse::<i8>().map_err(|_| "Invalid frame step")?;
+                if frames != 0 { self.replay_command = Some(Action::Step(frames)); }
+            }
+            ("replaysetspeed", 2) => {
+                let speed = crate::shortcut_ops::replay_speed(fields[1])?;
+                for (channel, current) in self.replay_speed.iter_mut().enumerate() {
+                    if self.replay_channel == channel || self.replay_channel == 2 { *current = speed; }
+                }
+            }
+            ("replayselectcamera", 2) => {
+                let camera = value(fields[1], REPLAY_ANGLES as u32)?;
+                if camera == 0 { return Err("Replay cameras start at 1".into()); }
+                for (channel, current) in self.replay_cameras.iter_mut().enumerate() {
+                    if self.replay_channel == channel || self.replay_channel == 2 { *current = camera as usize - 1; }
+                }
+            }
+            _ => {
+                if crate::shortcut_ops::run(self, op, &fields[1..], target, now)?
+                    || self.numbered_shortcut(op, &fields[1..], target)?
+                {
+                    return Ok(());
+                }
+                return Err(format!("Unknown action {text:?}"));
+            }
         }
         Ok(())
+    }
+
+    fn numbered_shortcut(&mut self, op: &str, args: &[&str],
+        target: impl Fn(&Self, &str) -> Option<u32>) -> Result<bool, String>
+    {
+        let index = |text: &str, max: usize| text.parse::<usize>().ok()
+            .and_then(|n| n.checked_sub(1)).filter(|&n| n < max);
+        for (prefix, channel) in [("replayacamera", Some(0)), ("replaybcamera", Some(1)), ("replaycamera", None)] {
+            if let Some(camera) = op.strip_prefix(prefix).and_then(|n| index(n, REPLAY_ANGLES)) {
+                for (i, current) in self.replay_cameras.iter_mut().enumerate() {
+                    if channel.map_or(self.replay_channel == i || self.replay_channel == 2, |channel| channel == i) {
+                        *current = camera;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        let preview = op.starts_with("previewoverlayinput");
+        if let Some(rest) = op.strip_prefix(if preview { "previewoverlayinput" } else { "overlayinput" }) {
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            if let Some(channel) = index(&rest[..end], OVERLAY_CHANNELS) {
+                match &rest[end..] {
+                    "off" | "out" => self.overlays[channel].on = false,
+                    "last" => { self.activate_overlay(channel); }
+                    "" | "in" => {
+                        let source = args.first().and_then(|arg| target(self, arg)).or(self.preview)
+                            .ok_or("Select an overlay input")?;
+                        if end == rest.len() { self.press_input_overlay(channel, source, preview); }
+                        else {
+                            self.assign_overlay(channel, source, preview);
+                            self.activate_overlay(channel);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+                return Ok(true);
+            }
+        }
+        if let Some(slot) = op.strip_prefix("settransitionduration").and_then(|n| index(n, self.transitions.len())) {
+            let ms = args.first().and_then(|arg| arg.parse::<u32>().ok()).filter(|&ms| ms <= 60_000)
+                .ok_or("Invalid transition duration")?;
+            self.transitions[slot].ms = ms;
+            return Ok(true);
+        }
+        if let Some(slot) = op.strip_prefix("settransitioneffect").and_then(|n| index(n, self.transitions.len())) {
+            let effect = args.first().and_then(|arg| ALL_EFFECTS.iter().find(|effect| effect.name().eq_ignore_ascii_case(arg)))
+                .ok_or("Unknown transition effect")?;
+            self.transitions[slot].effect = *effect;
+            self.transitions[slot].stinger = None;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// T-bar position as 0..1 for drawing.
@@ -2578,6 +2954,23 @@ impl Switcher {
     }
 
     /// Adds the input described by the Add Input dialog. Returns an error to show, if any.
+    pub fn replay_live_source(&self, channel: usize) -> Option<u32> {
+        if !self.replay_live || !self.replay_setup.show_live_sources
+            || self.inputs.iter().any(|input| input.playing && matches!(input.kind, Kind::Replay { .. }))
+        {
+            return None;
+        }
+        let camera = *self.replay_cameras.get(channel)?;
+        self.replay_camera_source(camera)
+    }
+
+    pub fn replay_camera_source(&self, camera: usize) -> Option<u32> {
+        let source = *self.replay_angles.get(camera)?;
+        if source == SRC_OUTPUT { return Some(source); }
+        let input = self.input(source.checked_sub(1)?)?;
+        (!matches!(input.kind, Kind::Replay { .. })).then_some(source)
+    }
+
     pub fn ensure_replay_inputs(&mut self) -> [u32; 2] {
         std::array::from_fn(|channel| {
             if let Some(input) = self.inputs.iter().find(|input| {
@@ -2649,6 +3042,14 @@ impl Switcher {
                 self.add_dialog.name.clear();
                 return Ok(());
             }
+            AddKind::PowerPoint => {
+                let path = std::path::Path::new(d.path.trim());
+                if !path.is_file() || !crate::slides::accepted(path) {
+                    return Err("Choose a PowerPoint or LibreOffice presentation.".into());
+                }
+                (Kind::Presentation { path: d.path.trim().into() }, file_name)
+            }
+            AddKind::VirtualSet => (Kind::VirtualSet { camera: 0, previous: 0, changed_at: 0.0 }, "Virtual Set".into()),
             AddKind::ImageSequence | AddKind::Photos => {
                 let f = d.folder.trim().to_string();
                 if f.is_empty() || !std::path::Path::new(&f).is_dir() {
@@ -2697,6 +3098,10 @@ impl Switcher {
         };
         let name = if d.name.trim().is_empty() { default_name } else { d.name.trim().to_string() };
         let mut i = Input::new(0, &name, kind);
+        if matches!(i.kind, Kind::VirtualSet { .. }) {
+            i.layers[1].place = Position { zoom: 0.48, pan_x: -0.45, pan_y: -0.12, ..Default::default() };
+            i.layers[2].place = Position { zoom: 0.48, pan_x: 0.45, pan_y: -0.12, ..Default::default() };
+        }
         if i.kind.has_audio() {
             i.bus_m = self.cfg.default_audio_bus == 0;
             i.bus_a = self.cfg.default_audio_bus == 1;
@@ -2736,6 +3141,10 @@ impl Switcher {
             .join("livemix_preset.txt")
     }
 
+    pub fn recovery_preset_path() -> std::path::PathBuf {
+        crate::media::storage_folder().join("last.vmix")
+    }
+
     fn last_preset_path() -> std::path::PathBuf {
         crate::media::storage_folder().join("last-preset.txt")
     }
@@ -2744,6 +3153,7 @@ impl Switcher {
         self.preset_name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         self.preset_file = Some(path.to_path_buf());
         self.saved_text = Some(self.preset_text());
+        let path = std::path::absolute(path).map_err(|error| error.to_string())?;
         crate::preset::write_file(&Self::last_preset_path(), path.to_string_lossy().as_bytes())
     }
 
@@ -2872,6 +3282,8 @@ impl Switcher {
                 Kind::Desktop => ("desktop", String::new(), String::new()),
                 Kind::ImageSequence { folder } => ("imagesequence", folder.clone(), String::new()),
                 Kind::Photos { folder } => ("photos", folder.clone(), String::new()),
+                Kind::Presentation { path } => ("presentation", path.clone(), String::new()),
+                Kind::VirtualSet { camera, .. } => ("virtualset", camera.to_string(), String::new()),
                 Kind::VideoDelay { source, seconds, resolution } => ("videodelay",
                     self.number_of(source.unwrap_or(0)).to_string(),
                     format!("{},{},{}", resolution[0], resolution[1], seconds)),
@@ -2949,9 +3361,10 @@ impl Switcher {
             }
             for (k, l) in i.layers.iter().enumerate() {
                 if l.input.is_some() {
-                    out.push_str(&format!("layer\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{}\t{}\n", n + 1, k,
+                    out.push_str(&format!("layer\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{}\t{}\t{}\t{}\n", n + 1, k,
                         l.on as u8, num(l.input), fmt_pos(&l.place), l.border as u8,
-                        l.border_colour[0], l.border_colour[1], l.border_colour[2], l.border_width));
+                        l.border_colour[0], l.border_colour[1], l.border_colour[2], l.border_width,
+                        l.scale[0], l.scale[1]));
                 }
             }
         }
@@ -2968,20 +3381,34 @@ impl Switcher {
     }
 
     pub fn load_last_preset(&mut self) {
+        let recovery = Self::recovery_preset_path();
+        if recovery.is_file() {
+            self.open_preset(&recovery, true);
+            return;
+        }
         let path = std::fs::read_to_string(Self::last_preset_path()).ok()
-            .filter(|p| !p.trim().is_empty()).map(std::path::PathBuf::from);
-        let path = path.or_else(|| {
-            let legacy = Self::legacy_preset_path();
-            legacy.is_file().then_some(legacy)
-        });
+            .and_then(|text| last_preset_entry(&text))
+            .or_else(|| self.preset_file.clone())
+            .or_else(|| {
+                let legacy = Self::legacy_preset_path();
+                legacy.is_file().then_some(legacy)
+            });
         if let Some(path) = path {
-            self.load_preset_from(&path);
+            if path.is_file() {
+                self.load_preset_from(&path);
+            } else {
+                self.notify(&format!("Last project is unavailable: {}", path.display()));
+            }
         } else {
             self.notify("No recent preset yet. Open or save a project first.");
         }
     }
 
     pub fn load_preset_from(&mut self, path: &std::path::Path) {
+        self.open_preset(path, false);
+    }
+
+    fn open_preset(&mut self, path: &std::path::Path, recovery: bool) {
         if self.outputs_busy() {
             self.notify(STOP_OUTPUTS_MSG);
             return;
@@ -3001,6 +3428,14 @@ impl Switcher {
                     self.import_report = Some(crate::preset::ImportReport::collect(path, &self.inputs, warnings.clone()));
                 }
                 self.now = now;
+                if recovery {
+                    self.preset_file = None;
+                    self.preset_name = "Recovered project".into();
+                    self.saved_text = None;
+                    set_output_fps(self.cfg.rate());
+                    self.notify("Recovered the last automatic project copy");
+                    return;
+                }
                 let last = self.remember_preset(path);
                 set_output_fps(self.cfg.rate());
                 self.notify(&match (last, warnings.is_empty()) {
@@ -3047,6 +3482,11 @@ impl Switcher {
                         "desktop" => Kind::Desktop,
                         "imagesequence" => Kind::ImageSequence { folder: f[3].into() },
                         "photos" => Kind::Photos { folder: f[3].into() },
+                        "presentation" => Kind::Presentation { path: f[3].into() },
+                        "virtualset" => {
+                            let camera = f[3].parse::<u8>().unwrap_or(0).min(2);
+                            Kind::VirtualSet { camera, previous: camera, changed_at: 0.0 }
+                        }
                         "videodelay" => {
                             let r: Vec<u32> = f[4].split(',').take(2).filter_map(|x| x.parse().ok()).collect();
                             Kind::VideoDelay {
@@ -3138,6 +3578,11 @@ impl Switcher {
                             }
                             if let Some(v) = f.get(8).and_then(|v| v.parse().ok()) {
                                 layer.border_width = v;
+                            }
+                            for (axis, scale) in layer.scale.iter_mut().enumerate() {
+                                if let Some(value) = f.get(9 + axis).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()) {
+                                    *scale = value.clamp(0.0025, 5.0);
+                                }
                             }
                             *l = layer;
                         }
@@ -3512,7 +3957,7 @@ mod tests {
                 red: 0.4, green: -0.5, blue: 0.6, alpha: -0.7, black: 0.125, white: -0.157 };
             i.layers[3] = Layer { on: true, input: Some(b),
                 place: Position { zoom: 0.25, pan_x: 0.5, pan_y: -0.5, crop: [0.1, 0.2, 0.9, 0.8] },
-                border: true, border_colour: [9, 8, 7], border_width: 0.05 };
+                scale: [1.0; 2], border: true, border_colour: [9, 8, 7], border_width: 0.05 };
         }
         let text = s.preset_text();
         let mut reopened = Switcher::empty();
@@ -3655,5 +4100,34 @@ mod tests {
         s.toggle_overlay_channel(1);
         frames(&mut s, 30);
         assert_eq!(s.overlays[1].input, None);
+    }
+}
+
+#[cfg(test)]
+mod portable_settings_tests {
+    use super::*;
+
+    #[test]
+    fn settings_round_trip_and_omit_destination_secrets() {
+        let mut switcher = Switcher::empty();
+        switcher.cfg.ffmpeg_all_files = true;
+        switcher.cfg.rec_mbps = 16;
+        switcher.cfg.streams[0].url = "rtmps://example.invalid/private-url".into();
+        switcher.cfg.streams[0].key = "private-key".into();
+        switcher.cfg.srt_outputs[0].connection.passphrase = "private-srt-passphrase".into();
+        let text = switcher.portable_settings().unwrap();
+        assert!(!text.contains("private-"));
+        let restored = Switcher::parse_portable_settings(&text).unwrap();
+        assert!(restored.cfg.ffmpeg_all_files);
+        assert_eq!(restored.cfg.rec_mbps, 16);
+        assert!(restored.cfg.streams[0].url.is_empty());
+    }
+
+    #[test]
+    fn portable_settings_reject_invalid_fields() {
+        let encode = |settings| serde_json::json!({"application": "LiveMix", "schema": 1, "settings": settings}).to_string();
+        for bad in ["rec_mbps=bad", "bad_key=1", "theme=classic\ntheme=classic", "broken"] {
+            assert!(Switcher::parse_portable_settings(&encode(bad)).is_err());
+        }
     }
 }

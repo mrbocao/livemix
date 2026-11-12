@@ -141,10 +141,12 @@ impl Buffer {
             let offset = signed_frames(at, end) - self.live_latency;
             self.data.len() as i64 + offset - frames as i64
         };
-        for n in 0..frames {
-            if let Some(sample) = usize::try_from(index + n as i64).ok().and_then(|i| self.data.get(i)) {
-                add(n, *sample);
-            }
+        let first = index.max(0);
+        let end = (index + frames as i64).min(self.data.len() as i64);
+        if first >= end { return; }
+        let offset = (first - index) as usize;
+        for (n, sample) in self.data.range(first as usize..end as usize).enumerate() {
+            add(offset + n, *sample);
         }
     }
 }
@@ -186,6 +188,15 @@ pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool,
     at: Instant, frames: usize) -> Packet
 {
     let mut mixed = vec![[0.0f32; 2]; frames];
+    mix_into(inputs, at, &mut mixed);
+    mixed.into_iter().map(|[l, r]| [l.round() as i16, r.round() as i16]).collect()
+}
+
+fn mix_into<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32)>,
+    at: Instant, mixed: &mut [[f32; 2]])
+{
+    mixed.fill([0.0; 2]);
+    let frames = mixed.len();
     for (source, file, gain) in inputs {
         if gain == 0.0 { continue; }
         if let Ok(buffer) = source.audio.try_lock() {
@@ -195,7 +206,6 @@ pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool,
             });
         }
     }
-    mixed.into_iter().map(|[l, r]| [l.round() as i16, r.round() as i16]).collect()
 }
 
 pub fn stereo_peaks(packet: &[Stereo]) -> [f32; 2] {
@@ -397,6 +407,8 @@ where
     let rate = u64::from(config.sample_rate.0);
     let mut sources_snapshot = Arc::<[MonitorSource]>::default();
     let mut clock = MonitorClock::default();
+    let mut mixed = Vec::new();
+    let mut packet = Vec::new();
     device.build_output_stream(&config, move |data: &mut [T], _| {
         let count = data.len() / channels;
         if count == 0 { return; }
@@ -404,7 +416,10 @@ where
         if let Ok(latest) = sources.try_lock() {
             sources_snapshot = latest.clone();
         }
-        let packet = mix(sources_snapshot.iter().map(|(source, file, gain)| (&**source, *file, *gain)), at, frames);
+        mixed.resize(frames, [0.0; 2]);
+        mix_into(sources_snapshot.iter().map(|(source, file, gain)| (&**source, *file, *gain)), at, &mut mixed);
+        packet.clear();
+        packet.extend(mixed.iter().map(|[l, r]| [l.round() as i16, r.round() as i16]));
         for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
             let position = phase + i as u64 * u64::from(RATE);
             let offset = (position / rate) as usize;

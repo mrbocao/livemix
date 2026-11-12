@@ -12,6 +12,7 @@ The repository root contains documentation and CI. The Rust crate is in `app/`. 
 | Program composition, scopes and GPU transfers | `program.rs`, `render.rs`, `scopes.rs`, `performance.rs`, `dx_interop.rs` |
 | Mixing, capture, monitoring and per-input processing | `audio.rs`, `dsp.rs` |
 | Physical and network I/O | `decklink.rs`, `decklink_macos.rs`, `ndi.rs`, `omt.rs`, `srt.rs`, `stream.rs` |
+| Presentation conversion and output integration tests | `slides.rs`, `livecheck.rs` |
 | Titles and operator controls | `gt.rs`, `automation.rs`, `midi.rs`, `ptz.rs` |
 
 ## Implementation checks
@@ -31,4 +32,4 @@ cargo test --locked --release -- --skip desktop_capture_delivers_frames --skip f
 cargo check --locked --target aarch64-apple-darwin
 ```
 
-Install the Apple target through Rustup before cross-checking. A cross-check verifies compilation and types. Native macOS CI also links, runs FFmpeg tests and packages the app. Run camera, desktop, network loopback and GPU integration tests separately on a machine with the required devices, libraries and permissions. Find ignored tests with `cargo test -- --list` and opt into the relevant tests by name. Report exact commands and which paths were exercised. For media performance changes, record the source, project format, GPU, selected path, frame drops and whether Program frames returned to system memory.
+Install the Apple target through Rustup before cross-checking. A cross-check verifies compilation and types. Native macOS CI also links, runs FFmpeg tests and packages the app. Run camera, desktop, network loopback and GPU integration tests separately on a machine with the required devices, libraries and permissions. Find ignored tests with `cargo test -- --list` and opt into the relevant tests by name. Report exact commands and which paths were exercised. Use [the MediaMTX script](docs/SETUP.md#streaming-integration-test) to verify video, stereo audio and timing through two shared RTMP destinations and one SRT output. For media performance changes, record the source, project format, GPU, selected path, frame drops and whether Program frames returned to system memory.

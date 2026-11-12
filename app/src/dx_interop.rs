@@ -37,6 +37,7 @@ pub(crate) struct Bridge {
     unregister: Unregister,
     lock: Access,
     unlock: Access,
+    effects: Option<(glow::Program, glow::VertexArray)>,
 }
 
 // The render callback uses the bridge only while its WGL context is current.
@@ -70,7 +71,7 @@ impl Bridge {
         }
         let interop = open(device.as_raw());
         if interop.is_null() { return Err("The selected D3D11 device could not be opened by OpenGL".into()); }
-        Ok(Self { device, interop, close, register, unregister, lock, unlock })
+        Ok(Self { device, interop, close, register, unregister, lock, unlock, effects: None })
     }
 
     pub(crate) unsafe fn copy(&self, gl: &glow::Context, source: glow::Framebuffer, [width, height]: [u32; 2])
@@ -126,23 +127,47 @@ impl Bridge {
         (self.close)(self.interop);
     }
 
-    pub(crate) unsafe fn import(&self, gl: &glow::Context, picture: &Picture, target: glow::Texture,
-        resize: bool) -> Result<(), String>
+    pub(crate) unsafe fn destroy(self, gl: &glow::Context) {
+        if let Some((shader, vao)) = self.effects {
+            gl.delete_program(shader);
+            gl.delete_vertex_array(vao);
+        }
+        self.close();
+    }
+
+    pub(crate) unsafe fn import(&mut self, gl: &glow::Context, picture: &Picture, target: glow::Texture,
+        resize: bool, effects: &Effects) -> Result<(), String>
     {
+        let (shader, vao) = match self.effects {
+            Some(program) => program,
+            None => {
+                let shader = crate::program::link(gl, crate::program::PACK_VERTEX, INPUT_EFFECTS)?;
+                let vao = match gl.create_vertex_array() {
+                    Ok(vao) => vao,
+                    Err(error) => { gl.delete_program(shader); return Err(error); }
+                };
+                self.effects = Some((shader, vao));
+                (shader, vao)
+            }
+        };
         let [w, h] = picture.size.map(|value| value as i32);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
-        let previous_texture = gl.get_parameter_texture(glow::TEXTURE_BINDING_2D);
+        let previous_active = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
+        let previous_program = gl.get_parameter_program(glow::CURRENT_PROGRAM);
+        let previous_vao = gl.get_parameter_vertex_array(glow::VERTEX_ARRAY_BINDING);
+        let mut viewport = [0; 4];
+        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
         let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+        let blend = gl.is_enabled(glow::BLEND);
+        let srgb = gl.is_enabled(glow::FRAMEBUFFER_SRGB);
         let texture = gl.create_texture()?;
-        let fbo = match gl.create_framebuffer() {
+        let target_fbo = match gl.create_framebuffer() {
             Ok(fbo) => fbo,
             Err(error) => { gl.delete_texture(texture); return Err(error); }
         };
-        let target_fbo = match gl.create_framebuffer() {
-            Ok(fbo) => fbo,
-            Err(error) => { gl.delete_framebuffer(fbo); gl.delete_texture(texture); return Err(error); }
-        };
+        gl.active_texture(glow::TEXTURE0);
+        let previous_texture = gl.get_parameter_texture(glow::TEXTURE_BINDING_2D);
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         let object = (self.register)(self.interop, picture.surface.0.as_raw(), texture.0.get(), glow::TEXTURE_2D, 0);
         let result = if object.is_null() {
@@ -153,22 +178,26 @@ impl Bridge {
             if locked {
                 if resize {
                     gl.bind_texture(glow::TEXTURE_2D, Some(target));
-                    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0, glow::RGBA,
+                    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::SRGB8_ALPHA8 as i32, w, h, 0, glow::RGBA,
                         glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_SWIZZLE_A, glow::ONE as i32);
                 }
-                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
-                gl.framebuffer_texture_2d(glow::READ_FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target_fbo));
                 gl.framebuffer_texture_2d(glow::DRAW_FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(target), 0);
-                if gl.check_framebuffer_status(glow::READ_FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE
-                    && gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE
-                {
+                if gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE {
                     gl.disable(glow::SCISSOR_TEST);
-                    gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+                    gl.disable(glow::BLEND);
+                    gl.disable(glow::FRAMEBUFFER_SRGB);
+                    gl.viewport(0, 0, w, h);
+                    gl.use_program(Some(shader));
+                    gl.bind_vertex_array(Some(vao));
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+                    gl.uniform_1_i32(gl.get_uniform_location(shader, "picture").as_ref(), 0);
+                    effects.bind(gl, shader);
+                    gl.draw_arrays(glow::TRIANGLES, 0, 3);
                     copied = gl.get_error() == glow::NO_ERROR;
                 }
-                gl.framebuffer_texture_2d(glow::READ_FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, None, 0);
+                gl.bind_texture(glow::TEXTURE_2D, None);
                 copied &= (self.unlock)(self.interop, 1, &object) != 0;
             }
             if (self.unregister)(self.interop, object) != 0 && copied { Ok(()) }
@@ -177,10 +206,65 @@ impl Bridge {
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
         gl.bind_texture(glow::TEXTURE_2D, previous_texture);
+        gl.active_texture(previous_active as u32);
+        gl.use_program(previous_program);
+        gl.bind_vertex_array(previous_vao);
+        gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
         if scissor { gl.enable(glow::SCISSOR_TEST); }
-        gl.delete_framebuffer(fbo);
+        if blend { gl.enable(glow::BLEND); }
+        if srgb { gl.enable(glow::FRAMEBUFFER_SRGB); }
         gl.delete_framebuffer(target_fbo);
         gl.delete_texture(texture);
         result.map_err(str::to_owned)
     }
 }
+
+pub(crate) struct Effects {
+    pub key: u64,
+    pub colour: crate::model::ColourAdjust,
+}
+
+impl Effects {
+    unsafe fn bind(&self, gl: &glow::Context, program: glow::Program) {
+        let uniform = |name| gl.get_uniform_location(program, name);
+        let c = self.colour;
+        let normal = |value: f32| value.clamp(-1.0, 1.0);
+        gl.uniform_4_f32(uniform("chroma_key").as_ref(), (self.key >> 16) as u8 as f32,
+            (self.key >> 8) as u8 as f32, self.key as u8 as f32,
+            if self.key == 0 { -1.0 } else { (self.key >> 24) as u8 as f32 * 1.7 });
+        gl.uniform_4_f32(uniform("adjust").as_ref(), normal(c.brightness), 1.0 + normal(c.contrast),
+            1.0 + normal(c.saturation), 1.0 + normal(c.alpha));
+        gl.uniform_3_f32(uniform("gain").as_ref(), 1.0 + normal(c.red), 1.0 + normal(c.green), 1.0 + normal(c.blue));
+        let black = normal(c.black) * 0.5;
+        gl.uniform_2_f32(uniform("levels").as_ref(), black, (1.0 + normal(c.white) * 0.5 - black).max(0.1));
+    }
+}
+
+const INPUT_EFFECTS: &str = r#"
+#version 330 core
+uniform sampler2D picture;
+uniform vec4 chroma_key;
+uniform vec4 adjust;
+uniform vec3 gain;
+uniform vec2 levels;
+out vec4 result;
+void main() {
+    vec3 rgb = texelFetch(picture, ivec2(gl_FragCoord.xy), 0).rgb;
+    float alpha = 1.0;
+    if (chroma_key.w >= 0.0) {
+        alpha = clamp((distance(rgb * 255.0, chroma_key.xyz) - chroma_key.w) / 40.0, 0.0, 1.0);
+        alpha = floor(alpha * 255.0) / 255.0;
+    }
+    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    rgb = vec3(luma) + (rgb - luma) * adjust.z;
+    rgb = (rgb - 0.5) * adjust.y + 0.5 + adjust.x;
+    rgb = clamp((rgb * gain - levels.x) / levels.y, 0.0, 1.0);
+    rgb = floor(rgb * 255.0 + 0.5) / 255.0;
+    alpha = floor(clamp(alpha * adjust.w, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+    vec3 linear = mix(pow((rgb + 0.055) / 1.055, vec3(2.4)), rgb / 12.92,
+                      lessThanEqual(rgb, vec3(0.04045))) * alpha;
+    vec3 srgb = mix(1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055, linear * 12.92,
+                    lessThanEqual(linear, vec3(0.0031308)));
+    result = vec4(srgb, alpha);
+}
+"#;

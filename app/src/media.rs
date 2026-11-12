@@ -147,7 +147,7 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
     sh.gpu_playback.store(gpu_playback, Ordering::Relaxed);
     sh.paused.store(paused, Ordering::Relaxed);
     sh.set_status("Starting…");
-    if let Source::File(path) | Source::FfmpegFile(path, _) = &src {
+    if let Source::File(path) | Source::AutoFile(path, _) | Source::FfmpegFile(path, _) | Source::DirectShowFile(path, _, _) = &src {
         let (source, path) = (sh.clone(), path.clone());
         std::thread::spawn(move || crate::audio::play_file(source, path));
     }
@@ -159,11 +159,23 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
         Source::Srt(config) => crate::srt::run_capture(s2, config),
         Source::AudioDevice(device) => crate::audio::capture_device(s2, &device),
         Source::AudioFile(path) => crate::audio::play_audio_input(s2, path),
+        Source::Presentation(path) => crate::slides::run(s2, path),
         Source::FfmpegFile(path, deinterlace) => crate::ffmpeg_media::play(&s2, &path, deinterlace),
         Source::Desktop => run_desktop(s2),
         Source::Sequence(folder, fps) => run_pictures(s2, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(s2, folder, false, 0.0, secs),
-        other => run(s2, other),
+        Source::DirectShowFile(path, config, deinterlace) => {
+            if let Err(error) = crate::directshow::play(&s2, &path, &config) {
+                if s2.seq.load(Ordering::Relaxed) == 0 && !s2.stop.load(Ordering::Relaxed) {
+                    let reason = format!("DirectShow: {error}");
+                    crate::ffmpeg_media::play_with_reason(&s2, &path, deinterlace, Some(&reason));
+                } else {
+                    s2.set_status(format!("DirectShow: {error}"));
+                }
+            }
+        }
+        Source::AutoFile(path, deinterlace) => run(s2, Source::File(path), Some(deinterlace)),
+        other => run(s2, other, None),
     });
     sh
 }
@@ -195,7 +207,7 @@ unsafe fn gpu_picture(sample: &IMFSample, dims: &Dims) -> Res<crate::dx_interop:
     desc.Height = dims.h as u32;
     desc.ArraySize = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
+    desc.BindFlags = (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32;
     desc.CPUAccessFlags = 0;
     desc.MiscFlags = 0;
     let mut copy = None;
@@ -509,8 +521,18 @@ unsafe fn copy_sample(s: &IMFSample, d: &Dims, key: u64) -> Res<Vec<u8>> {
     Ok(out)
 }
 
-fn run(sh: Arc<Shared>, src: Source) {
+fn run(sh: Arc<Shared>, src: Source, fallback: Option<u8>) {
+    let try_fallback = |reason: &str| {
+        if let (Source::File(path), Some(deinterlace)) = (&src, fallback) {
+            if !sh.stop.load(Ordering::Relaxed) && sh.seq.load(Ordering::Relaxed) == 0 {
+                crate::ffmpeg_media::play_with_reason(&sh, path, deinterlace, Some(reason));
+                return true;
+            }
+        }
+        false
+    };
     if !mf_init() {
+        if try_fallback("Media Foundation unavailable") { return; }
         sh.set_status("Windows Media Foundation is not available");
         return;
     }
@@ -531,6 +553,7 @@ fn run(sh: Arc<Shared>, src: Source) {
     let mut resume_at = None;
     let mut seek_to = None;
     let mut needs_picture = true;
+    let mut last_decoder_gpu = None;
     while !sh.stop.load(Ordering::Relaxed) {
         if sh.restart.swap(false, Ordering::Relaxed) {
             need_open = true;
@@ -561,6 +584,7 @@ fn run(sh: Arc<Shared>, src: Source) {
                     sh.ended.store(false, Ordering::Relaxed);
                 }
                 Err(e) => {
+                    if try_fallback(&format!("Media Foundation could not open the file ({})", e.message())) { return; }
                     sh.set_status(format!("No signal ({})", e.message()));
                     std::thread::sleep(Duration::from_millis(1500));
                     continue;
@@ -632,11 +656,13 @@ fn run(sh: Arc<Shared>, src: Source) {
             }
             resume_at = None;
             let e = result.err().unwrap_or_else(|| windows::core::Error::from(E_FAIL));
+            if try_fallback(&format!("Media Foundation failed before the first frame ({})", e.message())) { return; }
             sh.set_status(format!("Lost signal ({})", e.message()));
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
         if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
+            if try_fallback("Media Foundation reached the end before the first frame") { return; }
             resume_at = None;
             seek_to = None;
             if is_file {
@@ -684,8 +710,12 @@ fn run(sh: Arc<Shared>, src: Source) {
             continue;
         }
         let key = sh.key.load(Ordering::Relaxed);
-        if is_file && key == 0 && sh.gpu_playback.load(Ordering::Acquire) && !sh.cpu_colour.load(Ordering::Acquire) {
+        if is_file && sh.gpu_playback.load(Ordering::Acquire) && !sh.cpu_frames_required.load(Ordering::Acquire) {
             if let Ok(picture) = unsafe { gpu_picture(&s, &dims) } {
+                if last_decoder_gpu != Some(true) {
+                    *sh.decoder.lock().unwrap() = "Media Foundation · D3D11 texture".into();
+                    last_decoder_gpu = Some(true);
+                }
                 *sh.frame.lock().unwrap() = None;
                 *sh.gpu_frame.lock().unwrap() = Some(picture);
                 sh.seq.fetch_add(1, Ordering::Release);
@@ -696,6 +726,10 @@ fn run(sh: Arc<Shared>, src: Source) {
             }
         }
         if let Ok(rgba) = unsafe { copy_sample(&s, &dims, key) } {
+            if is_file && last_decoder_gpu != Some(false) {
+                *sh.decoder.lock().unwrap() = "Media Foundation · system memory".into();
+                last_decoder_gpu = Some(false);
+            }
             *sh.gpu_frame.lock().unwrap() = None;
             needs_picture = false;
             *sh.frame.lock().unwrap() = Some(Frame { w, h, rgba });
@@ -833,10 +867,10 @@ unsafe fn encoder_name(writer: &IMFSinkWriter, stream: u32, format: RecordFormat
 }
 
 pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, encoder: Arc<Mutex<String>>, opts: RecOpts,
-    gpu: Arc<std::sync::atomic::AtomicBool>)
+    index: Option<ReplayIndex>, gpu: Arc<std::sync::atomic::AtomicBool>)
 {
     if !opts.format.native_windows() {
-        if let Err(message) = crate::ffmpeg_media::record(&path, rx, &encoder, opts) {
+        if let Err(message) = crate::ffmpeg_media::record(&path, rx, &encoder, opts, index.as_ref()) {
             *err.lock().unwrap() = message;
         }
         return;
@@ -951,6 +985,7 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 s.SetSampleTime(t)?;
                 s.SetSampleDuration(frame_dur)?;
                 wr.WriteSample(*idx, &s)?;
+                if let Some(index) = &index { index.lock().unwrap().push((captured_at, (t / 10_000) as u64)); }
                 wrote_this_frame = true;
                 wrote_video = true;
                 if surface.is_some() {
@@ -1024,12 +1059,30 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
                 Ok(s)
             };
             let preset = COMDLG_FILTERSPEC { pszName: windows::core::w!("Project preset (*.vmix)"), pszSpec: windows::core::w!("*.vmix") };
-            if kind == PickKind::PresetSave {
+            let config = COMDLG_FILTERSPEC { pszName: windows::core::w!("LiveMix settings (*.json)"), pszSpec: windows::core::w!("*.json") };
+            let vmix_config = COMDLG_FILTERSPEC { pszName: windows::core::w!("vMix settings (*.config)"), pszSpec: windows::core::w!("*.config") };
+            if matches!(kind, PickKind::PresetSave | PickKind::SettingsSave) {
                 let d: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
-                d.SetFileTypes(&[preset])?;
-                d.SetDefaultExtension(windows::core::w!("vmix"))?;
+                if kind == PickKind::SettingsSave {
+                    d.SetFileTypes(&[config, vmix_config])?;
+                    d.SetFileName(windows::core::w!("LiveMix-settings"))?;
+                } else {
+                    d.SetFileTypes(&[preset])?;
+                    d.SetDefaultExtension(windows::core::w!("vmix"))?;
+                }
                 d.Show(HWND::default())?;
-                return name_of(&d.GetResult()?);
+                let path = name_of(&d.GetResult()?)?;
+                if kind == PickKind::SettingsSave
+                    && std::path::Path::new(&path).extension().is_none()
+                {
+                    let extension = if d.GetFileTypeIndex()? == 2 { "config" } else { "json" };
+                    let path = format!("{path}.{extension}");
+                    if std::path::Path::new(&path).exists() {
+                        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070050u32 as i32)));
+                    }
+                    return Ok(path);
+                }
+                return Ok(path);
             }
             let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
             let video = COMDLG_FILTERSPEC {
@@ -1040,8 +1093,12 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
             let all = COMDLG_FILTERSPEC { pszName: windows::core::w!("All files"), pszSpec: windows::core::w!("*.*") };
             match kind {
                 PickKind::PresetOpen => d.SetFileTypes(&[preset, all])?,
-                PickKind::PresetSave => unreachable!(),
+                PickKind::SettingsOpen => d.SetFileTypes(&[config, vmix_config, all])?,
+                PickKind::PresetSave | PickKind::SettingsSave => unreachable!(),
                 PickKind::Video => d.SetFileTypes(&[video, all])?,
+                PickKind::Presentation => d.SetFileTypes(&[
+                    COMDLG_FILTERSPEC { pszName: windows::core::w!("Presentations"), pszSpec: windows::core::w!("*.ppt;*.pptx;*.pps;*.ppsx;*.odp") }, all
+                ])?,
                 PickKind::Audio => d.SetFileTypes(&[
                     COMDLG_FILTERSPEC { pszName: windows::core::w!("Audio files"), pszSpec: windows::core::w!("*.wav;*.mp3;*.flac;*.m4a;*.aac;*.ogg;*.opus;*.aif;*.aiff;*.wma") },
                     all,
@@ -1314,6 +1371,27 @@ mod tests {
             "{diagnostics}, {size} bytes, {error}");
         assert_eq!(picture.map(|picture| picture.size), Some([320, 180]),
             "Hardware-decoded MP4 should publish a GPU texture: {}", decoded.status.lock().unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and FFprobe"]
+    fn auto_decoder_opens_ffv1_and_reports_the_backend() {
+        let path = std::env::temp_dir().join(format!("livemix-auto-decoder-{}.mkv", std::process::id()));
+        let output = crate::stream::command().args(["-y", "-f", "lavfi", "-i", "color=size=64x48:rate=25",
+            "-t", "1", "-c:v", "ffv1"]).arg(&path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reader = start_for_gl(Source::AutoFile(path.to_string_lossy().into_owned(), 0), true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reader.seq.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reader.stop.store(true, Ordering::Relaxed);
+        let decoder = reader.decoder.lock().unwrap().clone();
+        let _ = std::fs::remove_file(path);
+        assert!(reader.seq.load(Ordering::Relaxed) > 0, "{}", reader.status.lock().unwrap());
+        assert!(decoder.starts_with("Media Foundation") || decoder.starts_with("FFmpeg · software · fallback:"),
+            "{decoder}");
+        println!("{decoder}");
     }
 
     #[test]

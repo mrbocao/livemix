@@ -23,8 +23,25 @@ Test builds for Windows x64 and Apple Silicon are published under [GitHub Releas
 - **Switch and compose.** Use Cut, timed transitions, T-bar, GT stingers, eight overlay channels, layered inputs, position, crop, chroma key and colour adjustments. Monitor the picture with waveform, RGB parade, vectorscope and safe areas.
 - **Mix stereo audio.** Capture and monitor 48 kHz audio, route it through Master, A and B, and apply per-input EQ, gate, compression, gain and delay.
 - **Record and distribute.** Route four independent outputs to local windows, DeckLink, NDI, OMT or SRT as supported. Record two configured routes or use MultiCorder. Compatible RTMP destinations can share an encoder.
-- **Operate a show.** Select up to eight replay angles, mark events and export an angle to Preview. Draw freehand annotations with the transparent Telestrator input. Use keyboard shortcuts, a local web controller, simple scripts, input triggers and VISCA over UDP.
+- **Operate a show.** Mark events from up to eight Replay angles and cue the A/B players independently. The recorder indexes captured frames per angle. Use the Telestrator, keyboard and MIDI controls, local web switcher, scripts and VISCA over UDP.
+- **Build studio scenes.** Add a static PowerPoint or LibreOffice deck with manual slide navigation. Build a Virtual Set with backdrop, presenter and foreground layers, then switch between animated camera views.
 - **Move projects between sessions.** Save and reopen LiveMix projects in `.vmix` files. The import report lists missing media and unsupported input types. Compatibility with third-party presets and GT templates is partial.
+
+## Screenshots
+
+| Scopes | Replay |
+| --- | --- |
+| ![Waveform and vectorscope in Preview](docs/screenshots/video-scopes.png) | ![Advanced Replay camera monitors and event controls](docs/screenshots/replay.png) |
+
+![Virtual Set in Preview and static presentation in Program](docs/screenshots/studio.png)
+
+## Contribute
+
+Operators can help validate DeckLink and network video on real hardware, check Replay sync across cameras or record a 30-minute A/V test. Developers can take on browser inputs, GPU readback reduction, or a reproducible GT fixture. See [Contributing](CONTRIBUTING.md) and the [roadmap](docs/ROADMAP.md) for starting points.
+
+## Translations
+
+Choose the interface language in **Settings → Options**. See the [translation guide](app/locales/README.md) to contribute another language.
 
 ## Project status
 
@@ -32,4 +49,4 @@ LiveMix is in alpha. Windows can keep compatible decoded clips and eligible hard
 
 The [screenshots](docs/screenshots) show the Windows interface with demo sources. Report bugs with the operating system, GPU and driver, input type, project format, output route and steps to reproduce. [Open an issue](https://github.com/mrbocao/livemix/issues)
 
-The DSP and VISCA code adapted from LiveCraft retains its [MIT license and copyright notice](docs/LICENSE-LiveCraft-MIT.txt).
+The DSP and VISCA code adapted from LiveCraft retains its [MIT license and copyright notice](docs/LICENSE-LiveCraft-MIT.txt). LiveCraft's [Replay frame index](https://github.com/Wiibleyde/LiveCraft/pull/13), [streaming test](https://github.com/Wiibleyde/LiveCraft/pull/2), [presentation input](https://github.com/Wiibleyde/LiveCraft/pull/9) and [Virtual Sets](https://github.com/Wiibleyde/LiveCraft/pull/14) informed the corresponding LiveMix features.

@@ -16,7 +16,9 @@ pub struct Target {
     free_buffers: Vec<PackBuffer>,
     cpu_frames: Vec<Arc<Vec<u8>>>,
     readback_bytes: u64,
+    readback_frames: u64,
     ndi_pack: Option<Result<NdiPack, String>>,
+    gpu_scopes: Option<Result<crate::scopes::Gpu, String>>,
     #[cfg(windows)]
     dx_bridge: Option<Result<crate::dx_interop::Bridge, String>>,
 }
@@ -44,6 +46,7 @@ pub struct Destinations {
     pub ndi: Vec<crate::ndi::Sender>,
     pub omt: Vec<crate::omt::Sender>,
     pub scope: Option<(ScopeKey, ScopeMailbox)>,
+    pub scope_textures: Vec<(u8, egui::TextureHandle)>,
 }
 
 impl Destinations {
@@ -61,7 +64,7 @@ struct NdiPack {
     size: [u32; 2],
 }
 
-const PACK_VERTEX: &str = r#"
+pub(crate) const PACK_VERTEX: &str = r#"
 #version 330 core
 void main() {
     vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
@@ -198,7 +201,7 @@ unsafe fn compile(gl: &glow::Context, shader: glow::Program, kind: u32, source: 
     result
 }
 
-unsafe fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
+pub(crate) unsafe fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
     let shader = gl.create_program()?;
     let result = (|| {
         compile(gl, shader, glow::VERTEX_SHADER, vertex)?;
@@ -223,7 +226,9 @@ impl Target {
         Ok(Self {
             framebuffer, color, shader, vao, vertices, indices, size_uniform, size: [0, 0],
             readbacks: VecDeque::new(), free_buffers: Vec::new(), cpu_frames: Vec::new(), ndi_pack: None,
+            gpu_scopes: None,
             readback_bytes: 0,
+            readback_frames: 0,
             #[cfg(windows)]
             dx_bridge: None,
         })
@@ -238,8 +243,16 @@ impl Target {
             .map(|buffer| buffer.bytes as u64).sum()
     }
 
-    pub fn readback_bytes(&self) -> u64 {
-        self.readback_bytes
+    pub fn scope_backend(&self) -> String {
+        match &self.gpu_scopes {
+            Some(Ok(_)) => "OpenGL GPU".into(),
+            Some(Err(error)) => format!("CPU fallback ({error})"),
+            None => "Waiting for the first scope".into(),
+        }
+    }
+
+    pub fn readback_stats(&self) -> (u64, u64) {
+        (self.readback_frames, self.readback_bytes)
     }
 
     #[cfg(windows)]
@@ -395,6 +408,20 @@ impl Target {
             gl.draw_elements(glow::TRIANGLES, mesh.indices.len() as i32, glow::UNSIGNED_INT, 0);
         }
 
+        if let Some((key, _)) = &destinations.scope {
+            if !destinations.scope_textures.is_empty() {
+                let gpu = self.gpu_scopes.get_or_insert_with(|| crate::scopes::Gpu::new(gl));
+                if let Ok(renderer) = gpu {
+                    match renderer.draw(painter, self.color, size, key.2, &destinations.scope_textures) {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            if let Ok(renderer) = std::mem::replace(gpu, Err(error)) { renderer.destroy(gl); }
+                        }
+                    }
+                }
+            }
+        }
+
         #[cfg(windows)]
         if width % 2 == 0 && height % 2 == 0 && self.readbacks.is_empty()
             && !destinations.recorders.is_empty() && destinations.recorders.iter().all(|recorder| recorder.accepts_surface())
@@ -444,6 +471,7 @@ impl Target {
         };
         self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone(), uyvy });
         self.readback_bytes = self.readback_bytes.saturating_add(len as u64);
+        self.readback_frames = self.readback_frames.saturating_add(1);
         gl.flush();
         Ok(())
     }
@@ -462,6 +490,7 @@ impl Target {
         for buffer in self.free_buffers {
             gl.delete_buffer(buffer.id);
         }
+        if let Some(Ok(scopes)) = self.gpu_scopes { scopes.destroy(gl); }
         if let Some(Ok(pack)) = self.ndi_pack {
             gl.delete_framebuffer(pack.framebuffer);
             gl.delete_texture(pack.texture);

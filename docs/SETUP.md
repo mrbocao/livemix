@@ -9,11 +9,11 @@ cd app
 cargo run --locked --release
 ```
 
-The executable is `app/target/release/livemix.exe`. Windows uses Media Foundation for supported camera, video decode and recording paths, CPAL for system audio, and a WinMM backend for MIDI in development. Install current drivers for your hardware. Windows editions with optional media components may require those components for Media Foundation codecs.
+The executable is `app/target/release/livemix.exe`. Windows uses Media Foundation for supported camera, video decode and recording paths, CPAL for system audio, and WinMM for MIDI input and feedback. Install current drivers for your hardware. Windows editions with optional media components may require those components for Media Foundation codecs.
 
 ## macOS
 
-Use Apple Silicon and macOS 12 or newer. Install stable Rust, Xcode Command Line Tools, and FFmpeg with its companion FFprobe. The Mac backend uses AVFoundation through FFmpeg for camera and screen capture, and can use VideoToolbox for recording. Allow camera, microphone and screen-recording access as needed. The MIDI backend in development uses CoreMIDI.
+Use Apple Silicon and macOS 12 or newer. Install stable Rust, Xcode Command Line Tools, and FFmpeg with its companion FFprobe. The Mac backend uses AVFoundation through FFmpeg for camera and screen capture, and can use VideoToolbox for recording. Allow camera, microphone and screen-recording access as needed. MIDI input and feedback use CoreMIDI.
 
 ```sh
 cd app
@@ -51,3 +51,17 @@ LIVEMIX_DECKLINK_FFMPEG=/path/to/decklink-ffmpeg /Applications/LiveMix.app/Conte
 ## Hybrid GPUs on Windows
 
 Set the executable's graphics preference in Windows if you want OpenGL on the dedicated GPU. In **Settings → Performance**, choose **Automatic** to let LiveMix match the OpenGL renderer to a DXGI adapter when it can identify it. An explicit D3D11 choice applies on restart. The GPU texture path requires matching adapters and driver support for OpenGL/D3D11 interoperability. Check **D3D11 input** in recording diagnostics and compare the Program readback counter before and during a recording. See the [roadmap](ROADMAP.md) for the tested scope.
+
+## Presentation inputs
+
+Windows uses installed Microsoft PowerPoint when it can open the deck. The fallback uses LibreOffice Impress and Poppler's `pdftoppm`, with `pdftoppm` available on `PATH`. On macOS, install LibreOffice and Poppler. LiveMix detects the standard LibreOffice app location or `soffice` on `PATH`. Decks are converted on a worker, and presets keep the original presentation path.
+
+## Streaming integration test
+
+Install FFmpeg with H.264, AAC, RTMP and libsrt support. Download a [MediaMTX binary](https://github.com/bluenviron/mediamtx/releases) for your OS. From the repository root, run this in PowerShell:
+
+```powershell
+./scripts/test-streaming.ps1 -MediaMTX /path/to/mediamtx
+```
+
+The script starts a loopback-only server on TCP 21935 and UDP 28890 by default. The test sends synthetic flashes and stereo tones through one encoder to two RTMP destinations and through another encoder to one SRT destination. It checks the picture, both audio channels and flash-to-tone alignment at the receivers. This exercises the network output chain. Use a rehearsal with a camera and microphone to measure capture latency and long-run drift.
