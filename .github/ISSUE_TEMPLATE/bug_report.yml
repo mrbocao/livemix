@@ -1,0 +1,40 @@
+name: Bug report
+description: Something does not work, drops frames, loses sync or crashes
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: LiveMix version or commit
+      placeholder: "0.0.1-alpha.1 or a commit hash"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Operating system, GPU and driver
+      placeholder: "Windows 11, NVIDIA RTX 4060, driver 560.x"
+    validations:
+      required: true
+  - type: input
+    id: input
+    attributes:
+      label: Input type and project format
+      placeholder: "USB capture card, 1080p59.94, RTMP output"
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected and what happened
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Relevant lines from Settings → Performance, Input Settings → General → Decoder or the streaming log. Remove credentials, private paths and personal data.

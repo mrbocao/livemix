@@ -2,6 +2,13 @@
 name = "livemix"
 version = "0.0.1-alpha.1"
 edition = "2021"
+description = "Open-source live video switcher and streaming studio: cameras, clips, graphics, stereo audio, recording, instant replay and teleprompter"
+repository = "https://github.com/mrbocao/livemix"
+homepage = "https://mrbocao.github.io/livemix/"
+readme = "../README.md"
+keywords = ["video-switcher", "live-streaming", "broadcast", "ndi", "teleprompter"]
+categories = ["multimedia::video", "multimedia::audio", "graphics"]
+publish = false
 
 [dependencies]
 bytemuck = "1"

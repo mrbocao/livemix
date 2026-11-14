@@ -1,0 +1,43 @@
+name: Hardware test report
+description: Share what worked and what did not on your hardware
+labels: ["hardware-test"]
+body:
+  - type: markdown
+    attributes:
+      value: Reports from real productions are the most useful contribution. See the roadmap for tests that need coverage.
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: Computer, GPU(s), capture device or card, audio interface
+    validations:
+      required: true
+  - type: input
+    id: software
+    attributes:
+      label: OS, drivers and LiveMix version
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area tested
+      options:
+        - Camera or capture card
+        - Blackmagic DeckLink
+        - NDI or OMT
+        - SRT or RTMP streaming
+        - Recording
+        - Replay
+        - GPU path
+        - Teleprompter
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Project format, duration, dropped frames, A/V drift and whether reconnect worked
+    validations:
+      required: true
