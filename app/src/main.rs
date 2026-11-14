@@ -35,6 +35,7 @@ mod stream;
 mod livecheck;
 mod ndi;
 mod omt;
+mod omt_record;
 mod srt;
 mod audio;
 mod dsp;
@@ -61,6 +62,8 @@ use model::FULL;
 use render::*;
 mod app;
 mod startup;
+mod disk_speed;
+mod cammatch;
 mod outputs;
 mod desk;
 mod sources;
@@ -366,6 +369,8 @@ struct App {
     thumbnail_attempts: std::collections::HashSet<String>,
     /// One recording per camera (MultiCorder).
     multi: std::collections::HashMap<u32, media::Recorder>,
+    multi_ndi: std::collections::HashMap<u32, ndi::DirectRecording>,
+    multi_omt: std::collections::HashMap<u32, (omt::DirectRecording, Arc<Mutex<String>>)>,
     browse_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     browse_kind: media::PickKind,
     /// Snapshot picture waiting for the Save dialog answer.
@@ -432,16 +437,22 @@ impl Drop for NetworkThumbnail {
 }
 
 struct ReplayTrack {
-    recording: ComposedRecording,
+    recording: Option<ComposedRecording>,
+    direct: Option<omt::DirectRecording>,
+    started: f64,
+    error: Arc<Mutex<String>>,
+    index: Option<media::ReplayIndex>,
     origin: Instant,
     angle: usize,
     file: String,
+    storage: Option<std::path::PathBuf>,
     worker: std::thread::JoinHandle<()>,
 }
 
 struct FinalizingTrack {
     angle: usize,
     file: String,
+    storage: Option<std::path::PathBuf>,
     error: Arc<Mutex<String>>,
     index: Option<media::ReplayIndex>,
     worker: std::thread::JoinHandle<()>,
@@ -540,7 +551,7 @@ impl ReplayCapture {
                 for track in &segment.tracks { angles[track.angle] = true; }
             }
         }
-        if self.current.first().is_some_and(|track| self.position(track.recording.started) < end)
+        if self.current.first().is_some_and(|track| self.position(track.started) < end)
             && now >= end
         {
             for track in &self.current { angles[track.angle] = true; }
@@ -694,6 +705,7 @@ impl eframe::App for App {
         self.update_decklink_outputs();
         self.update_network_outputs();
         self.update_scopes(ctx, t);
+        cammatch::drive(&mut self.s);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.s.fullscreen = [false; 2];

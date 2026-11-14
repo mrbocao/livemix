@@ -55,8 +55,8 @@ impl Feedback {
         let target = self.target.checked_sub(1);
         let input = || target.and_then(|index| s.inputs.get(index)).map(|input| input.id);
         match self.state {
-            State::Program => input().is_some() && input() == s.output,
-            State::Preview => input().is_some() && input() == s.preview,
+            State::Program => input().is_some_and(|id| s.tally_contains(s.output, id)),
+            State::Preview => input().is_some_and(|id| s.tally_contains(s.preview, id)),
             State::Recording => s.rec.is_some(),
             State::Streaming => s.stream_active.contains(&true),
             State::MultiCorder => s.multicorder.is_some(),

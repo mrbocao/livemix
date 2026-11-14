@@ -554,6 +554,7 @@ pub struct CaptureConfig {
     /// BMDVideoConnection (0 = the device's default).
     pub port: u32,
     pub mode: u32,
+    pub audio_channels: u8,
 }
 
 #[implement(IDeckLinkInputCallback)]
@@ -617,8 +618,12 @@ impl IDeckLinkInputCallback_Impl for CaptureCallback_Impl {
             if (1..=crate::audio::RATE as usize).contains(&count)
                 && (vtable.bytes)(audio_packet, &mut bytes).is_ok() && !bytes.is_null()
             {
-                let samples = std::slice::from_raw_parts(bytes.cast::<crate::audio::Stereo>(), count);
-                self.shared.audio.lock().unwrap().capture(samples);
+                let channels = self.shared.audio_channels.load(Ordering::Relaxed) as usize;
+                if matches!(channels, 2 | 8 | 16) {
+                    let samples = std::slice::from_raw_parts(bytes.cast::<i16>(), count * channels);
+                    self.shared.audio.lock().unwrap().capture_interleaved(samples, channels,
+                        self.shared.direct_audio.load(Ordering::Relaxed));
+                }
             }
         }
         if video_frame.is_null() { return S_OK; }
@@ -748,7 +753,12 @@ pub fn run_capture(shared: Arc<Shared>, config: CaptureConfig) {
                 if let Some(mode) = modes.iter().find(|m| m.mode == mode) {
                     *shared.mode.lock().unwrap() = Some(mode.cam_mode());
                 }
-                let _ = input.EnableAudioInput(crate::audio::RATE, AUDIO_DEPTH, AUDIO_CHANNELS);
+                for channels in [16, 8, AUDIO_CHANNELS].into_iter().filter(|&channels| channels <= u32::from(config.audio_channels.max(2))) {
+                    if input.EnableAudioInput(crate::audio::RATE, AUDIO_DEPTH, channels).is_ok() {
+                        shared.audio_channels.store(u64::from(channels), Ordering::Relaxed);
+                        break;
+                    }
+                }
                 input.StartStreams().ok().map_err(|e| format!("StartStreams: {e}"))?;
                 *shared.status.lock().unwrap() = "DeckLink: waiting for signal".into();
                 while !shared.stop.load(Ordering::Relaxed) {
@@ -786,6 +796,8 @@ pub fn run_capture(shared: Arc<Shared>, config: CaptureConfig) {
 pub struct OutputConfig {
     pub device: usize,
     pub key_fill: bool,
+    pub ten_bit: bool,
+    pub audio_channels: u8,
     /// Wanted display mode (0 = pick one matching the project).
     pub mode: u32,
     pub port: u32,
@@ -799,7 +811,7 @@ struct Latest {
     pixels: Arc<Vec<u8>>,
     w: usize,
     h: usize,
-    audio: crate::audio::Packet,
+    audio: Arc<[i16]>,
 }
 
 struct OutputShared {
@@ -835,7 +847,7 @@ impl OutputSink {
     }
 
     /// Hands over the newest composed picture (BGRA rows, as OpenGL read them).
-    pub fn submit(&self, pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: crate::audio::Packet) {
+    pub fn submit(&self, pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: Arc<[i16]>) {
         if self.shared.stop.load(Ordering::Relaxed) {
             return;
         }
@@ -889,6 +901,14 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
             if width <= 0 || height <= 0 {
                 return Err("Invalid DeckLink output mode".into());
             }
+            let pixel = if config.ten_bit { u32::from_be_bytes(*b"v210") } else { PIXEL_BGRA };
+            let row_bytes = if config.ten_bit { (width + 47) / 48 * 128 } else { width * 4 };
+            if config.ten_bit {
+                let (mut actual, mut supported) = (0, 0);
+                output.DoesSupportVideoMode(config.port, mode.mode, pixel, 0, 0, &mut actual, &mut supported)
+                    .ok().map_err(|error| format!("DeckLink 10-bit mode check: {error}"))?;
+                if supported == 0 { return Err(format!("{} does not support DeckLink 10-bit YUV", mode.label())); }
+            }
             let keyer = if config.key_fill {
                 let attributes = device.cast::<IDeckLinkProfileAttributes>()
                     .map_err(|_| "Could not query the DeckLink profile for Key + Fill")?;
@@ -918,15 +938,26 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
             }
             let time_scale = mode.fps_n.max(1) as i64;
             let time_value = mode.fps_d.max(1) as i64;
-            let audio_enabled = !config.key_fill
-                && output.EnableAudioOutput(crate::audio::RATE, AUDIO_DEPTH, AUDIO_CHANNELS, AUDIO_TIMESTAMPED).is_ok();
+            let channels = usize::from(config.audio_channels);
+            let audio_result = if config.key_fill { Ok(()) } else {
+                output.EnableAudioOutput(crate::audio::RATE, AUDIO_DEPTH, channels as u32, AUDIO_TIMESTAMPED).ok()
+            };
+            if let Err(error) = &audio_result {
+                if channels > 2 {
+                    let _ = output.DisableVideoOutput();
+                    return Err(format!("DeckLink does not accept {channels} audio channels: {error}"));
+                }
+            }
+            let audio_enabled = !config.key_fill && audio_result.is_ok();
             shared.error.lock().unwrap().clear();
             let playback = (|| -> Result<(), String> {
                 let mut display_time: i64 = 0;
                 let mut latest: Option<Latest> = None;
                 let mut started = false;
                 let mut audio_time = 0_i64;
-                let mut queue = crate::audio::AudioFifo::default();
+                let mut queue = std::collections::VecDeque::<i16>::new();
+                let mut audio = Vec::new();
+                let mut resized = Vec::new();
                 while !shared.stop.load(Ordering::Relaxed) {
                 if let Some(frame) = shared.latest.lock().unwrap().take() {
                     latest = Some(frame);
@@ -948,8 +979,8 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 let created = output.CreateVideoFrame(
                     width,
                     height,
-                    width * 4,
-                    PIXEL_BGRA,
+                    row_bytes,
+                    pixel,
                     0,
                     &mut raw_frame as *mut *mut c_void,
                 );
@@ -967,9 +998,18 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                     .map_err(|e| format!("DeckLink frame write access: {e}"))?;
                 let bytes_result = buffer.GetBytes(&mut bytes).ok();
                 if bytes_result.is_ok() && !bytes.is_null() {
-                    let target = std::slice::from_raw_parts_mut(bytes.cast::<u8>(), width as usize * height as usize * 4);
-                    crate::decklink_pixels::blit(target, width as usize, height as usize,
-                        &frame.pixels, frame.w, frame.h, config.key_fill);
+                    let (w, h) = (width as usize, height as usize);
+                    let target = std::slice::from_raw_parts_mut(bytes.cast::<u8>(), row_bytes as usize * h);
+                    if config.ten_bit {
+                        let source = if (frame.w, frame.h) == (w, h) { frame.pixels.as_slice() } else {
+                            resized.resize(w * h * 4, 0);
+                            crate::decklink_pixels::blit(&mut resized, w, h, &frame.pixels, frame.w, frame.h, false);
+                            &resized
+                        };
+                        crate::decklink_pixels::pack_v210(target, row_bytes as usize, source, w, h);
+                    } else {
+                        crate::decklink_pixels::blit(target, w, h, &frame.pixels, frame.w, frame.h, config.key_fill);
+                    }
                 }
                 let _ = buffer.EndAccess(2);
                 bytes_result.map_err(|e| format!("DeckLink frame bytes: {e}"))?;
@@ -985,8 +1025,13 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 if audio_enabled {
                     let slot = (display_time / time_value) as u64;
                     let count = crate::audio::frames_for_slot(slot, time_scale as u32, time_value as u32);
-                    queue.push(&std::mem::take(&mut frame.audio));
-                    let mut audio = queue.pop(count);
+                    queue.extend(std::mem::take(&mut frame.audio).iter().copied());
+                    let excess = queue.len().saturating_sub(crate::audio::RATE as usize * channels);
+                    queue.drain(..excess);
+                    audio.clear();
+                    let samples = count * channels;
+                    audio.extend(queue.drain(..queue.len().min(samples)));
+                    audio.resize(samples, 0);
                     let mut written = 0;
                     output.ScheduleAudioSamples(audio.as_mut_ptr().cast(), count as u32, audio_time,
                         i64::from(crate::audio::RATE), &mut written).ok()

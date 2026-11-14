@@ -132,6 +132,7 @@ pub enum Kind {
     Presentation { path: String },
     Web { url: String, transparent: bool },
     VirtualSet { camera: u8, previous: u8, changed_at: f64 },
+    Mix { tally: bool },
     /// "Video Delay" (legacy type 10): a delayed copy of another input. The original
     /// buffers the source at the chosen resolution for `seconds` (frmInput tVideoDelay).
     VideoDelay { source: Option<u32>, seconds: f32, resolution: [u32; 2] },
@@ -471,6 +472,8 @@ pub struct Input {
     pub collapsed: bool,
     /// Up to 10 other inputs drawn on top (Input Settings → Layers).
     pub layers: [Layer; LAYERS],
+    pub mix_preview: Option<u32>,
+    pub mix_fade: Option<(u32, f64)>,
     pub id: u32,
     pub title: String,
     pub kind: Kind,
@@ -510,12 +513,16 @@ pub struct Input {
     /// Effects page: chkUseSourceRenderEffects ("Use Source Settings").
     pub effects_source: bool,
     pub click_action: u8,
+    pub go_action: String,
     pub delay_frames: u32,
     /// Live dBFS peak, filled in each frame for the Audio page's meter.
     pub level: [f32; 2],
+    pub pre_fader_level: [f32; 2],
+    pub audio_channels: u8,
     pub bus_m: bool,
     pub bus_a: bool,
     pub bus_b: bool,
+    pub extra_buses: [bool; 5],
     /// Live picture of a real input (texture id and pixel size), filled in by the UI.
     pub tex: Option<(eframe::egui::TextureId, [usize; 2])>,
     /// Photos: previous picture during the fade, with fade progress 0..1.
@@ -533,6 +540,7 @@ pub struct Input {
     pub cam_audio: Option<String>,
     pub decklink_port: u32,
     pub decklink_mode: u32,
+    pub decklink_audio_channels: u8,
     pub gt_change: Option<crate::gt::DataChange>,
     pub cam_modes: Vec<crate::media::CamMode>,
     pub cam_current: Option<crate::media::CamMode>,
@@ -554,6 +562,8 @@ impl Input {
             place: Position::default(),
             collapsed: false,
             layers: [Layer::default(); LAYERS],
+            mix_preview: None,
+            mix_fade: None,
             id,
             title: title.to_string(),
             kind,
@@ -585,11 +595,15 @@ impl Input {
             flatten: false,
             effects_source: false,
             click_action: 0,
+            go_action: String::new(),
             delay_frames: 0,
             level: [0.0; 2],
+            pre_fader_level: [0.0; 2],
+            audio_channels: 0,
             bus_m: true,
             bus_a: false,
             bus_b: false,
+            extra_buses: [false; 5],
             tex: None,
             prev_tex: None,
             status: String::new(),
@@ -601,6 +615,7 @@ impl Input {
             cam_mode: None,
             decklink_port: 0,
             decklink_mode: 0,
+            decklink_audio_channels: 2,
             gt_change: None,
             cam_modes: Vec::new(),
             cam_current: None,
@@ -901,6 +916,7 @@ pub enum AddKind {
     AudioInput,
     Title,
     VirtualSet,
+    Mix,
     WebBrowser,
     VideoCall,
     Zoom,
@@ -913,7 +929,7 @@ pub enum AddKind {
     TestImage,
 }
 
-pub const ADD_KINDS: [AddKind; 26] = [
+pub const ADD_KINDS: [AddKind; 27] = [
     AddKind::VideoFile,
     AddKind::Dvd,
     AddKind::List,
@@ -935,6 +951,7 @@ pub const ADD_KINDS: [AddKind; 26] = [
     AddKind::VideoCall,
     AddKind::Zoom,
     AddKind::Telestrator,
+    AddKind::Mix,
     AddKind::Clock,
     AddKind::Teleprompter,
     AddKind::TestCamera,
@@ -965,6 +982,7 @@ impl AddKind {
             AddKind::AudioInput => "Audio Input",
             AddKind::Title => "Title",
             AddKind::VirtualSet => "Virtual Set",
+            AddKind::Mix => "Mix",
             AddKind::WebBrowser => "Web Browser",
             AddKind::VideoCall => "Video Call",
             AddKind::Zoom => "Zoom",
@@ -1019,6 +1037,7 @@ impl AddKind {
             AddKind::AudioFile => "An audio file such as WAV, MP3, FLAC or AAC. Requires FFmpeg and FFprobe.",
             AddKind::AudioInput => "A microphone, USB audio interface or line input.",
             AddKind::VirtualSet => "Compose a backdrop, two presenter layers and a foreground with animated camera presets.",
+            AddKind::Mix => "Compose existing inputs into a reusable source. Choose the sources in Input Settings → Layers.",
             AddKind::WebBrowser => "Capture a web page using installed Chrome or Edge.",
             AddKind::VideoCall => "Remote guests by video call — not available in this version.",
             AddKind::Zoom => "Zoom meeting participants — not available in this version.",
@@ -1183,6 +1202,8 @@ pub struct Switcher {
     pub replay_angles: [u32; REPLAY_ANGLES],
     pub replay_setup: crate::replay::Setup,
     pub replay_setup_open: bool,
+    /// Camera Match assistant (window, chosen inputs, measurements).
+    pub cam_match: crate::cammatch::State,
     pub replay_session: String,
     pub replay_read_only: bool,
     pub replay_load: Option<bool>,
@@ -1212,7 +1233,13 @@ pub const SRC_MV1: u32 = u32::MAX - 1;
 pub const SRC_MV2: u32 = u32::MAX - 2;
 /// MultiView box left on automatic: the next input in list order.
 pub const MV_AUTO: u32 = u32::MAX;
-pub const OUTPUT_COUNT: usize = 4;
+pub const OUTPUT_COUNT: usize = 8;
+pub const AUDIO_BUS_NAMES: [&str; 8] = ["Master", "A", "B", "C", "D", "E", "F", "G"];
+pub const AUDIO_BUS_GROUPS: [(&str, u8); 13] = [
+    ("Master", 1), ("A", 2), ("B", 4), ("C", 8), ("D", 16), ("E", 32), ("F", 64), ("G", 128),
+    ("AB", 6), ("CD", 24), ("DE", 48), ("ABCD", 30), ("DEFG", 240),
+];
+pub const AUDIO_BUS_ROUTE: u32 = 0x4000_0000;
 pub const REPLAY_ANGLES: usize = 8;
 
 #[derive(Clone, Copy, Default)]
@@ -1229,6 +1256,8 @@ pub struct DeckLinkRoute {
     pub audio_bus: u8,
     pub audio_delay_ms: u32,
     pub key_fill: bool,
+    pub ten_bit: bool,
+    pub multichannel_audio: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1476,6 +1505,7 @@ pub struct Settings {
     pub default_audio_delay_ms: u32,
     pub default_auto_mix: bool,
     pub headphones_device: String,
+    pub headphones_post_master: bool,
     pub recent_media: [Vec<String>; 4],
     /// InputSize = 208x156 (ms::.cctor @0x12e000 falls back to 200x150).
     pub input_w: f32,
@@ -1551,6 +1581,10 @@ pub struct Settings {
     pub mc_split_min: u32,
     pub mc_codec: crate::media::RecordFormat,
     pub mc_outputs: [bool; OUTPUT_COUNT],
+    pub mc_audio_bus: u8,
+    pub mc_ndi_direct: bool,
+    pub mc_ndi_mkv: bool,
+    pub mc_omt_direct: bool,
     /// Streaming Settings (frmStreaming): destination, URL, stream name or key, quality.
     pub streams: [crate::stream::Destination; crate::stream::COUNT],
     /// PlayList (frmPlaylist chkLoop): start again after the last input.
@@ -1612,6 +1646,7 @@ impl Default for Settings {
             default_audio_delay_ms: 0,
             default_auto_mix: false,
             headphones_device: String::new(),
+            headphones_post_master: true,
             recent_media: Default::default(),
             input_w: 208.0,
             input_h: 156.0,
@@ -1663,6 +1698,10 @@ impl Default for Settings {
             mc_split_min: 0,
             mc_codec: Default::default(),
             mc_outputs: [false; OUTPUT_COUNT],
+            mc_audio_bus: 0,
+            mc_ndi_direct: false,
+            mc_ndi_mkv: false,
+            mc_omt_direct: false,
             streams: Default::default(),
             playlist_loop: false,
             out_size: 6,
@@ -1855,6 +1894,7 @@ impl Switcher {
             format!("default_audio_delay_ms={}", c.default_audio_delay_ms),
             format!("default_auto_mix={}", b(c.default_auto_mix)),
             format!("headphones_device={}", serde_json::to_string(&c.headphones_device).unwrap_or_default()),
+            format!("headphones_post_master={}", b(c.headphones_post_master)),
             format!("recent_media={}", serde_json::to_string(&c.recent_media).unwrap_or_default()),
             format!("input_size={}x{}", c.input_w, c.input_h),
             format!("input_numbers={}", b(c.input_numbers)),
@@ -1880,8 +1920,8 @@ impl Switcher {
             format!("omt_quality={}", serde_json::to_string(&c.omt_quality).unwrap_or_default()),
             format!("srt_outputs={}", serde_json::to_string(&c.srt_outputs).unwrap_or_default()),
             format!("decklink_outputs={}", c.decklink_outputs.iter().map(|route| {
-                format!("{},{},{},{},{},{}", route.device.map_or(-1, |n| n as i64), route.port, route.mode,
-                    route.audio_bus, route.audio_delay_ms, u8::from(route.key_fill))
+                format!("{},{},{},{},{},{},{},{}", route.device.map_or(-1, |n| n as i64), route.port, route.mode,
+                    route.audio_bus, route.audio_delay_ms, u8::from(route.key_fill), u8::from(route.ten_bit), u8::from(route.multichannel_audio))
             }).collect::<Vec<_>>().join(";")),
             format!("ext_overlays={}", b(c.outputs[0].overlays)),
             format!("additional_outputs={}", c.outputs[1..].iter()
@@ -1915,6 +1955,10 @@ impl Switcher {
             format!("mc_split_min={}", c.mc_split_min),
             format!("mc_codec={}", c.mc_codec.key()),
             format!("mc_outputs={}", c.mc_outputs.iter().map(|on| if *on { '1' } else { '0' }).collect::<String>()),
+            format!("mc_audio_bus={}", c.mc_audio_bus),
+            format!("mc_ndi_direct={}", b(c.mc_ndi_direct)),
+            format!("mc_ndi_mkv={}", b(c.mc_ndi_mkv)),
+            format!("mc_omt_direct={}", b(c.mc_omt_direct)),
             format!("streams={}", serde_json::Value::Array(c.streams.iter().map(|d|
                 serde_json::json!({"provider": d.provider, "url": d.url, "key": d.key,
                     "quality": d.quality, "source": d.source, "hardware": d.hardware, "hevc": d.hevc,
@@ -1988,6 +2032,7 @@ impl Switcher {
                 "default_audio_delay_ms" => c.default_audio_delay_ms = v.parse::<u32>().unwrap_or(0).min(1000),
                 "default_auto_mix" => c.default_auto_mix = on,
                 "headphones_device" => c.headphones_device = serde_json::from_str(v).unwrap_or_default(),
+                "headphones_post_master" => c.headphones_post_master = on,
                 "recent_media" => {
                     if let Ok(history) = serde_json::from_str::<[Vec<String>; 4]>(v) {
                         c.recent_media = history.map(|items| items.into_iter().take(16).collect());
@@ -2028,7 +2073,11 @@ impl Switcher {
                     }
                 }
                 "omt_quality" => c.omt_quality = serde_json::from_str(v).unwrap_or_default(),
-                "srt_outputs" => c.srt_outputs = serde_json::from_str(v).unwrap_or_default(),
+                "srt_outputs" => {
+                    if let Ok(outputs) = serde_json::from_str::<Vec<crate::srt::Settings>>(v) {
+                        for (slot, output) in c.srt_outputs.iter_mut().zip(outputs) { *slot = output; }
+                    }
+                }
                 "decklink_outputs" => {
                     for (route, entry) in c.decklink_outputs.iter_mut().zip(v.split(';')) {
                         let fields: Vec<_> = entry.split(',').collect();
@@ -2036,9 +2085,11 @@ impl Switcher {
                             route.device = device.parse().ok();
                             route.port = port.parse().unwrap_or(0);
                             route.mode = mode.parse().unwrap_or(0);
-                            route.audio_bus = extra.first().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0).min(2);
+                            route.audio_bus = extra.first().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0).min(7);
                             route.audio_delay_ms = extra.get(1).and_then(|value| value.parse::<u32>().ok()).unwrap_or(0).min(1000);
                             route.key_fill = extra.get(2) == Some(&"1");
+                            route.ten_bit = extra.get(3) == Some(&"1");
+                            route.multichannel_audio = extra.get(4) == Some(&"1");
                         }
                     }
                 }
@@ -2085,6 +2136,10 @@ impl Switcher {
                 "mc_mbps" => c.mc_mbps = v.parse().unwrap_or(crate::media::DEFAULT_MBPS).clamp(1, 100),
                 "mc_split_min" => c.mc_split_min = v.parse().unwrap_or(0),
                 "mc_codec" => c.mc_codec = crate::media::RecordFormat::parse(v),
+                "mc_audio_bus" => c.mc_audio_bus = v.parse().unwrap_or(0),
+                "mc_ndi_direct" => c.mc_ndi_direct = on,
+                "mc_ndi_mkv" => c.mc_ndi_mkv = on,
+                "mc_omt_direct" => c.mc_omt_direct = on,
                 "mc_outputs" => {
                     for (enabled, value) in c.mc_outputs.iter_mut().zip(v.bytes()) {
                         *enabled = value == b'1';
@@ -2097,7 +2152,7 @@ impl Switcher {
                 "streams" => {
                     if let Ok(streams) = serde_json::from_str::<Vec<serde_json::Value>>(v) {
                         for (destination, stream) in c.streams.iter_mut().zip(streams) {
-                            destination.provider = stream["provider"].as_u64().unwrap_or(0).min(3) as u8;
+                            destination.provider = stream["provider"].as_u64().unwrap_or(0).min(4) as u8;
                             destination.url = stream["url"].as_str().unwrap_or("").into();
                             destination.key = stream["key"].as_str().unwrap_or("").into();
                             destination.quality = stream["quality"].as_u64().unwrap_or(1).min(crate::stream::QUALITIES.len() as u64 - 1) as u8;
@@ -2289,6 +2344,7 @@ impl Switcher {
             replay_angles: [SRC_OUTPUT, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO, MV_AUTO],
             replay_setup: Default::default(),
             replay_setup_open: false,
+            cam_match: Default::default(),
             replay_session: String::new(),
             replay_read_only: false,
             replay_load: None,
@@ -2364,6 +2420,36 @@ impl Switcher {
     pub fn input_mut(&mut self, id: u32) -> Option<&mut Input> {
         self.inputs.iter_mut().find(|i| i.id == id)
     }
+    pub fn tally_contains(&self, root: Option<u32>, id: u32) -> bool {
+        fn contains(s: &Switcher, root: u32, id: u32, depth: u8) -> bool {
+            if root == id { return true; }
+            depth > 0 && s.input(root).is_some_and(|input| {
+                input.layers.iter().filter(|layer| layer.on).filter_map(|layer| layer.input)
+                    .chain(input.mix_fade.filter(|(_, until)| s.now < *until).map(|(source, _)| source))
+                    .any(|source| contains(s, source, id, depth - 1))
+            })
+        }
+        root.is_some_and(|root| {
+            root == id || self.input(root).is_some_and(|input| matches!(input.kind, Kind::Mix { tally: true }))
+                && contains(self, root, id, 2)
+        })
+    }
+
+    pub fn take_mix(&mut self, id: u32, fade: bool, now: f64) {
+        let Some(next) = self.input(id).filter(|input| matches!(input.kind, Kind::Mix { .. }))
+            .and_then(|input| input.mix_preview).filter(|&source| source != id && self.input(source).is_some())
+        else { return };
+        let input = self.input_mut(id).unwrap();
+        if input.mix_fade.is_some_and(|(_, until)| now < until) { return; }
+        let layer = &mut input.layers[0];
+        let old = layer.input.filter(|_| layer.on);
+        if old == Some(next) { return; }
+        layer.input = Some(next);
+        layer.on = true;
+        input.mix_preview = old;
+        input.mix_fade = old.filter(|_| fade).map(|source| (source, now + 0.5));
+    }
+
     pub fn number_of(&self, id: u32) -> usize {
         self.inputs.iter().position(|i| i.id == id).map(|p| p + 1).unwrap_or(0)
     }
@@ -2375,14 +2461,17 @@ impl Switcher {
 
     // ------------------------------------------------------------ transitions
 
-    pub fn pause_video_inputs(&mut self) {
+    pub fn pause_video_inputs(&mut self) -> usize {
+        let mut paused = 0;
         self.playlist = None;
         for input in &mut self.inputs {
-            if input.kind.playable() && !matches!(input.kind, Kind::AudioFile { .. }) {
+            if input.playing && input.kind.playable() && !matches!(input.kind, Kind::AudioFile { .. }) {
                 input.playing = false;
+                paused += 1;
             }
         }
         self.replay_command = Some(crate::replay::Action::SetPlaying(2, false));
+        paused
     }
 
     pub fn select_preview(&mut self, id: u32) {
@@ -2501,6 +2590,19 @@ impl Switcher {
     }
 
     /// Per-input Quick Play: that input goes to Output with the Quick Play effect; Preview kept.
+    pub fn go_input(&mut self, id: u32, now: f64) {
+        let Some(input) = self.input(id) else { return };
+        if input.go_action.trim().is_empty() {
+            self.quick_play_input(id);
+            return;
+        }
+        let action = input.go_action.split_whitespace().map(|word| {
+            if word.eq_ignore_ascii_case("@input") { format!("@{id}") } else { word.to_owned() }
+        }).collect::<Vec<_>>().join(" ");
+        if let Err(error) = self.perform_action(&action, now) { self.notice(&error); }
+    }
+
+
     pub fn quick_play_input(&mut self, id: u32) {
         let (e, ms) = (self.quickplay_effect, self.quickplay_ms);
         self.begin(id, e, ms, true);
@@ -2997,6 +3099,8 @@ impl Switcher {
             }
         }
         for i in &mut self.inputs {
+            if i.mix_preview == Some(id) { i.mix_preview = None; }
+            if i.mix_fade.is_some_and(|(source, _)| source == id) { i.mix_fade = None; }
             for l in i.layers.iter_mut().filter(|l| l.input == Some(id)) {
                 *l = Layer::default();
             }
@@ -3251,6 +3355,7 @@ impl Switcher {
                 (Kind::Presentation { path: d.path.trim().into() }, file_name)
             }
             AddKind::VirtualSet => (Kind::VirtualSet { camera: 0, previous: 0, changed_at: 0.0 }, "Virtual Set".into()),
+            AddKind::Mix => (Kind::Mix { tally: true }, "Mix".into()),
             AddKind::ImageSequence | AddKind::Photos => {
                 let f = d.folder.trim().to_string();
                 if f.is_empty() || !std::path::Path::new(&f).is_dir() {
@@ -3498,6 +3603,7 @@ impl Switcher {
                 Kind::Presentation { path } => ("presentation", path.clone(), String::new()),
                 Kind::Web { url, transparent } => ("web", url.clone(), (*transparent as u8).to_string()),
                 Kind::VirtualSet { camera, .. } => ("virtualset", camera.to_string(), String::new()),
+                Kind::Mix { tally } => ("mix", u8::from(*tally).to_string(), String::new()),
                 Kind::VideoDelay { source, seconds, resolution } => ("videodelay",
                     self.number_of(source.unwrap_or(0)).to_string(),
                     format!("{},{},{}", resolution[0], resolution[1], seconds)),
@@ -3527,11 +3633,16 @@ impl Switcher {
         }
         let num = |o: Option<u32>| o.map(|i| self.number_of(i)).unwrap_or(0);
         out.push_str(&format!("preview\t{}\noutput\t{}\n", num(self.preview), num(self.output)));
+        if let Some(line) = self.cam_match.save_line(|id| num(id)) { out.push_str(&line); }
         // Position and layers of each input (by input number).
         let fmt_pos = |p: &Position| format!("{},{},{},{},{},{},{}", p.zoom, p.pan_x, p.pan_y, p.crop[0], p.crop[1], p.crop[2], p.crop[3]);
         for (n, i) in self.inputs.iter().enumerate() {
             out.push_str(&format!("input_options\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 n + 1, i.collapsed as u8, i.audio_on as u8, i.bus_m as u8, i.bus_a as u8, i.bus_b as u8));
+            if i.extra_buses.contains(&true) {
+                out.push_str(&format!("extra_buses\t{}\t{}\n", n + 1,
+                    i.extra_buses.map(|on| if on { '1' } else { '0' }).iter().collect::<String>()));
+            }
             if i.place != Position::default() {
                 out.push_str(&format!("place\t{}\t{}\n", n + 1, fmt_pos(&i.place)));
             }
@@ -3559,6 +3670,9 @@ impl Switcher {
             if i.click_action != 0 || i.delay_frames != 0 {
                 out.push_str(&format!("advanced\t{}\t{}\t{}\n", n + 1, i.click_action, i.delay_frames));
             }
+            if !i.go_action.is_empty() {
+                out.push_str(&format!("go_action\t{}\t{}\n", n + 1, serde_json::to_string(&i.go_action).unwrap_or_default()));
+            }
             let c = i.colour_adjust;
             if c != ColourAdjust::default() {
                 out.push_str(&format!("colour\t{}\t{},{},{},{},{},{},{},{},{}\n", n + 1, c.brightness,
@@ -3575,8 +3689,9 @@ impl Switcher {
             if let Some(m) = &i.cam_mode {
                 out.push_str(&format!("cammode\t{}\t{}\n", n + 1, m.code()));
             }
-            if i.decklink_port != 0 || i.decklink_mode != 0 {
-                out.push_str(&format!("decklink_port\t{}\t{}\t{}\n", n + 1, i.decklink_port, i.decklink_mode));
+            if i.decklink_port != 0 || i.decklink_mode != 0 || i.decklink_audio_channels != 2 {
+                out.push_str(&format!("decklink_port\t{}\t{}\t{}\t{}\n", n + 1,
+                    i.decklink_port, i.decklink_mode, i.decklink_audio_channels));
             }
             for (k, l) in i.layers.iter().enumerate() {
                 if l.input.is_some() {
@@ -3717,6 +3832,7 @@ impl Switcher {
                         }
                         "telestrator" => Kind::Telestrator { strokes: serde_json::from_str(f[3]).unwrap_or_default() },
                         "teleprompter" => Kind::Teleprompter(serde_json::from_str(f[3]).unwrap_or_default()),
+                        "mix" => Kind::Mix { tally: f[3] == "1" },
                         _ => Kind::Blank,
                     };
                     let mut i = Input::new(0, f[2], kind);
@@ -3776,6 +3892,8 @@ impl Switcher {
                     {
                         i.decklink_port = f[2].parse().unwrap_or(0);
                         i.decklink_mode = f.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        i.decklink_audio_channels = f.get(4).and_then(|v| v.parse().ok())
+                            .filter(|n| matches!(n, 2 | 8 | 16)).unwrap_or(2);
                     }
                 }
                 Some("place") if f.len() >= 3 => {
@@ -3863,6 +3981,20 @@ impl Switcher {
                         }
                     }
                 }
+                Some("extra_buses") if f.len() >= 3 => {
+                    if let Some(input) = f[1].parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+                        .and_then(|index| s.inputs.get_mut(index))
+                    {
+                        for (enabled, value) in input.extra_buses.iter_mut().zip(f[2].bytes()) { *enabled = value == b'1'; }
+                    }
+                }
+                Some("go_action") if f.len() >= 3 => {
+                    if let Some(input) = f[1].parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+                        .and_then(|index| s.inputs.get_mut(index))
+                    {
+                        input.go_action = serde_json::from_str(f[2]).unwrap_or_default();
+                    }
+                }
                 Some("audio_effects") if f.len() >= 3 => {
                     let n: usize = f[1].parse().unwrap_or(0);
                     if let (Some(i), Ok(fx)) = (ids.get(n.wrapping_sub(1)).copied().and_then(|id| s.input_mut(id)),
@@ -3874,6 +4006,11 @@ impl Switcher {
                 Some("preview") if f.len() >= 2 => {
                     let n: usize = f[1].parse().unwrap_or(0);
                     s.preview = ids.get(n.wrapping_sub(1)).copied();
+                }
+                Some("cammatch") if f.len() >= 5 => {
+                    let pick = |text: &str| text.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+                        .and_then(|n| ids.get(n)).copied();
+                    s.cam_match.load_fields(pick(f[1]), pick(f[2]), f[3], f[4]);
                 }
                 Some("output") if f.len() >= 2 => {
                     let n: usize = f[1].parse().unwrap_or(0);
@@ -4409,6 +4546,65 @@ mod portable_settings_tests {
         assert!(restored.cfg.ffmpeg_all_files);
         assert_eq!(restored.cfg.rec_mbps, 16);
         assert!(restored.cfg.streams[0].url.is_empty());
+    }
+
+    #[test]
+    fn older_four_output_settings_keep_their_srt_destinations() {
+        let mut s = Switcher::empty();
+        let mut previous = vec![crate::srt::Settings::default(); 4];
+        previous[3].connection.port = 9111;
+        s.apply_settings_text(&format!("srt_outputs={}", serde_json::to_string(&previous).unwrap()));
+        assert_eq!(s.cfg.srt_outputs[3].connection.port, 9111);
+        assert_eq!(s.cfg.srt_outputs[7].connection.port, crate::srt::Settings::default().connection.port);
+    }
+
+    #[test]
+    fn go_action_targets_its_own_input_after_project_reload() {
+        let mut s = Switcher::demo();
+        s.inputs[0].go_action = "Preview @input".into();
+        let mut restored = Switcher::empty();
+        let project = crate::preset::encode(&s).unwrap();
+        crate::preset::decode(&mut restored, std::path::Path::new("test.livemix"), &project).unwrap();
+        let id = restored.inputs[0].id;
+        restored.go_input(id, 1.0);
+        assert_eq!(restored.preview, Some(id));
+    }
+
+    #[test]
+    fn mix_tally_follows_enabled_layers_and_survives_project_reload() {
+        let mut s = Switcher::empty();
+        let source = s.add(Input::new(0, "Source", Kind::Blank));
+        let mix = s.add(Input::new(0, "Mix", Kind::Mix { tally: true }));
+        let layer = &mut s.input_mut(mix).unwrap().layers[0];
+        layer.input = Some(source);
+        layer.on = true;
+        assert!(s.tally_contains(Some(mix), source));
+        let project = crate::preset::encode(&s).unwrap();
+        let mut restored = Switcher::empty();
+        crate::preset::decode(&mut restored, std::path::Path::new("test.livemix"), &project).unwrap();
+        let (source, mix) = (restored.inputs[0].id, restored.inputs[1].id);
+        assert!(restored.tally_contains(Some(mix), source));
+        restored.input_mut(mix).unwrap().layers[0].on = false;
+        assert!(!restored.tally_contains(Some(mix), source));
+    }
+
+    #[test]
+    fn mix_fade_swaps_its_sources_without_touching_the_main_buses() {
+        let mut s = Switcher::demo();
+        let (preview, program) = (s.preview, s.output);
+        let old = s.inputs[0].id;
+        let new = s.inputs[1].id;
+        let mix = s.add(Input::new(0, "Mix", Kind::Mix { tally: true }));
+        let input = s.input_mut(mix).unwrap();
+        input.layers[0].input = Some(old);
+        input.layers[0].on = true;
+        input.mix_preview = Some(new);
+        s.take_mix(mix, true, 1.0);
+        let input = s.input(mix).unwrap();
+        assert_eq!(input.layers[0].input, Some(new));
+        assert_eq!(input.mix_preview, Some(old));
+        assert_eq!(input.mix_fade, Some((old, 1.5)));
+        assert_eq!((s.preview, s.output), (preview, program));
     }
 
     #[test]

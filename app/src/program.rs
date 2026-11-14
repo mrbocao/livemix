@@ -42,7 +42,7 @@ pub struct Destinations {
     pub key_fill: bool,
     pub audio: crate::audio::Packet,
     pub recorders: Vec<Arc<crate::media::Recorder>>,
-    pub decklinks: Vec<(usize, crate::decklink::OutputSink, crate::audio::Packet)>,
+    pub decklinks: Vec<(usize, crate::decklink::OutputSink, Arc<[i16]>)>,
     pub streams: Vec<crate::stream::Output>,
     pub ndi: Vec<crate::ndi::Sender>,
     pub omt: Vec<crate::omt::Sender>,

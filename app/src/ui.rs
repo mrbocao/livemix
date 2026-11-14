@@ -113,6 +113,13 @@ pub(crate) fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 });
                 ui.end_row();
             });
+            let bitrate = s.cfg.rec_codec.ffmpeg_profile().bitrate
+                && (!s.cfg.rec_second || s.cfg.rec_second_codec.ffmpeg_profile().bitrate);
+            let total = s.cfg.rec_mbps + if s.cfg.rec_second { s.cfg.rec_second_mbps } else { 0 };
+            let folder = if s.cfg.rec_folder.trim().is_empty() { media::storage_folder() }
+                else { std::path::PathBuf::from(s.cfg.rec_folder.trim()) };
+            crate::disk_speed::show(ui, folder, s.rec.is_some() || s.multicorder.is_some() || s.replay_arm,
+                bitrate.then_some(total));
             setting_toggle(ui, &mut s.cfg.recording_confirm, "Ask before stopping (Display confirmation for Record, External, Stream and MultiCorder buttons)");
             ui.label(RichText::new(tr(ui, "Both slots share the folder and split interval.")).size(11.0).color(TEXT_DIM));
             ui.horizontal(|ui| {
@@ -155,10 +162,11 @@ pub(crate) fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 });
                 ui.end_row();
                 ui.label("URL");
-                ui.add(egui::TextEdit::singleline(&mut destination.url).desired_width(320.0));
+                ui.add(egui::TextEdit::singleline(&mut destination.url).password(destination.provider == 4).desired_width(320.0));
                 ui.end_row();
                 ui.label(tr(ui, "Stream Name or Key"));
-                ui.add(egui::TextEdit::singleline(&mut destination.key).password(true).desired_width(320.0));
+                ui.add_enabled(!destination.is_srt() && destination.provider != 4,
+                    egui::TextEdit::singleline(&mut destination.key).password(true).desired_width(320.0));
                 ui.end_row();
                 ui.label(tr(ui, "Resolution"));
                 let q = usize::from(destination.quality).min(stream::QUALITIES.len() - 1);
@@ -252,6 +260,30 @@ pub(crate) fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                         ui.label(tr(ui, "Audio track"));
                         changed |= setting_toggle(ui, &mut s.cfg.record_audio[2],
                             format!("{} · {}", s.cfg.mc_codec.audio_codec(), tr(ui, "Stereo"))).changed();
+                        ui.end_row();
+                        ui.label(tr(ui, "Audio source"));
+                        let selected = AUDIO_BUS_GROUPS.iter().find(|(_, mask)| *mask == s.cfg.mc_audio_bus)
+                            .map_or("Source audio", |(name, _)| *name);
+                        egui::ComboBox::from_id_salt("mc-audio-bus").selected_text(tr(ui, selected)).show_ui(ui, |ui| {
+                            changed |= ui.selectable_value(&mut s.cfg.mc_audio_bus, 0, tr(ui, "Source audio")).changed();
+                            for (name, mask) in AUDIO_BUS_GROUPS {
+                                changed |= ui.selectable_value(&mut s.cfg.mc_audio_bus, mask, name).changed();
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("NDI");
+                        changed |= ui.add_enabled_ui(!running && ndi::record_tool().is_some(), |ui| {
+                            let mut changed = setting_toggle(ui, &mut s.cfg.mc_ndi_direct, tr(ui, "Record original NDI video")).changed();
+                            if s.cfg.mc_ndi_direct {
+                                changed |= setting_toggle(ui, &mut s.cfg.mc_ndi_mkv, tr(ui, "Save NDI as MKV after recording")).changed();
+                            }
+                            changed
+                        }).inner;
+                        ui.end_row();
+                        ui.label("OMT");
+                        changed |= ui.add_enabled_ui(!running, |ui| {
+                            setting_toggle(ui, &mut s.cfg.mc_omt_direct, tr(ui, "Record original OMT video"))
+                        }).inner.on_hover_text("Writes VMX1 and source audio to MKV. Codec, audio bus and split do not apply.").changed();
                         ui.end_row();
                         ui.label(tr(ui, "New File Every:"));
                         ui.horizontal(|ui| {
@@ -457,6 +489,7 @@ pub(crate) fn new_preset_windows(ctx: &egui::Context, s: &mut Switcher, last_aut
 pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &str, encoder: &str, program_path: &str, mixer: &mut MixerControls, controls: &mut controls::Controls, last_autosave: &mut LastAutosave) {
     let t = ctx.input(|input| input.time);
     replay_windows(ctx, s, t);
+    cammatch::window(ctx, s);
     if let Some(report) = &s.import_report {
         let mut open = true;
         let mut close = false;

@@ -1,6 +1,16 @@
 //! Replay recording, event marking and A/B playback driven from the update loop.
 use crate::*;
 
+fn replay_omt_source(s: &Switcher, source: u32) -> Option<&str> {
+    if !s.replay_setup.compressed_omt || s.replay_setup.audio != 0 || source == SRC_OUTPUT || source == MV_AUTO {
+        return None;
+    }
+    match &s.input(source.checked_sub(1)?)?.kind {
+        Kind::Device { link, .. } => link.strip_prefix("omt:"),
+        _ => None,
+    }
+}
+
 impl App {
     pub(crate) fn indexed_command(&mut self, action: replay::Action) {
         if self.replay.folder.is_none() { return; }
@@ -26,8 +36,7 @@ impl App {
             let previous = self.replay.indexed[channel].as_ref().filter(|cursor| cursor.angle == angle);
             let mut range = previous.map_or_else(|| event.map(|event| (event.start, event.end)), |cursor| cursor.range);
             let folder = self.replay.folder.as_deref().unwrap();
-            let tail = self.replay.session.segments.iter().rev().find(|segment| segment.files[angle].as_deref()
-                .is_some_and(|file| replay::direct_path(folder, file).is_some()));
+            let tail = self.replay.session.segments.iter().rev().find(|segment| segment.direct_path(folder, angle).is_some());
             let position = previous.map(|cursor| {
                 if cursor.direction == ReplayMotion::Forward {
                     if let Some(segment) = self.replay.session.segments.iter().find(|segment| {
@@ -156,8 +165,7 @@ impl App {
                 continue;
             }
             let segments = &self.replay.session.segments;
-            let has_angle = |segment: &&replay::Segment| segment.files[cursor.angle].as_deref()
-                .is_some_and(|file| replay::direct_path(folder, file).is_some());
+            let has_angle = |segment: &&replay::Segment| segment.direct_path(folder, cursor.angle).is_some();
             let segment = segments.iter().filter(has_angle).find(|segment| {
                 (segment.start as f64..segment.end as f64).contains(&cursor.position)
             }).or_else(|| {
@@ -177,7 +185,7 @@ impl App {
                 continue;
             }
             let file = segment.files[cursor.angle].as_ref().unwrap();
-            let Some(path) = replay::direct_path(folder, file) else { continue };
+            let Some(path) = segment.direct_path(folder, cursor.angle) else { continue };
             if cursor.direction == ReplayMotion::Forward && cursor.file.as_ref() == Some(file) { continue; }
             cursor.position = cursor.position.clamp(segment.start as f64, (segment.end as f64 - frame).max(segment.start as f64));
             let offset = segment.seek_time(cursor.angle, cursor.position as u64);
@@ -372,22 +380,27 @@ impl App {
         let options = &mut replay.session.setup;
         let configured = &self.s.replay_setup;
         let options_changed = !replay.session.native
-            && (options.show_live_sources, options.advanced, options.play_to_program)
-                != (configured.show_live_sources, configured.advanced, configured.play_to_program);
+            && ((options.show_live_sources, options.advanced, options.play_to_program)
+                != (configured.show_live_sources, configured.advanced, configured.play_to_program)
+                || options.camera_folders != configured.camera_folders || options.compressed_omt != configured.compressed_omt);
         if options_changed {
             options.show_live_sources = configured.show_live_sources;
             options.advanced = configured.advanced;
             options.play_to_program = configured.play_to_program;
+            options.camera_folders.clone_from(&configured.camera_folders);
+            options.compressed_omt = configured.compressed_omt;
         }
         if replay.finalizing.first().is_some_and(|segment| segment.tracks.iter().all(|track| track.worker.is_finished())) {
             let segment = replay.finalizing.remove(0);
             let mut files = std::array::from_fn(|_| None);
             let mut frames = std::array::from_fn(|_| Vec::new());
+            let mut storage = std::array::from_fn(|_| None);
             for track in segment.tracks {
                 let joined = track.worker.join().is_ok();
-                let file = folder.join(&track.file);
+                let file = track.storage.as_deref().unwrap_or(&folder).join(&track.file);
                 if joined && track.error.lock().unwrap().is_empty() && std::fs::metadata(&file).is_ok_and(|entry| entry.len() > 0) {
                     files[track.angle] = Some(track.file);
+                    storage[track.angle] = track.storage;
                     if let Some(index) = track.index {
                         frames[track.angle] = index.lock().unwrap().drain(..).map(|(time, media_ms)| {
                             let offset = time.saturating_duration_since(segment.origin).as_millis() as u64;
@@ -396,11 +409,13 @@ impl App {
                     }
                 } else {
                     let _ = std::fs::remove_file(file);
-                    self.s.replay_status = format!("Camera {} failed to record", track.angle + 1);
+                    let error = track.error.lock().unwrap();
+                    self.s.replay_status = if error.is_empty() { format!("Camera {} failed to record", track.angle + 1) }
+                        else { format!("Camera {}: {error}", track.angle + 1) };
                 }
             }
             if files.iter().any(Option::is_some) && segment.end > segment.start {
-                replay.session.segments.push(replay::Segment { start: segment.start, end: segment.end, files, frames });
+                replay.session.segments.push(replay::Segment { start: segment.start, end: segment.end, files, frames, storage });
                 replay.session.segments.sort_by_key(|segment| segment.start);
                 changed = true;
             } else {
@@ -574,7 +589,7 @@ impl App {
             let range = (event.start, event.end);
             let opening = replay.session.segments.iter().find(|segment| {
                 segment.start <= event.start && event.start < segment.end
-                    && segment.files[request.angle].as_deref().is_some_and(|file| replay::direct_path(&folder, file).is_some())
+                    && segment.direct_path(&folder, request.angle).is_some()
             });
             if request.speed == 100 && !replay.sync_playback && !replay.session.native && opening.is_some() {
                 self.s.ensure_replay_inputs();
@@ -586,7 +601,7 @@ impl App {
                 });
                 replay.requested[channel] = None;
                 rotate_for_play |= range.1 > ready_until && replay.current.first()
-                    .is_some_and(|track| replay.position(track.recording.started) < range.1);
+                    .is_some_and(|track| replay.position(track.started) < range.1);
             } else if range.1 <= ready_until {
                 replay.requested[channel] = None;
                 match replay.job(request.event, request.angle, request.speed, false, None) {
@@ -598,7 +613,7 @@ impl App {
                     Err(error) => self.s.replay_status = error,
                 }
             } else if !replay.current.is_empty() || !replay.finalizing.is_empty() {
-                rotate_for_play |= replay.current.first().is_some_and(|track| replay.position(track.recording.started) < range.1);
+                rotate_for_play |= replay.current.first().is_some_and(|track| replay.position(track.started) < range.1);
                 self.s.replay_status = "Opening the recorded camera segment…".into();
             } else {
                 replay.requested[channel] = None;
@@ -652,20 +667,22 @@ impl App {
         }
 
         if self.s.replay_arm && self.program.lock().unwrap().error.is_some()
-            && self.s.replay_angles.iter().any(|&source| !matches!(source, SRC_OUTPUT | MV_AUTO))
+            && self.s.replay_angles.iter().any(|&source| !matches!(source, SRC_OUTPUT | MV_AUTO)
+                && replay_omt_source(&self.s, source).is_none())
         {
             self.s.replay_arm = false;
             self.s.replay_status = "Multicamera replay requires offscreen capture".into();
         }
         if !replay.current.is_empty() && (!self.s.replay_arm || (
             replay.finalizing.len() < 2
-                && (rotate_for_play || now - replay.current[0].recording.started >= replay::SEGMENT_MS as f64 / 1000.0)))
+                && (rotate_for_play || now - replay.current[0].started >= replay::SEGMENT_MS as f64 / 1000.0)))
         {
-            let start = replay.position(replay.current[0].recording.started);
+            let start = replay.position(replay.current[0].started);
             let origin = replay.current[0].origin;
-            let tracks = replay.current.drain(..).map(|track| FinalizingTrack {
-                angle: track.angle, file: track.file, error: track.recording.recorder.error.clone(),
-                index: track.recording.recorder.replay_index.clone(), worker: track.worker,
+            let tracks = replay.current.drain(..).map(|track| {
+                drop(track.direct);
+                FinalizingTrack { angle: track.angle, file: track.file, storage: track.storage,
+                    error: track.error, index: track.index, worker: track.worker }
             }).collect();
             replay.finalizing.push(FinalizingReplay { origin, start, end: position, tracks });
         }
@@ -704,25 +721,44 @@ impl App {
                 fps, hw: self.s.cfg.hw_encoder, format: media::RecordFormat::parse(&setup.codec), audio: true };
             let origin = Instant::now();
             let mut seen = std::collections::HashSet::new();
+            let mut unavailable = Vec::new();
             for (angle, source) in self.s.replay_angles.into_iter().enumerate() {
                 if source == MV_AUTO || !seen.insert(source) { continue; }
                 if source != SRC_OUTPUT && !self.s.input(source - 1).is_some_and(|input| !matches!(input.kind, Kind::Replay { .. })) { continue; }
-                let file = format!("camera-{}-{stamp}.mp4", angle + 1);
+                let omt_source = replay_omt_source(&self.s, source);
+                let extension = if omt_source.is_some() { "mkv" } else { "mp4" };
+                let file = format!("camera-{}-{stamp}.{extension}", angle + 1);
+                let storage = replay::camera_storage(&setup.camera_folders[angle]).unwrap_or_else(|error| {
+                    unavailable.push(format!("{} ({error})", angle + 1));
+                    None
+                });
+                if let Some(address) = omt_source {
+                    let path = storage.as_deref().unwrap_or(&folder).join(&file);
+                    let (direct, error, index, worker) = omt::record_compressed(address.to_owned(), path, origin, true, true);
+                    replay.current.push(ReplayTrack { recording: None, direct: Some(direct), started: now,
+                        error, index, origin, angle, file, storage, worker });
+                    continue;
+                }
                 let route = OutputRoute { source, overlays: source == SRC_OUTPUT };
                 let (recorder, worker) = media::Recorder::spawn_writer_indexed(
-                    folder.join(&file).to_string_lossy().into_owned(), options, true);
+                    storage.as_deref().unwrap_or(&folder).join(&file).to_string_lossy().into_owned(), options, true);
                 let recording = ComposedRecording { recorder: Arc::new(recorder), channel: 0,
                     route_override: Some(route), audio_override: match setup.audio {
                         0 => None,
                         1 => Some(SRC_OUTPUT),
                         n => self.s.replay_angles.get(usize::from(n - 2)).copied().filter(|&source| source != MV_AUTO),
                     }, started: now };
-                replay.current.push(ReplayTrack { recording, origin, angle, file, worker });
+                let error = recording.recorder.error.clone();
+                let index = recording.recorder.replay_index.clone();
+                replay.current.push(ReplayTrack { recording: Some(recording), direct: None, started: now,
+                    error, index, origin, angle, file, storage, worker });
             }
             if replay.current.is_empty() {
                 self.s.replay_arm = false;
                 self.s.replay_status = "Select at least one available camera".into();
-            } else if self.s.replay_status == "Replay session ready" {
+            } else if !unavailable.is_empty() {
+                self.s.replay_status = format!("Using session drive for camera(s) {}", unavailable.join(", "));
+            } else if self.s.replay_status == "Replay session ready" || self.s.replay_status.starts_with("Using session drive") {
                 self.s.replay_status = format!("Recording {} camera(s)", replay.current.len());
             }
         }
@@ -795,7 +831,10 @@ fn replay_marks_without_rotating_records_and_reopens_both_channels() {
     app.s.cfg = Settings::default();
     app.s.cfg.hw_encoder = false;
     let folder = std::env::temp_dir().join(format!("livemix-replay-test-{}", replay_stamp()));
+    let second_disk = std::env::temp_dir().join(format!("livemix-replay-storage-test-{}", replay_stamp()));
+    std::fs::create_dir(&second_disk).unwrap();
     app.s.replay_setup.folder = folder.to_string_lossy().into_owned();
+    app.s.replay_setup.camera_folders[1] = second_disk.to_string_lossy().into_owned();
     app.s.replay_load = Some(true);
     app.record_format = ([320, 180], 25.0);
     app.s.replay_angles[1] = app.s.inputs[0].id + 1;
@@ -808,7 +847,7 @@ fn replay_marks_without_rotating_records_and_reopens_both_channels() {
     for index in 0..20 {
         for track in &app.replay.current {
             if track.angle == 1 && (5..8).contains(&index) { continue; }
-            track.recording.recorder.push_audio([220, 60, 30, 255].repeat(320 * 180), 320, 180,
+            track.recording.as_ref().unwrap().recorder.push_audio([220, 60, 30, 255].repeat(320 * 180), 320, 180,
                 start + std::time::Duration::from_millis(index * 40), audio::test_tone(1920));
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -834,7 +873,7 @@ fn replay_marks_without_rotating_records_and_reopens_both_channels() {
     let next_recording = app.replay.current[0].origin;
     for index in 0..3 {
         for track in &app.replay.current {
-            track.recording.recorder.push_audio([220, 60, 30, 255].repeat(320 * 180), 320, 180,
+            track.recording.as_ref().unwrap().recorder.push_audio([220, 60, 30, 255].repeat(320 * 180), 320, 180,
                 next_recording + std::time::Duration::from_millis(index * 40), audio::test_tone(1920));
         }
     }
@@ -845,8 +884,17 @@ fn replay_marks_without_rotating_records_and_reopens_both_channels() {
         app.update_replay(0.8);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let segment = &app.replay.session.segments[0];
+    let segment = app.replay.session.segments[0].clone();
     assert!(!segment.frames[0].is_empty() && !segment.frames[1].is_empty());
+    assert!(segment.storage[0].is_none());
+    let external = segment.path(&folder, 1).unwrap();
+    assert_eq!(external.parent(), replay::camera_storage(&second_disk.to_string_lossy()).unwrap().as_deref());
+    assert!(external.is_file());
+    app.s.replay_setup.camera_folders[1].clear();
+    app.update_replay(0.9);
+    let reopened = replay::Session::open(&folder).unwrap();
+    assert!(reopened.setup.camera_folders[1].is_empty());
+    assert_eq!(reopened.segments[0].path(&folder, 1).unwrap(), external);
     assert!(!segment.frames[1].iter().any(|frame| (200..320).contains(&frame.show_ms)));
     assert!(segment.seek_time(1, segment.start + 280) < segment.seek_time(1, segment.start + 400));
     let event = &app.s.replay_events[0];
@@ -888,4 +936,5 @@ fn replay_marks_without_rotating_records_and_reopens_both_channels() {
     app.update_replay(0.82);
     assert!(matches!(app.replay.indexed[0].as_ref().unwrap().direction, ReplayMotion::Reverse));
     std::fs::remove_dir_all(folder).unwrap();
+    std::fs::remove_dir_all(second_disk).unwrap();
 }

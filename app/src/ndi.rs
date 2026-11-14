@@ -197,6 +197,113 @@ pub fn discover() -> Result<Vec<String>, String> {
     }
 }
 
+pub fn record_tool() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LIVEMIX_NDI_RECORD").map(PathBuf::from) {
+        return (path.is_absolute() && path.is_file()).then_some(path);
+    }
+    #[cfg(windows)]
+    if let Some(programs) = std::env::var_os("ProgramFiles").map(PathBuf::from) {
+        let path = programs.join("NDI/NDI 6 Tools/Studio Monitor/Application.NDIRecording.x64.exe");
+        if path.is_file() { return Some(path); }
+    }
+    None
+}
+
+pub struct DirectRecording {
+    stop: Option<mpsc::Sender<()>>,
+    pub status: Arc<Mutex<String>>,
+}
+
+impl Drop for DirectRecording {
+    fn drop(&mut self) {
+        // Closing the control channel lets the worker finalize the MOV.
+        self.stop.take();
+    }
+}
+
+impl DirectRecording {
+    pub fn start(tool: PathBuf, source: String, output: PathBuf) -> Self {
+        let (stop, control) = mpsc::channel();
+        let status = Arc::new(Mutex::new("Connecting NDI recorder…".into()));
+        let state = Arc::clone(&status);
+        std::thread::spawn(move || {
+            let mkv = output.extension().is_some_and(|ext| ext == "mkv");
+            let capture = if mkv { output.with_extension("pending.mov") } else { output.clone() };
+            let result = record_direct(tool, source, capture.clone(), control, &state, mkv)
+                .and_then(|()| if mkv { remux_recording(&capture, &output, &state) } else { Ok(()) });
+            if let Err(error) = result {
+                *state.lock().unwrap() = format!("NDI recording: {error}");
+            }
+        });
+        Self { stop: Some(stop), status }
+    }
+}
+
+fn remux_recording(capture: &std::path::Path, output: &std::path::Path, status: &Mutex<String>) -> Result<(), String> {
+    *status.lock().unwrap() = "Finalizing NDI MKV…".into();
+    let temporary = output.with_extension("pending.mkv");
+    let result = crate::stream::command().args(["-nostdin", "-n", "-i"]).arg(capture)
+        .args(["-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-allow_raw_vfw", "1"])
+        .arg(&temporary).output().map_err(|error| format!("FFmpeg unavailable; MOV kept: {error}"))?;
+    if !result.status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("MKV remux failed; MOV kept: {}", String::from_utf8_lossy(&result.stderr)
+            .lines().last().unwrap_or("unsupported codec")));
+    }
+    std::fs::rename(&temporary, output).map_err(|error| format!("Could not finalize MKV; MOV kept: {error}"))?;
+    let _ = std::fs::remove_file(capture);
+    Ok(())
+}
+
+fn record_direct(tool: PathBuf, source: String, output: PathBuf, stop: mpsc::Receiver<()>,
+    status: &Mutex<String>, single_file: bool) -> Result<(), String>
+{
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(tool);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command.arg("-i").arg(source).arg("-o").arg(output).arg("-nothumbnail");
+    if single_file { command.arg("-noautochop"); }
+    let mut child = command
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().map_err(|error| error.to_string())?;
+    std::thread::scope(|scope| {
+        let stdout = child.stdout.take().unwrap();
+        scope.spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("<record_started ") {
+                    *status.lock().unwrap() = "Recording NDI to MOV".into();
+                } else if let Some((_, message)) = line.split_once("<record_error ") {
+                    *status.lock().unwrap() = format!("NDI recording: {}", message.trim_end_matches("/>"));
+                }
+            }
+        });
+        loop {
+            if let Some(exit) = child.try_wait().map_err(|error| error.to_string())? {
+                return Err(format!("Recorder exited ({exit})"));
+            }
+            if matches!(stop.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)) {
+                continue;
+            }
+            if let Some(mut input) = child.stdin.take() { let _ = input.write_all(b"<exit/>\n"); }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Some(exit) = child.try_wait().map_err(|error| error.to_string())? {
+                    return if exit.success() { Ok(()) } else { Err(format!("Recorder exited ({exit})")) };
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Recorder did not finish the MOV after Stop".into());
+        }
+    })
+}
+
 const BGRA: u32 = u32::from_le_bytes(*b"BGRA");
 const BGRX: u32 = u32::from_le_bytes(*b"BGRX");
 
@@ -383,6 +490,47 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool, crate:
         (api.send_destroy)(sender);
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires NDI Record, the native NDI runtime and local discovery"]
+fn ndi_direct_mov_loopback() {
+    let tool = record_tool().expect("NDI Record utility");
+    let name = format!("LiveMix direct {}", crate::replay_stamp());
+    let sender = Sender::start(name.clone(), 25.0);
+    let source = discover().unwrap().into_iter().find(|source| source.contains(&name))
+        .unwrap_or_else(|| panic!("sender was not discovered: {:?}", sender.status()));
+    let path = std::env::temp_dir().join(format!("livemix-direct-{}.mov", crate::replay_stamp()));
+    let recorder = DirectRecording::start(tool, source, path.clone());
+    let status = Arc::clone(&recorder.status);
+    let frame = NetworkFrame { pixels: Arc::new([20, 55, 180, 255].repeat(320 * 180)), width: 320, height: 180 };
+    let packet: crate::audio::Packet = vec![[4800, -4800]; 1920].into();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut frames = 0;
+    while Instant::now() < deadline && frames < 30 {
+        sender.submit_pixels(frame.clone(), false, packet.clone());
+        std::thread::sleep(Duration::from_millis(40));
+        if status.lock().unwrap().starts_with("Recording NDI") { frames += 1; }
+    }
+    drop(recorder);
+    sender.stop();
+    assert_eq!(frames, 30, "{}", status.lock().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if bytes.windows(4).any(|word| word == b"moov") {
+                let mkv = path.with_extension("mkv");
+                remux_recording(&path, &mkv, &status).unwrap();
+                let decoded = crate::stream::command().args(["-v", "error", "-xerror", "-i"]).arg(&mkv)
+                    .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"]).output().unwrap();
+                assert!(decoded.status.success(), "{}", String::from_utf8_lossy(&decoded.stderr));
+                std::fs::remove_file(mkv).unwrap();
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "MOV did not finalize: {}", status.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

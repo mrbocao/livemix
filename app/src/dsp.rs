@@ -53,12 +53,75 @@ fn lin_to_db(v: f32) -> f32 {
     20.0 * v.max(1e-6).log10()
 }
 
+const DENOISE_SAMPLES: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
+
+struct StereoDenoiser {
+    states: [Box<nnnoiseless::DenoiseState<'static>>; 2],
+    input: [[f32; DENOISE_SAMPLES]; 2],
+    output: [[f32; DENOISE_SAMPLES]; 2],
+    position: usize,
+}
+
+impl StereoDenoiser {
+    fn new() -> Self {
+        Self {
+            states: std::array::from_fn(|_| nnnoiseless::DenoiseState::new()),
+            input: [[0.0; DENOISE_SAMPLES]; 2],
+            output: [[0.0; DENOISE_SAMPLES]; 2],
+            position: 0,
+        }
+    }
+
+    fn process(&mut self, block: &mut [f32]) {
+        for pair in block.as_chunks_mut::<2>().0 {
+            let position = self.position;
+            for (channel, sample) in pair.iter_mut().enumerate() {
+                self.input[channel][position] = *sample * 32768.0;
+                *sample = self.output[channel][position] / 32768.0;
+            }
+            self.position += 1;
+            if self.position == DENOISE_SAMPLES {
+                for (channel, state) in self.states.iter_mut().enumerate() {
+                    state.process_frame(&mut self.output[channel], &self.input[channel]);
+                }
+                self.position = 0;
+            }
+        }
+    }
+}
+
+#[test]
+fn stereo_matrix_uses_both_original_channels() {
+    let config = AudioCfg { matrix: [[0.0, 1.0], [0.5, 0.5]], ..Default::default() };
+    let mut block = [0.5, -0.25];
+    Chain::default().process(&mut block, &config);
+    assert_eq!(block, [-0.25, 0.125]);
+}
+
+#[test]
+fn automatic_gain_raises_a_quiet_signal_on_both_channels() {
+    let mut block = vec![0.03; 48_000];
+    let cfg = AudioCfg { agc: true, ..Default::default() };
+    Chain::default().process(&mut block, &cfg);
+    assert!(block[47_998] > 0.10);
+    assert_eq!(block[47_998], block[47_999]);
+}
+
 /// Filter state of one input.
 pub struct Chain {
+    denoise: Option<Box<StereoDenoiser>>,
+    room_fast: f32,
+    room_slow: f32,
+    room_gain: f32,
     eq_set: [f32; 10],
     eq: Vec<(usize, Biquad)>,
     gate_level: f32,
     comp_level: f32,
+    comp_gain: f32,
+    comp_target: f32,
+    comp_samples: u8,
+    dynamics_level: f32,
+    dynamics_gain: f32,
     gate_gain: f32,
     delay: VecDeque<f32>,
 }
@@ -66,10 +129,19 @@ pub struct Chain {
 impl Default for Chain {
     fn default() -> Self {
         Self {
+            denoise: None,
+            room_fast: 0.0,
+            room_slow: 0.0,
+            room_gain: 1.0,
             eq_set: [0.0; 10],
             eq: Vec::new(),
             gate_level: 0.0,
             comp_level: 0.0,
+            comp_gain: 1.0,
+            comp_target: 1.0,
+            comp_samples: 0,
+            dynamics_level: 0.0,
+            dynamics_gain: 1.0,
             gate_gain: 1.0,
             delay: VecDeque::new(),
         }
@@ -92,22 +164,51 @@ impl Chain {
 
     /// Treats one block in place. Nothing set means nothing computed.
     pub fn process(&mut self, block: &mut [f32], cfg: &AudioCfg) {
+        if cfg.denoise {
+            self.denoise.get_or_insert_with(|| Box::new(StereoDenoiser::new())).process(block);
+        } else {
+            self.denoise = None;
+        }
+        if cfg.dereverb || self.room_gain < 0.9999 {
+            for pair in block.as_chunks_mut::<2>().0 {
+                let level = pair[0].abs().max(pair[1].abs());
+                self.room_fast += (level - self.room_fast) * 0.002;
+                self.room_slow += (level - self.room_slow) * 0.00012;
+                let target = if cfg.dereverb && self.room_slow > 0.0003 {
+                    (1.5 * self.room_fast / self.room_slow).clamp(0.35, 1.0)
+                } else { 1.0 };
+                let slew = if target < self.room_gain { 0.001 } else { 0.007 };
+                self.room_gain += (target - self.room_gain) * slew;
+                for sample in pair { *sample *= self.room_gain; }
+            }
+        } else {
+            self.room_fast = 0.0;
+            self.room_slow = 0.0;
+        }
         match cfg.channel {
             1 => block.as_chunks_mut::<2>().0.iter_mut().for_each(|p| p[1] = p[0]),
             2 => block.as_chunks_mut::<2>().0.iter_mut().for_each(|p| p[0] = p[1]),
+            3 => block.as_chunks_mut::<2>().0.iter_mut().for_each(|p| p.swap(0, 1)),
+            4 => block.as_chunks_mut::<2>().0.iter_mut().for_each(|p| *p = [(p[0] + p[1]) * 0.5; 2]),
             _ => {}
+        }
+        if cfg.matrix != [[1.0, 0.0], [0.0, 1.0]] {
+            for pair in block.as_chunks_mut::<2>().0 {
+                let [left, right] = *pair;
+                *pair = cfg.matrix.map(|[l, r]| l * left + r * right);
+            }
         }
         if cfg.pan.abs() > 0.001 {
             let (left, right) = if cfg.pan > 0.0 { (1.0 - cfg.pan, 1.0) } else { (1.0, 1.0 + cfg.pan) };
             block.as_chunks_mut::<2>().0.iter_mut().for_each(|p| { p[0] *= left; p[1] *= right; });
         }
-        if cfg.gate_threshold > -89.0 {
+        if cfg.gate_enabled && cfg.gate_threshold > -89.0 {
             self.gate(block, cfg.gate_threshold);
         }
-        if cfg.comp_ratio > 1.001 {
-            self.compress(block, cfg.comp_ratio, cfg.comp_threshold);
+        if (cfg.compressor_enabled && cfg.comp_ratio > 1.001) || self.compressor_releasing() {
+            self.compress(block, cfg);
         }
-        self.refresh_eq(&cfg.eq);
+        self.refresh_eq(if cfg.eq_enabled { &cfg.eq } else { &[0.0; 10] });
         for (_, f) in &mut self.eq {
             for p in block.as_chunks_mut::<2>().0 {
                 p[0] = f.run(p[0], 0);
@@ -117,6 +218,13 @@ impl Chain {
         if cfg.gain_db.abs() > 0.01 {
             let g = db_to_lin(cfg.gain_db);
             block.iter_mut().for_each(|v| *v *= g);
+        }
+        if cfg.gain_right_db.abs() > 0.01 {
+            let gain = db_to_lin(cfg.gain_right_db);
+            for pair in block.as_chunks_mut::<2>().0 { pair[1] *= gain; }
+        }
+        if cfg.agc || cfg.dynamics || (self.dynamics_gain - 1.0).abs() > 0.0001 {
+            self.level_dynamics(block, cfg);
         }
         self.apply_delay(block, cfg.delay_ms);
     }
@@ -133,17 +241,54 @@ impl Chain {
         }
     }
 
-    fn compress(&mut self, block: &mut [f32], ratio: f32, threshold_db: f32) {
+    pub fn compressor_releasing(&self) -> bool {
+        self.comp_gain < 0.9999 || self.comp_target < 0.9999
+    }
+
+    pub fn settling(&self) -> bool {
+        self.compressor_releasing() || (self.dynamics_gain - 1.0).abs() > 0.0001 || self.room_gain < 0.9999
+    }
+
+    fn level_dynamics(&mut self, block: &mut [f32], cfg: &AudioCfg) {
+        let attack = 1.0 - (-1000.0 / (AUDIO_RATE as f32 * cfg.dynamics_attack_ms)).exp();
+        let low = db_to_lin(cfg.dynamics_low);
+        let high = db_to_lin(cfg.dynamics_high);
+        let goal = db_to_lin(-18.0);
+        for pair in block.as_chunks_mut::<2>().0 {
+            let peak = pair[0].abs().max(pair[1].abs());
+            let speed = if peak > self.dynamics_level { attack } else { 0.0001 };
+            self.dynamics_level += (peak - self.dynamics_level) * speed;
+            let level = self.dynamics_level.max(0.0001);
+            let mut gain = if cfg.agc && level > 0.01 { (goal / level).clamp(0.25, 4.0) } else { 1.0 };
+            if cfg.dynamics {
+                if level < low { gain *= (level / low).sqrt(); }
+                if level * gain > high { gain *= (high / (level * gain)).sqrt(); }
+            }
+            let slew = if gain < self.dynamics_gain { attack } else { 0.0001 };
+            self.dynamics_gain += (gain - self.dynamics_gain) * slew;
+            pair[0] *= self.dynamics_gain;
+            pair[1] *= self.dynamics_gain;
+        }
+    }
+
+    fn compress(&mut self, block: &mut [f32], cfg: &AudioCfg) {
+        let active = cfg.compressor_enabled && cfg.comp_ratio > 1.001;
+        let slope = 1.0 - 1.0 / cfg.comp_ratio;
+        if !active { self.comp_target = 1.0; }
         for p in block.as_chunks_mut::<2>().0 {
             let level = p[0].abs().max(p[1].abs());
             let coef = if level > self.comp_level { 0.01 } else { 0.0005 };
             self.comp_level += (level - self.comp_level) * coef;
-            let over = lin_to_db(self.comp_level) - threshold_db;
-            if over > 0.0 {
-                let g = db_to_lin(-over * (1.0 - 1.0 / ratio));
-                p[0] *= g;
-                p[1] *= g;
+            if active && self.comp_samples == 0 {
+                let over = (lin_to_db(self.comp_level) - cfg.comp_threshold).max(0.0);
+                self.comp_target = db_to_lin(-over * slope);
             }
+            // Update the gain target every 16 samples and slew the applied gain per sample.
+            self.comp_samples = (self.comp_samples + 1) % 16;
+            let slew = if self.comp_target < self.comp_gain { 0.01 } else if active { 0.0005 } else { 0.004 };
+            self.comp_gain += (self.comp_target - self.comp_gain) * slew;
+            p[0] *= self.comp_gain;
+            p[1] *= self.comp_gain;
         }
     }
 

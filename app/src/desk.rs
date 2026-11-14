@@ -66,8 +66,18 @@ pub(crate) fn top_bar(ctx: &egui::Context, s: &mut Switcher) {
                     if bar_btn(ui, "Settings", s.settings_open).clicked() {
                         s.settings_open = !s.settings_open;
                     }
+                    if bar_btn(ui, "Camera Match", s.cam_match.open).on_hover_text(tr(ui, "Compare two cameras and match their picture")).clicked() {
+                        s.cam_match.open = !s.cam_match.open;
+                        s.cam_match.reset_measurements();
+                    }
                     if bar_btn(ui, "Pause Inputs", false).on_hover_text(tr(ui, "Pause all currently playing video inputs")).clicked() {
-                        s.pause_video_inputs();
+                        let paused = s.pause_video_inputs();
+                        let message = match paused {
+                            0 => tr(ui, "Pause sent to video inputs and Replay").to_owned(),
+                            1 => tr(ui, "1 video input paused").to_owned(),
+                            count => format!("{count} {}", tr(ui, "video inputs paused")),
+                        };
+                        s.notice(&message);
                     }
                 });
             });
@@ -284,7 +294,9 @@ pub(crate) fn monitor(ui: &mut egui::Ui, s: &mut Switcher, t: f64, is_output: bo
                 // Overlays show on Preview as well (InputRenderFlags: overlays are only left out
                 // with ExcludePreviewOverlays), so picking another input never hides them;
                 // right-click overlays (ms::zzo @0x1301ac) show on Preview only.
-                draw_overlay_channels(&pp, pr, s, t, true);
+                if allows_overlays(s, s.preview) {
+                    draw_overlay_channels(&pp, pr, s, t, true);
+                }
                 if s.cfg.safe_type != 0 {
                     draw_safe_areas(&pp, pr, s.cfg.safe_type);
                 }
@@ -565,6 +577,10 @@ pub(crate) fn draw_overlay_channels(painter: &egui::Painter, rect: egui::Rect, s
     }
 }
 
+pub(crate) fn allows_overlays(s: &Switcher, input: Option<u32>) -> bool {
+    !input.and_then(|id| s.input(id)).is_some_and(|input| matches!(input.kind, Kind::Teleprompter(_)))
+}
+
 pub(crate) fn draw_output_opts(painter: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64, overlays: bool) {
     match &s.trans {
         Some(tr) if tr.stinger.is_none() => {
@@ -578,7 +594,10 @@ pub(crate) fn draw_output_opts(painter: &egui::Painter, rect: egui::Rect, s: &Sw
             }
         }
     }
-    if overlays {
+    let transition_allows_overlays = s.trans.as_ref().is_none_or(|tr| {
+        tr.stinger.is_some() || (allows_overlays(s, tr.from) && allows_overlays(s, Some(tr.to)))
+    });
+    if overlays && allows_overlays(s, s.output) && transition_allows_overlays {
         draw_overlay_channels(painter, rect, s, t, false);
     }
     if let Some(tr) = &s.trans {
@@ -636,7 +655,7 @@ pub(crate) fn draw_src(p: &egui::Painter, rect: egui::Rect, s: &Switcher, t: f64
             if let Some(inp) = id.and_then(|i| s.input(i)) {
                 draw_source(p, rect, inp, 1.0, t, &s.inputs);
             }
-            if overlays {
+            if overlays && allows_overlays(s, id) {
                 draw_overlay_channels(p, rect, s, t, src == SRC_PREVIEW);
             }
         }
@@ -688,9 +707,9 @@ pub(crate) fn draw_multiview(p: &egui::Painter, rect: egui::Rect, s: &Switcher, 
         }
         // Strip colour: Output (ActiveColour, DarkGreen) before Preview (PreviewColour,
         // DarkOrange); anything else MV_IDLE.
-        let strip_col = if src == SRC_OUTPUT || (src != SRC_PREVIEW && id.is_some() && id == s.output) {
+        let strip_col = if src == SRC_OUTPUT || (src != SRC_PREVIEW && id.is_some_and(|id| s.tally_contains(s.output, id))) {
             s.cfg.output_colour
-        } else if src == SRC_PREVIEW || (id.is_some() && id == s.preview) {
+        } else if src == SRC_PREVIEW || id.is_some_and(|id| s.tally_contains(s.preview, id)) {
             s.cfg.preview_colour
         } else {
             MV_IDLE

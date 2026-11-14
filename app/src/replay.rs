@@ -8,11 +8,14 @@ pub(crate) mod ui;
 
 const MANIFEST: &str = "livemix-replay.json";
 pub const SEGMENT_MS: u64 = 4_000;
+const STORAGE_DIR: &str = "LiveMix Replay";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Setup {
     pub folder: String,
+    pub camera_folders: [String; 8],
+    pub compressed_omt: bool,
     pub size: Option<[u32; 2]>,
     pub fps: Option<f32>,
     pub mbps: u32,
@@ -29,17 +32,19 @@ pub struct Setup {
 
 impl Default for Setup {
     fn default() -> Self {
-        Self { folder: String::new(), size: None, fps: None, mbps: 25, codec: "h264".into(),
+        Self { folder: String::new(), camera_folders: Default::default(), compressed_omt: false, size: None, fps: None, mbps: 25, codec: "h264".into(),
             audio: 0, buffer_seconds: 120, delete_old: true, transition_ms: 0, match_speed: false,
             show_live_sources: false, advanced: false, play_to_program: false }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Segment {
     pub start: u64,
     pub end: u64,
     pub files: [Option<String>; 8],
+    #[serde(default)]
+    pub storage: [Option<PathBuf>; 8],
     #[serde(default)]
     pub frames: [Vec<FrameStamp>; 8],
 }
@@ -50,7 +55,40 @@ pub struct FrameStamp {
     pub media_ms: u64,
 }
 
+pub fn camera_storage(requested: &str) -> std::io::Result<Option<PathBuf>> {
+    let requested = requested.trim();
+    if requested.is_empty() { return Ok(None); }
+    let root = Path::new(requested);
+    if !root.is_absolute() || !root.is_dir()
+        || root.components().any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Choose an existing absolute folder"));
+    }
+    let directory = root.join(STORAGE_DIR);
+    std::fs::create_dir_all(&directory)?;
+    Ok(Some(directory))
+}
+
 impl Segment {
+    fn recording_folder<'a>(&'a self, session: &'a Path, angle: usize) -> Option<&'a Path> {
+        match self.storage.get(angle)?.as_deref() {
+            None => Some(session),
+            Some(directory) if directory.is_absolute() && directory.file_name()?.to_str()? == STORAGE_DIR
+                && !directory.components().any(|part| matches!(part, std::path::Component::ParentDir)) => Some(directory),
+            Some(_) => None,
+        }
+    }
+
+    pub fn path(&self, session: &Path, angle: usize) -> Option<PathBuf> {
+        let name = self.files.get(angle)?.as_deref()?;
+        let folder = self.recording_folder(session, angle)?;
+        if self.storage[angle].is_some() { media_path(folder, name) } else { indexed_path(folder, name) }
+    }
+
+    pub fn direct_path(&self, session: &Path, angle: usize) -> Option<PathBuf> {
+        self.path(session, angle).filter(|path| path.extension().and_then(|ext| ext.to_str()) != Some("vdata"))
+    }
+
     pub fn seek_time(&self, angle: usize, time: u64) -> u64 {
         let show = time.saturating_sub(self.start);
         let Some(frames) = self.frames.get(angle).filter(|frames| !frames.is_empty()) else { return show; };
@@ -312,8 +350,15 @@ impl Session {
             {
                 return true;
             }
-            for file in segment.files.iter().flatten().filter_map(|file| media_path(folder, file)) {
-                let _ = std::fs::remove_file(file);
+            for (angle, name) in segment.files.iter().enumerate() {
+                let Some(name) = name else { continue };
+                let Some(directory) = segment.recording_folder(folder, angle) else { continue };
+                let Some(file) = media_path(directory, name) else { continue };
+                match std::fs::remove_file(file) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && directory.is_dir() => {}
+                    Err(_) => return true,
+                }
             }
             changed = true;
             false
@@ -389,7 +434,7 @@ pub fn native_session(folder: &Path) -> Result<Session, String> {
             (*camera == angle && *time == start).then(|| path.as_ref().map(|path| path.to_string_lossy().into_owned())).flatten()
         }));
         if files.iter().any(Option::is_some) {
-            session.segments.push(Segment { start: start - origin, end: end - origin, files, frames: Default::default() });
+            session.segments.push(Segment { start: start - origin, end: end - origin, files, ..Default::default() });
         }
     }
     for event in &mut session.events {
@@ -416,7 +461,7 @@ pub fn indexed_path(folder: &Path, name: &str) -> Option<PathBuf> {
 
 pub fn media_path(folder: &Path, name: &str) -> Option<PathBuf> {
     let path = Path::new(name);
-    if path.components().count() != 1 || path.file_name().is_none() || path.extension()? != "mp4"
+    if path.components().count() != 1 || path.file_name().is_none() || !matches!(path.extension()?.to_str()?, "mp4" | "mkv")
         || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
     {
         return None;
@@ -461,10 +506,6 @@ impl NativeRemux {
     }
 }
 
-pub fn direct_path(folder: &Path, name: &str) -> Option<PathBuf> {
-    indexed_path(folder, name).filter(|path| path.extension().and_then(|ext| ext.to_str()) != Some("vdata"))
-}
-
 pub fn event_media(folder: &Path, segments: &[Segment], event: &Event, angle: usize,
     speed: u8, output: &Path) -> Result<(), String>
 {
@@ -475,7 +516,7 @@ pub fn event_media(folder: &Path, segments: &[Segment], event: &Event, angle: us
         if segment.start > cursor.saturating_add(100) {
             return Err("Replay media has a gap in this range".into());
         }
-        let path = segment.files.get(angle).and_then(Option::as_deref).and_then(|file| indexed_path(folder, file))
+        let path = segment.path(folder, angle)
             .and_then(|path| path.canonicalize().ok()).ok_or("Camera media is missing for this range")?;
         let start = segment.seek_time(angle, cursor);
         let end = segment.cut_end(angle, event.end.min(segment.end)).max(start.saturating_add(1));
@@ -550,7 +591,7 @@ mod tests {
 
     #[test]
     fn indexed_marks_hold_the_previous_picture_across_asymmetric_drops() {
-        let mut segment = Segment { start: 4000, end: 8000, files: Default::default(), frames: Default::default() };
+        let mut segment = Segment { start: 4000, end: 8000, ..Default::default() };
         segment.frames[0] = vec![
             FrameStamp { show_ms: 10, media_ms: 0 },
             FrameStamp { show_ms: 40, media_ms: 30 },
@@ -660,7 +701,7 @@ mod tests {
             assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
             let mut files = std::array::from_fn(|_| None);
             files[0] = Some(name);
-            Segment { start: index * 1000, end: (index + 1) * 1000, files, frames: Default::default() }
+            Segment { start: index * 1000, end: (index + 1) * 1000, files, ..Default::default() }
         }).collect::<Vec<_>>();
         let event = Event { id: 1, start: 760, end: 1240, description: String::new(), speed: 50, angles: [true; 8], ..Default::default() };
         let target = root.join("result.mp4");

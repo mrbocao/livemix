@@ -60,6 +60,8 @@ pub(crate) fn replay_windows(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                     });
                     ui.separator();
                     ui.strong("Recording Format");
+                    ui.checkbox(&mut setup.compressed_omt, tr(ui, "Record original OMT video"))
+                        .on_hover_text("Uses source format and embedded audio with Follow camera. Records to MKV.");
                     ui.horizontal_wrapped(|ui| {
                         let size_label = setup.size.map_or("Project size".into(), |[w, h]| format!("{w}×{h}"));
                         egui::ComboBox::from_id_salt("replay-size").selected_text(size_label).show_ui(ui, |ui| {
@@ -94,6 +96,19 @@ pub(crate) fn replay_windows(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                                     for (value, label) in &choices { ui.selectable_value(source, *value, label); }
                                 });
                             if index % 2 == 1 { ui.end_row(); }
+                        }
+                    });
+                    egui::CollapsingHeader::new(tr(ui, "Configure Storage")).show(ui, |ui| {
+                        ui.label(tr(ui, "Leave blank to use the session folder. Changes apply to new recordings."));
+                        for (angle, folder) in setup.camera_folders.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Camera {}", angle + 1));
+                                ui.add(egui::TextEdit::singleline(folder).desired_width(260.0));
+                                if ui.button("Browse…").clicked() {
+                                    s.browse_for = 4 + angle as u8;
+                                    s.browse_req = Some(media::PickKind::Folder);
+                                }
+                            });
                         }
                     });
                     ui.separator();

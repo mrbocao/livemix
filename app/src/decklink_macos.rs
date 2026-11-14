@@ -135,7 +135,7 @@ pub fn display_modes(index: usize, playback: bool) -> Vec<Mode> {
 fn format_code(mode: u32) -> String { String::from_utf8_lossy(&mode.to_be_bytes()).trim_end().to_owned() }
 
 #[derive(Clone, Copy)]
-pub struct CaptureConfig { pub device: usize, pub port: u32, pub mode: u32 }
+pub struct CaptureConfig { pub device: usize, pub port: u32, pub mode: u32, pub audio_channels: u8 }
 
 pub fn run_capture(shared: Arc<media::Shared>, config: CaptureConfig) {
     if let Err(error) = capture(&shared, config) { shared.set_status(error); }
@@ -155,7 +155,9 @@ fn capture(shared: &media::Shared, config: CaptureConfig) -> Result<(), String> 
             Ok(())
         });
     }
-    cmd.args(["-loglevel", "error", "-f", "decklink", "-channels", "2", "-audio_input", "embedded"]);
+    let channels = match config.audio_channels { 8 => 8, 16 => 16, _ => 2 };
+    let channel_arg = channels.to_string();
+    cmd.args(["-loglevel", "error", "-f", "decklink", "-channels", &channel_arg, "-audio_input", "embedded"]);
     if config.port != 0 {
         let port = match config.port {
             1 => "sdi", 2 => "hdmi", 4 => "optical_sdi", 8 => "component", 16 => "composite", _ => "s_video",
@@ -165,7 +167,7 @@ fn capture(shared: &media::Shared, config: CaptureConfig) -> Result<(), String> 
     if config.mode != 0 { cmd.args(["-format_code", &format_code(config.mode)]); }
     let mut child = cmd.args(["-i", &device.address,
         "-map", "0:v:0", "-threads:v", "1", "-c:v", "bmp", "-pix_fmt", "bgra", "-f", "image2pipe", "pipe:1",
-        "-map", "0:a:0", "-c:a", "pcm_s16le", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:3"])
+        "-map", "0:a:0", "-c:a", "pcm_s16le", "-ac", &channel_arg, "-ar", "48000", "-f", "s16le", "pipe:3"])
         .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
         .map_err(|e| format!("Could not start DeckLink capture: {e}"))?;
     drop(audio_write);
@@ -179,10 +181,13 @@ fn capture(shared: &media::Shared, config: CaptureConfig) -> Result<(), String> 
         });
         scope.spawn(move || {
             let mut audio = BufReader::new(audio_read);
-            let mut bytes = [0u8; 480 * 4];
+            let mut bytes = vec![0u8; 480 * channels * 2];
+            let mut samples = Vec::with_capacity(480 * channels);
             while audio.read_exact(&mut bytes).is_ok() {
-                let samples: Vec<_> = audio::pcm(&bytes).collect();
-                shared.audio.lock().unwrap().capture(&samples);
+                samples.clear();
+                samples.extend(bytes.chunks_exact(2).map(|sample| i16::from_le_bytes([sample[0], sample[1]])));
+                shared.audio_channels.store(channels as u64, Relaxed);
+                shared.audio.lock().unwrap().capture_interleaved(&samples, channels, shared.direct_audio.load(Relaxed));
             }
         });
         while !shared.stop.load(Relaxed) {
@@ -204,6 +209,8 @@ fn stop_child(child: &mut Child) {
 pub struct OutputConfig {
     pub device: usize,
     pub key_fill: bool,
+    pub ten_bit: bool,
+    pub audio_channels: u8,
     pub port: u32,
     pub mode: u32,
     pub size: (u32, u32),
@@ -211,7 +218,7 @@ pub struct OutputConfig {
     pub interlaced: bool,
 }
 
-struct OutputFrame { pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: audio::Packet }
+struct OutputFrame { pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: Arc<[i16]> }
 
 #[derive(Default)]
 struct Playback {
@@ -242,7 +249,7 @@ impl OutputSink {
         Self { tx, state }
     }
 
-    pub fn submit(&self, pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: audio::Packet) {
+    pub fn submit(&self, pixels: Arc<Vec<u8>>, w: usize, h: usize, audio: Arc<[i16]>) {
         if !self.state.stop.load(Relaxed) { let _ = self.tx.try_send(OutputFrame { pixels, w, h, audio }); }
     }
 
@@ -283,12 +290,14 @@ fn output(state: &Playback, config: OutputConfig, rx: mpsc::Receiver<OutputFrame
         return Ok(());
     }
     let (n, d) = media::rate_fraction(config.fps);
+    let channels = config.audio_channels.to_string();
     let mut cmd = command();
     cmd.args(["-loglevel", "error", "-probesize", "32", "-analyzeduration", "1", "-f", "matroska", "-i", "pipe:0",
         "-vf", &format!("fps={}/{},scale={}:{}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
             mode.n, mode.d, mode.w, mode.h, mode.w, mode.h),
-        "-field_order", mode.fields, "-pix_fmt", "uyvy422", "-c:v", "rawvideo", "-c:a", "pcm_s16le",
-        "-ar", "48000", "-ac", "2", "-f", "decklink", &device.address]);
+        "-field_order", mode.fields, "-pix_fmt", if config.ten_bit { "yuv422p10le" } else { "uyvy422" },
+        "-c:v", if config.ten_bit { "v210" } else { "rawvideo" }, "-c:a", "pcm_s16le",
+        "-ar", "48000", "-ac", &channels, "-f", "decklink", &device.address]);
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         .map_err(|e| format!("Could not start DeckLink output: {e}"))?;
     let input = child.stdin.take().unwrap();
@@ -296,11 +305,12 @@ fn output(state: &Playback, config: OutputConfig, rx: mpsc::Receiver<OutputFrame
     if state.stop.load(Relaxed) { stop_child(&mut child); return Ok(()); }
     *slot = Some(child);
     drop(slot);
-    let mut pipe = audio::AvPipe::new(input, config.size.0, config.size.1, n, d).map_err(|e| e.to_string())?;
+    let mut pipe = audio::AvPipe::new_with_channels(input, config.size.0, config.size.1, n, d,
+        usize::from(config.audio_channels)).map_err(|e| e.to_string())?;
     while !state.stop.load(Relaxed) {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(frame) if (frame.w as u32, frame.h as u32) == config.size => {
-                pipe.frame(&frame.pixels, &frame.audio).map_err(|_| "DeckLink output stopped. Check the driver, profile, port and display mode.")?;
+                pipe.frame_interleaved(&frame.pixels, &frame.audio).map_err(|_| "DeckLink output stopped. Check the driver, profile, port and display mode.")?;
                 state.frames.fetch_add(1, Relaxed);
             }
             Ok(_) => {}

@@ -270,8 +270,8 @@ pub(crate) fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, 
     let show_numbers = s.cfg.input_numbers;
     let close_confirm = s.cfg.input_close_confirm;
     let Some(inp) = s.input(id) else { return };
-    let is_out = s.output == Some(id);
-    let is_prev = s.preview == Some(id);
+    let is_out = s.tally_contains(s.output, id);
+    let is_prev = s.tally_contains(s.preview, id);
     let border = if is_out { s.cfg.output_colour } else if is_prev { s.cfg.preview_colour } else { EDGE };
     let title = inp.title.clone();
     let cat = inp.category;
@@ -404,6 +404,24 @@ pub(crate) fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, 
                 ui.close_menu();
             }
             ui.separator();
+            if matches!(s.input(id).map(|input| &input.kind), Some(Kind::Mix { .. })) {
+                let choices: Vec<_> = s.inputs.iter().filter(|input| input.id != id)
+                    .map(|input| (input.id, input.title.clone())).collect();
+                if let Some(input) = s.input_mut(id) {
+                    let title = choices.iter().find(|(id, _)| Some(*id) == input.mix_preview)
+                        .map_or("Select Mix Preview", |(_, title)| title.as_str());
+                    egui::ComboBox::from_id_salt(("mix-preview", id)).selected_text(title).show_ui(ui, |ui| {
+                        for (source, label) in &choices {
+                            ui.selectable_value(&mut input.mix_preview, Some(*source), label);
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Mix Cut").clicked() { s.take_mix(id, false, t); }
+                    if ui.button("Mix Fade").clicked() { s.take_mix(id, true, t); }
+                });
+                ui.separator();
+            }
             ui.label("Category");
             if ui.button(tr(ui, "None")).clicked() {
                 if let Some(i) = s.input_mut(id) {
@@ -484,8 +502,10 @@ pub(crate) fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, 
                     s.input_preview = Some(id);
                     ui.ctx().send_viewport_cmd_to(egui::ViewportId::from_hash_of("livemix-input-preview"), egui::ViewportCommand::Focus);
                 }
-                if tile_btn(ui, "GO", 34.0 * scale, false, true, BTN).on_hover_text("Transition this Input directly to Output using the Quick Play effect").clicked() {
-                    s.quick_play_input(id);
+                let action = s.input(id).map(|input| input.go_action.as_str()).unwrap_or_default();
+                let hint = if action.trim().is_empty() { "Quick Play" } else { action };
+                if tile_btn(ui, "GO", 34.0 * scale, false, true, BTN).on_hover_text(hint).clicked() {
+                    s.go_input(id, t);
                 }
                 if tile_btn(ui, "Cut", BW_CUT * scale, false, true, BTN).on_hover_text("Switch this Input directly to Output").clicked() {
                     s.cut_direct(id);
@@ -813,6 +833,7 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
             Kind::Presentation { .. } => "PowerPoint",
             Kind::Web { .. } => "Web Browser",
             Kind::VirtualSet { .. } => "Virtual Set",
+            Kind::Mix { .. } => "Mix",
             Kind::VideoDelay { .. } => "Video Delay",
             Kind::Telestrator { .. } => "Telestrator",
             Kind::Teleprompter(_) => "Teleprompter",
@@ -873,6 +894,9 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
             slide_buttons(ui, inp);
             ui.end_row();
         }
+        if let Kind::Mix { tally } = &mut inp.kind {
+            setting_toggle(ui, tally, "Tally Passthrough");
+        }
         if let Kind::VirtualSet { camera, previous, changed_at } = &mut inp.kind {
             ui.label("Camera");
             ui.horizontal(|ui| {
@@ -899,6 +923,14 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
             ui.end_row();
             ui.label(tr(ui, "Video format"));
             decklink_mode_picker(ui, "input-decklink-mode", device, false, &mut inp.decklink_mode);
+            ui.end_row();
+            ui.label("Embedded audio channels");
+            egui::ComboBox::from_id_salt("decklink-capture-audio-channels")
+                .selected_text(inp.decklink_audio_channels.to_string()).show_ui(ui, |ui| {
+                    for channels in [2, 8, 16] {
+                        ui.selectable_value(&mut inp.decklink_audio_channels, channels, channels.to_string());
+                    }
+                });
             ui.end_row();
             ui.label("Detected mode");
             ui.label(inp.cam_current.as_ref().map(|mode| mode.label()).unwrap_or_else(|| inp.status.clone()));
@@ -1087,6 +1119,12 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
                     ui.selectable_value(&mut inp.click_action, value as u8, *name);
                 }
             });
+    });
+    ui.horizontal(|ui| {
+        ui.label(tr(ui, "GO action"));
+        ui.add(egui::TextEdit::singleline(&mut inp.go_action).char_limit(256)
+            .hint_text("Quick Play").desired_width(210.0))
+            .on_hover_text("Use a shortcut command, such as Preview @input or FadeDirect @input 500.");
     });
 }
 
@@ -1620,16 +1658,23 @@ pub(crate) fn input_audio_general(ui: &mut egui::Ui, inp: &mut Input) {
             .color(TEXT_DIM));
         return;
     }
-    let levels = if inp.audio_on { inp.level } else { [0.0; 2] };
+    let post = inp.pre_fader_level.map(|level| level * if inp.audio_on { inp.volume / 100.0 } else { 0.0 });
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(46.0, 152.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.label(RichText::new("Volume").size(10.0).color(TEXT_DIM));
             ui.spacing_mut().slider_width = 112.0;
             ui.add(egui::Slider::new(&mut inp.volume, 0.0..=100.0).vertical().show_value(true));
         });
-        for level in levels {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 136.0), Sense::hover());
-            render::meter(ui.painter(), rect, meter_fraction(level));
+        for (label, levels) in [("Pre", inp.pre_fader_level), ("Post", post)] {
+            ui.vertical(|ui| {
+                ui.label(tr(ui, label));
+                ui.horizontal(|ui| {
+                    for level in levels {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 136.0), Sense::hover());
+                        render::meter(ui.painter(), rect, meter_fraction(level));
+                    }
+                });
+            });
         }
         let (scale_rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 136.0), Sense::hover());
         {
@@ -1667,16 +1712,16 @@ pub(crate) fn input_audio_general(ui: &mut egui::Ui, inp: &mut Input) {
             });
             let fx = &mut inp.audio_effects;
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Channel").size(10.0).color(TEXT_DIM));
-                ui.selectable_value(&mut fx.channel, 0, tr(ui, "Stereo"));
-                ui.selectable_value(&mut fx.channel, 1, "Left");
-                ui.selectable_value(&mut fx.channel, 2, "Right");
-            });
-            ui.horizontal(|ui| {
                 ui.label("Gain");
                 ui.add(egui::DragValue::new(&mut fx.gain_db).range(-24.0..=24.0).speed(0.2).suffix(" dB"));
+                if ui.small_button(tr(ui, "Reset")).clicked() { fx.gain_db = 0.0; }
                 ui.label("Delay");
                 ui.add(egui::DragValue::new(&mut fx.delay_ms).range(0.0..=1000.0).speed(1.0).suffix(" ms"));
+            });
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Right trim"));
+                ui.add(egui::DragValue::new(&mut fx.gain_right_db).range(-24.0..=24.0).speed(0.2).suffix(" dB"));
+                if ui.small_button(tr(ui, "Reset")).clicked() { fx.gain_right_db = 0.0; }
             });
             ui.horizontal(|ui| {
                 ui.label("Pan");
@@ -1690,6 +1735,9 @@ pub(crate) fn input_audio_general(ui: &mut egui::Ui, inp: &mut Input) {
                 }
             });
             setting_toggle(ui, &mut inp.solo_pfl, "Solo PFL (pre-fader)");
+            setting_toggle(ui, &mut fx.meter_pre_fader, "Meters Pre-Fader");
+            let mut visible = !fx.hide_in_mixer;
+            if setting_toggle(ui, &mut visible, "Visible in Mixer").changed() { fx.hide_in_mixer = !visible; }
         });
     });
 }
@@ -1698,15 +1746,16 @@ pub(crate) fn input_audio(ui: &mut egui::Ui, input: &mut Input, page_height: f32
     let id = ui.make_persistent_id(("audio-settings-page", input.id));
     let mut page = ui.data(|data| data.get_temp::<usize>(id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        for (index, name) in ["General", "EQ", "Compressor", "Noise Gate"].into_iter().enumerate() {
-            ui.selectable_value(&mut page, index, name);
+        for (index, name) in ["General", "EQ", "Compressor", "Noise Gate", "Channel Mixer", "Channel Matrix", "Bus Mixer", "Dynamics"].into_iter().enumerate() {
+            ui.selectable_value(&mut page, index, tr(ui, name));
         }
     });
     ui.data_mut(|data| data.insert_temp(id, page));
     ui.separator();
-    egui::ScrollArea::vertical().id_salt(page).max_height(page_height).show(ui, |ui| match page {
+    egui::ScrollArea::vertical().id_salt(page).auto_shrink([false, true]).max_height(page_height).show(ui, |ui| match page {
         1 => input_audio_eq(ui, input),
         2 => {
+            setting_toggle(ui, &mut input.audio_effects.compressor_enabled, "Enable Compressor");
             dynamics_graph(ui, &mut input.audio_effects);
             ui.add(egui::Slider::new(&mut input.audio_effects.comp_threshold, -60.0..=0.0).text("Threshold").suffix(" dBFS"));
             ui.add(egui::Slider::new(&mut input.audio_effects.comp_ratio, 1.0..=20.0).text("Ratio").suffix(":1"));
@@ -1717,16 +1766,156 @@ pub(crate) fn input_audio(ui: &mut egui::Ui, input: &mut Input, page_height: f32
             }
         }
         3 => {
+            setting_toggle(ui, &mut input.audio_effects.gate_enabled, "Enable Noise Gate");
             ui.add(egui::Slider::new(&mut input.audio_effects.gate_threshold, -90.0..=0.0).text("Threshold").suffix(" dBFS"));
             if ui.button(tr(ui, "Reset")).clicked() {
                 input.audio_effects.gate_threshold = audio::Effects::default().gate_threshold;
             }
+        }
+        4 => {
+            for (index, label) in ["Stereo", "Left to both", "Right to both", "Swap Left / Right", "Mono mix"].into_iter().enumerate() {
+                ui.radio_value(&mut input.audio_effects.channel, index as u8, tr(ui, label));
+            }
+        }
+        5 => {
+            let fx = &mut input.audio_effects;
+            let route_id = ui.id().with(("matrix-destination", input.id));
+            let mut route = ui.data(|data| data.get_temp::<usize>(route_id)).unwrap_or(0);
+            egui::ComboBox::from_id_salt("matrix-destination").selected_text(if route == 0 {
+                tr(ui, "Shared stereo mix")
+            } else { tr(ui, audio::DIRECT_ROUTES[route - 1]) }).show_ui(ui, |ui| {
+                ui.selectable_value(&mut route, 0, tr(ui, "Shared stereo mix"));
+                for (index, name) in audio::DIRECT_ROUTES.into_iter().enumerate() {
+                    ui.selectable_value(&mut route, index + 1, tr(ui, name));
+                }
+            });
+            ui.data_mut(|data| data.insert_temp(route_id, route));
+            if route > 0 {
+                let matrix = &mut fx.direct_routes[route - 1];
+                let mut enabled = matrix.is_some();
+                if setting_toggle(ui, &mut enabled, "Direct channel routing").changed() {
+                    *matrix = enabled.then(|| {
+                        let mut unity = [[0.0; 16]; 2];
+                        unity[0][0] = 1.0;
+                        unity[1][1] = 1.0;
+                        unity
+                    });
+                }
+                ui.label(tr(ui, "Direct routes use capture channels before input effects. Enable the corresponding bus in Bus Mixer."));
+                if let Some(matrix) = matrix {
+                    egui::Grid::new("direct-matrix").spacing([16.0, 5.0]).show(ui, |ui| {
+                        for label in ["Input", "Left", "Right"] { ui.strong(tr(ui, label)); }
+                        ui.end_row();
+                        for index in 0..usize::from(input.audio_channels.clamp(8, 16)) {
+                            ui.label((index + 1).to_string());
+                            for row in &mut *matrix {
+                                ui.add(egui::DragValue::new(&mut row[index]).range(-2.0..=2.0).speed(0.01)
+                                    .fixed_decimals(2).suffix(" ×"));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
+                return;
+            }
+            let key = ui.id().with("matrix-preset-name");
+            let mut name = ui.data(|data| data.get_temp::<String>(key)).unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(tr(ui, "Preset"));
+                egui::ComboBox::from_id_salt("matrix-preset").selected_text(if name.is_empty() { "—" } else { &name }).show_ui(ui, |ui| {
+                    for (label, matrix) in &fx.matrix_presets {
+                        if ui.selectable_label(name == *label, label).clicked() {
+                            name.clone_from(label);
+                            fx.matrix = *matrix;
+                        }
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut name).desired_width(115.0).char_limit(48));
+                let label = name.trim();
+                let existing = fx.matrix_presets.iter().position(|(name, _)| name == label);
+                if ui.add_enabled(!label.is_empty() && (existing.is_some() || fx.matrix_presets.len() < 32),
+                    egui::Button::new(tr(ui, "Save preset"))).clicked()
+                {
+                    if let Some(index) = existing { fx.matrix_presets[index].1 = fx.matrix; }
+                    else { fx.matrix_presets.push((label.to_owned(), fx.matrix)); }
+                }
+                if let Some(index) = existing {
+                    if ui.button(tr(ui, "Delete")).clicked() {
+                        fx.matrix_presets.remove(index);
+                        name.clear();
+                    }
+                }
+            });
+            ui.data_mut(|data| data.insert_temp(key, name));
+            let matrix = &mut fx.matrix;
+            egui::Grid::new("input-channel-matrix").spacing([16.0, 8.0]).show(ui, |ui| {
+                ui.strong(tr(ui, "Output"));
+                ui.strong(tr(ui, "Input Left"));
+                ui.strong(tr(ui, "Input Right"));
+                ui.end_row();
+                for (row, name) in matrix.iter_mut().zip(["Left", "Right"]) {
+                    ui.label(tr(ui, name));
+                    for gain in row {
+                        ui.add(egui::DragValue::new(gain).range(-2.0..=2.0).speed(0.01).fixed_decimals(2).suffix(" ×"));
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr(ui, "Reset")).clicked() { *matrix = audio::Effects::default().matrix; }
+                if ui.button(tr(ui, "Swap Left / Right")).clicked() { *matrix = [[0.0, 1.0], [1.0, 0.0]]; }
+                if ui.button(tr(ui, "Mono mix")).clicked() { *matrix = [[0.5, 0.5]; 2]; }
+            });
+            if input.audio_channels > 2 || fx.extra_channels != [[0.0; 6]; 2] {
+                ui.separator();
+                ui.label(tr(ui, "Additional capture channels"));
+                egui::Grid::new("extra-audio-channels").spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.strong(tr(ui, "Input"));
+                    ui.strong(tr(ui, "Left"));
+                    ui.strong(tr(ui, "Right"));
+                    ui.end_row();
+                    for index in 0..6 {
+                        ui.label(format!("{}", index + 3));
+                        for output in &mut fx.extra_channels {
+                            ui.add(egui::DragValue::new(&mut output[index]).range(-2.0..=2.0)
+                                .speed(0.01).fixed_decimals(2).suffix(" ×"));
+                        }
+                        ui.end_row();
+                    }
+                });
+                if ui.button(tr(ui, "Reset additional channels")).clicked() { fx.extra_channels = [[0.0; 6]; 2]; }
+            }
+        }
+        6 => {
+            for (name, enabled) in [("Master", &mut input.bus_m), ("Bus A", &mut input.bus_a), ("Bus B", &mut input.bus_b)] {
+                setting_toggle(ui, enabled, name);
+            }
+            for (name, enabled) in AUDIO_BUS_NAMES[3..].iter().zip(&mut input.extra_buses) {
+                setting_toggle(ui, enabled, format!("Bus {name}"));
+            }
+        }
+        7 => {
+            let fx = &mut input.audio_effects;
+            setting_toggle(ui, &mut fx.agc, "Automatic Gain Control");
+            setting_toggle(ui, &mut fx.denoise, "Noise Suppression");
+            setting_toggle(ui, &mut fx.dereverb, "Reverb Tail Reduction")
+                .on_hover_text("Attenuate decaying room tails between sounds.");
+            setting_toggle(ui, &mut fx.dynamics, "Enable Dynamics");
+            ui.add_enabled_ui(fx.dynamics, |ui| {
+                ui.add(egui::Slider::new(&mut fx.dynamics_low, -80.0..=(fx.dynamics_high - 1.0).min(-12.0))
+                    .text(tr(ui, "Low Threshold")).suffix(" dBFS"));
+                ui.add(egui::Slider::new(&mut fx.dynamics_high, (fx.dynamics_low + 1.0)..=0.0)
+                    .text(tr(ui, "High Threshold")).suffix(" dBFS"));
+                ui.add(egui::Slider::new(&mut fx.dynamics_attack_ms, 1.0..=200.0)
+                    .text(tr(ui, "Attack")).suffix(" ms"));
+            });
         }
         _ => input_audio_general(ui, input),
     });
 }
 
 pub(crate) fn input_audio_eq(ui: &mut egui::Ui, inp: &mut Input) {
+    setting_toggle(ui, &mut inp.audio_effects.eq_enabled, "Enable EQ");
     eq_graph(ui, &mut inp.audio_effects.eq);
     egui::Grid::new(("eq-bands", inp.id)).num_columns(4).spacing([8.0, 2.0]).show(ui, |ui| {
         for (index, frequency) in dsp::EQ_BANDS.into_iter().enumerate() {

@@ -29,6 +29,10 @@ impl Default for Destination {
 }
 
 impl Destination {
+    pub fn is_srt(&self) -> bool {
+        self.url.trim().starts_with("srt://")
+    }
+
     pub fn audio_rate(&self) -> u32 {
         let host = self.url.split_once("://").map(|(_, rest)| rest.split(['/', ':']).next().unwrap_or(""));
         if self.provider == 1 || host.is_some_and(|host| host == "youtube.com" || host.ends_with(".youtube.com")) {
@@ -94,15 +98,34 @@ fn redact(line: &str, secrets: &[String]) -> String {
 
 pub(crate) fn publish_url(dest: &Destination) -> Result<String, String> {
     let url = dest.url.trim();
-    let (_, host) = url.split_once("://").filter(|(scheme, _)| matches!(*scheme, "rtmp" | "rtmps"))
-        .ok_or("Enter an rtmp:// or rtmps:// server URL")?;
+    let (_, host) = url.split_once("://").filter(|(scheme, _)| matches!(*scheme, "rtmp" | "rtmps" | "srt"))
+        .ok_or("Enter an rtmp://, rtmps:// or srt:// server URL")?;
     let key = dest.key.trim();
-    if host.split('/').next().unwrap_or("").is_empty()
-        || url.chars().chain(key.chars()).any(char::is_whitespace)
+    let endpoint = host.split(['/', '?']).next().unwrap_or("");
+    if endpoint.is_empty() || url.chars().any(char::is_whitespace)
+        || (!dest.is_srt() && key.chars().any(char::is_whitespace))
     {
-        return Err("The RTMP URL or stream key is invalid".into());
+        return Err("The destination URL or stream key is invalid".into());
+    }
+    if dest.is_srt() {
+        if endpoint.rsplit_once(':').is_none_or(|(address, port)| {
+            address.is_empty() || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+        }) { return Err("Enter an SRT host and port".into()); }
+        return Ok(url.into());
     }
     Ok(if key.is_empty() { url.into() } else { format!("{}/{}", url.trim_end_matches('/'), key) })
+}
+
+#[test]
+fn srt_stream_preserves_provider_url_options() {
+    let mut dest = Destination {
+        url: "srt://[::1]:9000?streamid=publish:test&latency=120000".into(),
+        key: "unused RTMP key".into(),
+        ..Destination::default()
+    };
+    assert_eq!(publish_url(&dest).unwrap(), dest.url);
+    dest.url = "srt://example.test".into();
+    assert!(publish_url(&dest).is_err());
 }
 
 fn ffmpeg_path() -> PathBuf {
@@ -182,7 +205,13 @@ impl Output {
                 .map(|(_, suffix)| suffix.to_owned()).unwrap_or_default();
             [dest.key.trim().to_owned(), embedded]
         }).collect();
-        let (muxer, url) = if urls.len() == 1 {
+        if destinations.iter().any(|destination| destination.is_srt() != dest.is_srt()) {
+            return Err("Streaming groups must use the same transport".into());
+        }
+        let (muxer, url) = if dest.is_srt() {
+            if urls.len() != 1 { return Err("Each SRT stream uses its own encoder".into()); }
+            ("mpegts", urls.into_iter().next().unwrap())
+        } else if urls.len() == 1 {
             ("flv", urls.into_iter().next().unwrap())
         } else {
             let slaves = urls.iter().map(|url| {

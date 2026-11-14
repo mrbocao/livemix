@@ -11,6 +11,8 @@ pub struct Frame {
 
 #[derive(Default)]
 pub struct Shared {
+    pub audio_channels: AtomicU64,
+    pub direct_audio: AtomicBool,
     #[cfg(windows)]
     pub(crate) gpu_frame: Mutex<Option<crate::dx_interop::Picture>>,
     #[cfg(windows)]

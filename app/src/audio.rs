@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 pub const RATE: u32 = 48_000;
 pub type Stereo = [i16; 2];
 pub type Packet = Arc<[Stereo]>;
+pub type ChannelMatrix = [[f32; 16]; 2];
+pub const DIRECT_ROUTES: [&str; 4] = ["Master", "A", "B", "Headphones"];
 const HISTORY: usize = RATE as usize * 2;
 const BLOCK: usize = 480;
 
@@ -23,8 +25,28 @@ pub struct AudioClock {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Effects {
     pub channel: u8,
+    /// Matrix rows are output Left/Right and columns are input Left/Right.
+    pub matrix: [[f32; 2]; 2],
+    pub extra_channels: [[f32; 6]; 2],
+    #[serde(deserialize_with = "read_direct_routes")]
+    pub direct_routes: [Option<ChannelMatrix>; 4],
+    pub agc: bool,
+    pub denoise: bool,
+    pub dereverb: bool,
+    pub dynamics: bool,
+    pub dynamics_low: f32,
+    pub dynamics_high: f32,
+    pub dynamics_attack_ms: f32,
+    pub matrix_presets: Vec<(String, [[f32; 2]; 2])>,
+    pub eq_enabled: bool,
+    pub gate_enabled: bool,
+    pub compressor_enabled: bool,
+    pub hide_in_mixer: bool,
+    pub meter_pre_fader: bool,
+    pub gain_right_db: f32,
     pub gate_threshold: f32,
     pub comp_threshold: f32,
     pub comp_ratio: f32,
@@ -36,21 +58,58 @@ pub struct Effects {
     pub pan: f32,
 }
 
+fn read_direct_routes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<[Option<ChannelMatrix>; 4], D::Error> {
+    use serde::Deserialize;
+    let saved = Vec::<Option<[Vec<f32>; 2]>>::deserialize(deserializer)?;
+    let mut routes = [None; 4];
+    for (slot, route) in routes.iter_mut().zip(saved) {
+        *slot = route.map(|rows| rows.map(|row| {
+            let mut gains = [0.0; 16];
+            for (gain, saved) in gains.iter_mut().zip(row) { *gain = saved; }
+            gains
+        }));
+    }
+    Ok(routes)
+}
+
 impl Default for Effects {
     fn default() -> Self {
         Self { channel: 0, gate_threshold: -90.0, comp_threshold: -18.0, comp_ratio: 1.0,
+            matrix: [[1.0, 0.0], [0.0, 1.0]], matrix_presets: Vec::new(),
+            extra_channels: [[0.0; 6]; 2], direct_routes: [None; 4], agc: false, denoise: false, dereverb: false, dynamics: false,
+            dynamics_low: -45.0, dynamics_high: -12.0, dynamics_attack_ms: 10.0,
+            eq_enabled: true, gate_enabled: true, compressor_enabled: true,
+            hide_in_mixer: false, meter_pre_fader: false, gain_right_db: 0.0,
             eq: [0.0; 10], gain_db: 0.0, delay_ms: 0.0, pan: 0.0 }
     }
 }
 
 impl Effects {
     pub fn normalized(mut self) -> Self {
-        self.channel = self.channel.min(2);
+        self.channel = self.channel.min(4);
+        for gain in self.extra_channels.iter_mut().flatten() {
+            *gain = if gain.is_finite() { gain.clamp(-2.0, 2.0) } else { 0.0 };
+        }
+        for gain in self.direct_routes.iter_mut().flatten().flatten().flatten() {
+            *gain = if gain.is_finite() { gain.clamp(-2.0, 2.0) } else { 0.0 };
+        }
+        self.dynamics_low = self.dynamics_low.clamp(-80.0, -12.0);
+        self.dynamics_high = self.dynamics_high.clamp(self.dynamics_low + 1.0, 0.0);
+        self.dynamics_attack_ms = self.dynamics_attack_ms.clamp(1.0, 200.0);
+        self.matrix_presets.truncate(32);
+        for matrix in std::iter::once(&mut self.matrix).chain(self.matrix_presets.iter_mut().map(|(_, matrix)| matrix)) {
+            for (row, defaults) in matrix.iter_mut().zip(Self::default().matrix) {
+                for (gain, default) in row.iter_mut().zip(defaults) {
+                    *gain = if gain.is_finite() { gain.clamp(-2.0, 2.0) } else { default };
+                }
+            }
+        }
         self.gate_threshold = self.gate_threshold.clamp(-90.0, 0.0);
         self.comp_threshold = self.comp_threshold.clamp(-60.0, 0.0);
         self.comp_ratio = self.comp_ratio.clamp(1.0, 20.0);
         self.eq = self.eq.map(|gain| gain.clamp(-18.0, 18.0));
         self.gain_db = self.gain_db.clamp(-24.0, 24.0);
+        self.gain_right_db = self.gain_right_db.clamp(-24.0, 24.0);
         self.delay_ms = self.delay_ms.clamp(0.0, 1000.0);
         self.pan = self.pan.clamp(-1.0, 1.0);
         self
@@ -69,6 +128,8 @@ pub struct Buffer {
     file_epoch: u64,
     live_resyncs: u64,
     extra_history: usize,
+    /// Original channel frames aligned with the tail of the processed stereo buffer.
+    raw: VecDeque<[i16; 16]>,
 }
 
 impl Buffer {
@@ -77,14 +138,39 @@ impl Buffer {
     }
 
     pub fn set_effects(&mut self, effects: &Effects) {
+        let mut processing = effects.clone();
+        processing.hide_in_mixer = false;
+        processing.meter_pre_fader = false;
+        processing.matrix_presets.clear();
+        processing.direct_routes = [None; 4];
+        let effects = &processing;
         if self.effects != *effects {
+            // Other effects keep their existing reset semantics. Compressor edits
+            // retain the envelope and current gain so a live tweak cannot reset them.
+            let mut previous = self.effects.clone();
+            previous.comp_threshold = effects.comp_threshold;
+            previous.comp_ratio = effects.comp_ratio;
+            previous.compressor_enabled = effects.compressor_enabled;
+            previous.agc = effects.agc;
+            previous.dereverb = effects.dereverb;
+            previous.dynamics = effects.dynamics;
+            previous.dynamics_low = effects.dynamics_low;
+            previous.dynamics_high = effects.dynamics_high;
+            previous.dynamics_attack_ms = effects.dynamics_attack_ms;
+            if previous != *effects {
+                self.chain = Default::default();
+            }
             self.effects = effects.clone();
-            self.chain = Default::default();
         }
     }
 
     fn append(&mut self, samples: impl IntoIterator<Item = Stereo>) {
-        if self.effects == Effects::default() {
+        self.raw.clear();
+        self.append_stereo(samples);
+    }
+
+    fn append_stereo(&mut self, samples: impl IntoIterator<Item = Stereo>) {
+        if self.effects == Effects::default() && !self.chain.settling() {
             self.data.extend(samples);
         } else {
             self.scratch.clear();
@@ -99,10 +185,22 @@ impl Buffer {
         self.first += excess as u64;
     }
 
+    fn append_channels(&mut self, samples: &[[i16; 16]], keep_raw: bool) {
+        let extra = self.effects.extra_channels;
+        self.append_stereo(samples.iter().map(|frame| fold_extra(*frame, extra)));
+        if keep_raw {
+            self.raw.extend(samples.iter().copied());
+            self.raw.drain(..self.raw.len().saturating_sub(self.data.len()));
+        } else {
+            self.raw.clear();
+        }
+    }
+
     pub fn retain_for_delay(&mut self, seconds: f32) {
         self.extra_history = (seconds.clamp(0.0, 120.0) * RATE as f32) as usize;
         let excess = self.data.len().saturating_sub(HISTORY + self.extra_history);
         self.data.drain(..excess);
+        self.raw.drain(..self.raw.len().saturating_sub(self.data.len()));
         self.first += excess as u64;
     }
 
@@ -110,9 +208,24 @@ impl Buffer {
         self.capture_at(samples, Instant::now());
     }
 
+    pub fn capture_interleaved(&mut self, samples: &[i16], channels: usize, direct: bool) {
+        if channels == 0 { return; }
+        let frames: Vec<_> = samples.chunks_exact(channels).map(|samples| {
+            let mut frame = [0; 16];
+            for (slot, sample) in frame.iter_mut().zip(samples) { *slot = *sample; }
+            if channels == 1 { frame[1] = frame[0]; }
+            frame
+        }).collect();
+        self.capture_live(frames.len(), Instant::now(), |buffer| buffer.append_channels(&frames, direct));
+    }
+
     fn capture_at(&mut self, samples: &[Stereo], now: Instant) {
-        if samples.is_empty() { return; }
-        let duration = sample_duration(samples.len());
+        self.capture_live(samples.len(), now, |buffer| buffer.append(samples.iter().copied()));
+    }
+
+    fn capture_live(&mut self, len: usize, now: Instant, append: impl FnOnce(&mut Self)) {
+        if len == 0 { return; }
+        let duration = sample_duration(len);
         let end = self.live_end.and_then(|previous| {
             let predicted = previous + duration;
             let error = signed_frames(now, predicted);
@@ -128,14 +241,15 @@ impl Buffer {
                 self.live_resyncs += 1;
             }
             self.data.clear();
+            self.raw.clear();
         }
         self.live_end = Some(end.unwrap_or(now));
-        self.live_latency = (samples.len() as i64).clamp(1440, 5760);
-        self.append(samples.iter().copied());
+        self.live_latency = (len as i64).clamp(1440, 5760);
+        append(self);
     }
 
     fn read(&self, shared: &crate::media::Shared, at: Instant, frames: usize, file: bool, delay: f32,
-        mut add: impl FnMut(usize, Stereo))
+        matrix: Option<&ChannelMatrix>, mut add: impl FnMut(usize, Stereo))
     {
         let index = if file {
             // Waiting for the clock is inaudible; skipping it silenced the whole block.
@@ -156,10 +270,35 @@ impl Buffer {
         let end = (index + frames as i64).min(self.data.len() as i64);
         if first >= end { return; }
         let offset = (first - index) as usize;
+        if let Some(matrix) = matrix {
+            let raw_start = self.data.len().saturating_sub(self.raw.len());
+            for i in (first as usize).max(raw_start)..end as usize {
+                let frame = self.raw[i - raw_start];
+                let output = matrix.map(|row| row.into_iter().zip(frame)
+                    .map(|(gain, sample)| gain * f32::from(sample)).sum::<f32>().round() as i16);
+                add(offset + i - first as usize, output);
+            }
+            return;
+        }
         for (n, sample) in self.data.range(first as usize..end as usize).enumerate() {
             add(offset + n, *sample);
         }
     }
+}
+
+#[test]
+fn compressor_bypass_does_not_jump_to_unity_at_a_block_boundary() {
+    let mut buffer = Buffer::default();
+    let dry = [24_000; 2];
+    buffer.set_effects(&Effects { comp_ratio: 8.0, comp_threshold: -32.0, ..Effects::default() });
+    buffer.append(std::iter::repeat_n(dry, 4096));
+    let before = buffer.data.back().unwrap()[0];
+    assert!(before < 12_000);
+    buffer.set_effects(&Effects::default());
+    buffer.append([dry]);
+    assert!((buffer.data.back().unwrap()[0] - before).abs() < 150);
+    buffer.append(std::iter::repeat_n(dry, 4096));
+    assert!((buffer.data.back().unwrap()[0] - dry[0]).abs() < 5);
 }
 
 fn signed_frames(a: Instant, b: Instant) -> i64 {
@@ -273,22 +412,28 @@ pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool,
 pub fn mix_delayed<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32, f32)>,
     at: Instant, frames: usize) -> Packet
 {
+    mix_routed(inputs.into_iter().map(|(source, file, gain, delay)| (source, file, gain, delay, None)), at, frames)
+}
+
+pub fn mix_routed<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32, f32, Option<&'a ChannelMatrix>)>,
+    at: Instant, frames: usize) -> Packet
+{
     let mut mixed = vec![[0.0f32; 2]; frames];
     mix_into(inputs, at, &mut mixed);
     mixed.into_iter().map(|[l, r]| [l.round() as i16, r.round() as i16]).collect()
 }
 
-fn mix_into<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32, f32)>,
+fn mix_into<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32, f32, Option<&'a ChannelMatrix>)>,
     at: Instant, mixed: &mut [[f32; 2]])
 {
     mixed.fill([0.0; 2]);
     let frames = mixed.len();
-    for (source, file, gain, delay) in inputs {
+    for (source, file, gain, delay, matrix) in inputs {
         if gain == 0.0 { continue; }
         // Writers hold the buffer for microseconds. Waiting is inaudible; skipping the
         // input (try_lock) silenced a whole block whenever the reader was appending.
         if let Ok(buffer) = source.audio.lock() {
-            buffer.read(source, at, frames, file, delay, |i, sample| {
+            buffer.read(source, at, frames, file, delay, matrix, |i, sample| {
                 mixed[i][0] += f32::from(sample[0]) * gain;
                 mixed[i][1] += f32::from(sample[1]) * gain;
             });
@@ -337,7 +482,7 @@ pub fn delayed_peaks((shared, file, gain, delay): (&crate::media::Shared, bool, 
     let mut peaks = [0u16; 2];
     if gain > 0.0 {
         if let Ok(buffer) = shared.audio.try_lock() {
-            buffer.read(shared, at, 960, file, delay, |_, [left, right]| {
+            buffer.read(shared, at, 960, file, delay, None, |_, [left, right]| {
                 peaks[0] = peaks[0].max(left.unsigned_abs());
                 peaks[1] = peaks[1].max(right.unsigned_abs());
             });
@@ -387,11 +532,11 @@ fn audio_device_identity(device: &cpal::Device) -> Option<(String, String)> {
 
 const NATIVE_RATE: cpal::SampleRate = cpal::SampleRate(RATE);
 
-type CapturedAudio = (Instant, Vec<Stereo>);
+type CapturedAudio = (Instant, Vec<[i16; 16]>);
 
 struct InputQueue {
     ready: std::sync::mpsc::SyncSender<CapturedAudio>,
-    free: std::sync::mpsc::Receiver<Vec<Stereo>>,
+    free: std::sync::mpsc::Receiver<Vec<[i16; 16]>>,
 }
 
 pub fn capture_device(shared: Arc<crate::media::Shared>, id: &str) {
@@ -405,6 +550,7 @@ pub fn capture_device(shared: Arc<crate::media::Shared>, id: &str) {
             ranges.filter(|range| range.channels() == default.channels() && range.sample_format() == default.sample_format())
                 .find_map(|range| range.try_with_sample_rate(NATIVE_RATE))
         }).unwrap_or(default);
+        shared.audio_channels.store(u64::from(config.channels()), Relaxed);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(8);
         let (free_tx, free_rx) = std::sync::mpsc::sync_channel(8);
         for _ in 0..8 {
@@ -423,7 +569,9 @@ pub fn capture_device(shared: Arc<crate::media::Shared>, id: &str) {
         while !shared.stop.load(Relaxed) {
             match ready_rx.recv_timeout(Duration::from_millis(40)) {
                 Ok((at, mut samples)) => {
-                    shared.audio.lock().unwrap().capture_at(&samples, at);
+                    let mut buffer = shared.audio.lock().unwrap();
+                    let direct = shared.direct_audio.load(Relaxed);
+                    buffer.capture_live(samples.len(), at, |buffer| buffer.append_channels(&samples, direct));
                     samples.clear();
                     let _ = free_tx.try_send(samples);
                 }
@@ -452,11 +600,14 @@ where
         let at = Instant::now();
         let Ok(mut samples) = queue.free.try_recv() else { return };
         for frame in data.chunks_exact(channels) {
-            let left = i16::from_sample(frame[0]);
-            let right = i16::from_sample(frame[usize::from(channels > 1)]);
+            let mut samples_by_channel = [0; 16];
+            for (value, sample) in samples_by_channel.iter_mut().zip(frame) {
+                *value = i16::from_sample(*sample);
+            }
+            if channels == 1 { samples_by_channel[1] = samples_by_channel[0]; }
             phase += RATE;
             while phase >= rate {
-                samples.push([left, right]);
+                samples.push(samples_by_channel);
                 phase -= rate;
             }
         }
@@ -464,7 +615,39 @@ where
     }, move |error| errors.set_status(format!("Audio input: {error}")), None).map_err(|e| e.to_string())
 }
 
-type MonitorSource = (Arc<crate::media::Shared>, bool, f32, f32);
+fn fold_extra(frame: [i16; 16], extra: [[f32; 6]; 2]) -> Stereo {
+    if extra == [[0.0; 6]; 2] { return [frame[0], frame[1]]; }
+    std::array::from_fn(|channel| {
+        let sum = extra[channel].iter().zip(&frame[2..])
+            .fold(f32::from(frame[channel]), |sum, (gain, sample)| sum + gain * f32::from(*sample));
+        sum.round() as i16
+    })
+}
+
+#[test]
+fn extra_capture_channels_can_be_routed_to_separate_sides() {
+    let mut extra = [[0.0; 6]; 2];
+    extra[0][0] = 0.5;
+    extra[1][5] = -1.0;
+    assert_eq!(fold_extra([100, 200, 1000, 0, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0], extra), [600, -200]);
+}
+
+#[test]
+fn direct_routes_mix_original_channels_without_the_shared_stereo_fold() {
+    let source = crate::media::Shared::default();
+    let at = Instant::now();
+    let mut buffer = source.audio.lock().unwrap();
+    buffer.live_end = Some(at);
+    buffer.append_channels(&[[10, 20, 300, 400, 0, 0, 0, 800, 0, 0, 0, 0, 0, 0, 0, 0]], true);
+    drop(buffer);
+    let mut matrix = [[0.0; 16]; 2];
+    matrix[0][7] = 1.0;
+    matrix[1][2] = 0.5;
+    assert_eq!(mix_routed([(&source, false, 1.0, 0.0, Some(&matrix))], at, 1)[0], [800, 150]);
+    assert_eq!(mix_delayed([(&source, false, 1.0, 0.0)], at, 1)[0], [10, 20]);
+}
+
+type MonitorSource = (Arc<crate::media::Shared>, bool, f32, f32, Option<ChannelMatrix>);
 
 pub struct Monitor {
     _stream: cpal::Stream,
@@ -527,7 +710,7 @@ where
             sources_snapshot = latest.clone();
         }
         mixed.resize(frames, [0.0; 2]);
-        mix_into(sources_snapshot.iter().map(|(source, file, gain, delay)| (&**source, *file, *gain, *delay)), at, &mut mixed);
+        mix_into(sources_snapshot.iter().map(|(source, file, gain, delay, matrix)| (&**source, *file, *gain, *delay, matrix.as_ref())), at, &mut mixed);
         packet.clear();
         packet.extend(mixed.iter().map(|[l, r]| [l.round() as i16, r.round() as i16]));
         for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
@@ -745,6 +928,9 @@ pub unsafe fn capture_planar(shared: &crate::media::Shared, data: *const u8, fra
         return;
     }
     let mut samples = Vec::with_capacity((frames * RATE as usize).div_ceil(rate));
+    shared.audio_channels.store(channels as u64, Relaxed);
+    let direct = shared.direct_audio.load(Relaxed);
+    let extra = shared.audio.lock().unwrap().effects.extra_channels;
     for index in 0..frames {
         let sample = |channel| {
             let value = data.add(index * 4 + channel * stride).cast::<f32>().read_unaligned();
@@ -752,7 +938,15 @@ pub unsafe fn capture_planar(shared: &crate::media::Shared, data: *const u8, fra
         };
         *phase += RATE as usize;
         while *phase >= rate {
-            samples.push([sample(0), sample(usize::from(channels > 1))]);
+            let mut frame = [0; 16];
+            frame[0] = sample(0);
+            frame[1] = sample(usize::from(channels > 1));
+            if direct || extra != [[0.0; 6]; 2] {
+                for (channel, value) in frame.iter_mut().enumerate().take(channels.min(16)).skip(2) {
+                    *value = sample(channel);
+                }
+            }
+            samples.push(frame);
             *phase -= rate;
         }
     }
@@ -763,23 +957,29 @@ pub unsafe fn capture_planar(shared: &crate::media::Shared, data: *const u8, fra
             let gap = buffer.live_end.map(|previous| signed_frames(start, previous)).unwrap_or(0);
             if gap.abs() > i64::from(RATE) / 4 {
                 buffer.data.clear();
+                buffer.raw.clear();
                 buffer.live_resyncs += 1;
             } else if gap > 0 {
-                buffer.append(std::iter::repeat_n([0; 2], gap as usize));
+                buffer.append_stereo(std::iter::repeat_n([0; 2], gap as usize));
+                if direct && !buffer.raw.is_empty() {
+                    buffer.raw.extend(std::iter::repeat_n([0; 16], gap as usize));
+                    let excess = buffer.raw.len().saturating_sub(buffer.data.len());
+                    buffer.raw.drain(..excess);
+                }
             } else if gap < 0 {
                 let skip = (-gap) as usize;
                 if skip >= samples.len() { return; }
-                buffer.append(samples[skip..].iter().copied());
+                buffer.append_channels(&samples[skip..], direct);
                 buffer.live_end = Some(end);
                 buffer.live_latency = 0;
                 return;
             }
-            buffer.append(samples.iter().copied());
+            buffer.append_channels(&samples, direct);
             buffer.live_end = Some(end);
         }
         buffer.live_latency = 0;
     } else {
-        buffer.capture(&samples);
+        buffer.capture_live(samples.len(), Instant::now(), |buffer| buffer.append_channels(&samples, direct));
     }
 }
 
@@ -1121,6 +1321,10 @@ pub struct AvPipe<W> {
     n: u32,
     d: u32,
     queue: AudioFifo,
+    #[cfg(target_os = "macos")]
+    channels: usize,
+    #[cfg(target_os = "macos")]
+    interleaved: VecDeque<i16>,
 }
 
 fn element_header(mut out: impl Write, id: &[u8], len: usize) -> std::io::Result<()> {
@@ -1145,7 +1349,11 @@ fn master(out: &mut Vec<u8>, id: &[u8], build: impl FnOnce(&mut Vec<u8>)) {
 }
 
 impl<W: Write> AvPipe<W> {
-    pub fn new(mut output: W, w: u32, h: u32, n: u32, d: u32) -> std::io::Result<Self> {
+    pub fn new(output: W, w: u32, h: u32, n: u32, d: u32) -> std::io::Result<Self> {
+        Self::new_with_channels(output, w, h, n, d, 2)
+    }
+
+    pub fn new_with_channels(mut output: W, w: u32, h: u32, n: u32, d: u32, channels: usize) -> std::io::Result<Self> {
         let mut header = Vec::new();
         master(&mut header, &[0x1a, 0x45, 0xdf, 0xa3], |ebml| {
             uint(ebml, &[0x42, 0x86], 1); // EBMLVersion
@@ -1185,13 +1393,18 @@ impl<W: Write> AvPipe<W> {
                 element(audio, &[0x86], b"A_PCM/INT/LIT");
                 master(audio, &[0xe1], |format| {
                     element(format, &[0xb5], &f64::from(RATE).to_be_bytes());
-                    uint(format, &[0x9f], 2);
+                    uint(format, &[0x9f], channels as u64);
                     uint(format, &[0x62, 0x64], 16);
                 });
             });
         });
         output.write_all(&header)?;
-        Ok(Self { output, slot: 0, n, d, queue: AudioFifo::default() })
+        Ok(Self { output, slot: 0, n, d, queue: AudioFifo::default(),
+            #[cfg(target_os = "macos")]
+            channels,
+            #[cfg(target_os = "macos")]
+            interleaved: VecDeque::new(),
+        })
     }
 
     /// Queues mixer audio ahead of the frames that will carry it, such as repeated pictures.
@@ -1204,19 +1417,36 @@ impl<W: Write> AvPipe<W> {
         self.queue.push(audio);
         let count = frames_for_slot(self.slot, self.n, self.d);
         let audio = self.queue.pop(count);
+        self.write_blocks(bgra, count * 4, |output| write_pcm(output, &audio, count))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn frame_interleaved(&mut self, bgra: &[u8], audio: &[i16]) -> std::io::Result<()> {
+        self.interleaved.extend(audio.iter().copied());
+        let sample_count = frames_for_slot(self.slot, self.n, self.d) * self.channels;
+        let used = self.interleaved.len().min(sample_count);
+        let mut bytes = Vec::with_capacity(sample_count * 2);
+        bytes.extend(self.interleaved.drain(..used).flat_map(i16::to_le_bytes));
+        bytes.resize(sample_count * 2, 0);
+        let excess = self.interleaved.len().saturating_sub(RATE as usize * self.channels);
+        self.interleaved.drain(..excess);
+        self.write_blocks(bgra, bytes.len(), |output| output.write_all(&bytes))
+    }
+
+    fn write_blocks(&mut self, bgra: &[u8], audio_bytes: usize, write_audio: impl FnOnce(&mut W) -> std::io::Result<()>) -> std::io::Result<()> {
         let time = self.slot * 1_000_000 * u64::from(self.d) / u64::from(self.n);
         let mut stamp = Vec::new();
         uint(&mut stamp, &[0xe7], time);
         let overhead = 1 + 8 + 4; // SimpleBlock ID, size, and block header
         element_header(&mut self.output, &[0x1f, 0x43, 0xb6, 0x75],
-            stamp.len() + 2 * overhead + bgra.len() + count * 4)?;
+            stamp.len() + 2 * overhead + bgra.len() + audio_bytes)?;
         self.output.write_all(&stamp)?;
         element_header(&mut self.output, &[0xa3], 4 + bgra.len())?;
         self.output.write_all(&[0x81, 0, 0, 0x80])?;
         self.output.write_all(bgra)?;
-        element_header(&mut self.output, &[0xa3], 4 + count * 4)?;
+        element_header(&mut self.output, &[0xa3], 4 + audio_bytes)?;
         self.output.write_all(&[0x82, 0, 0, 0x80])?;
-        write_pcm(&mut self.output, &audio, count)?;
+        write_audio(&mut self.output)?;
         self.slot += 1;
         Ok(())
     }

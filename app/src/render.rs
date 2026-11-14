@@ -141,13 +141,23 @@ fn draw_layered(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, all: &[Input]
     if depth >= 2 {
         return;
     }
-    for l in inp.layers.iter().filter(|l| l.on) {
+    for (index, l) in inp.layers.iter().enumerate().filter(|(_, l)| l.on) {
         let Some(li) = l.input.filter(|id| *id != inp.id).and_then(|id| all.iter().find(|i| i.id == id)) else { continue };
         let placed = place_rect(r, &l.place);
         let lr = Rect::from_center_size(placed.center(), placed.size() * egui::vec2(l.scale[0], l.scale[1]));
         let lc = crop_rect(lr, &l.place).intersect(p.clip_rect());
         if lc.width() > 0.0 && lc.height() > 0.0 {
-            draw_layered(&p.with_clip_rect(lc), lr, li, a, t, all, depth + 1, Cue::Rest);
+            let layer = p.with_clip_rect(lc);
+            let mut opacity = a;
+            if index == 0 && matches!(inp.kind, Kind::Mix { .. }) {
+                if let Some((old, until)) = inp.mix_fade.filter(|(_, until)| t < *until) {
+                    if let Some(previous) = all.iter().find(|input| input.id == old && input.id != inp.id) {
+                        draw_layered(&layer, lr, previous, a, t, all, depth + 1, Cue::Rest);
+                        opacity *= (1.0 - (until - t) * 2.0).clamp(0.0, 1.0) as f32;
+                    }
+                }
+            }
+            draw_layered(&layer, lr, li, opacity, t, all, depth + 1, Cue::Rest);
         }
         // Layer Designer > Border: a frame around the layer's visible rectangle.
         if l.border && l.border_width > 0.0 && lc.width() > 0.0 && lc.height() > 0.0 {
@@ -266,7 +276,7 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
         Kind::Colour(c) => {
             p.rect_filled(r, 0.0, fade(*c, a));
         }
-        Kind::Blank => {}
+        Kind::Blank | Kind::Mix { .. } => {}
         Kind::Bars => {
             let cols = [
                 Color32::from_rgb(191, 191, 191),

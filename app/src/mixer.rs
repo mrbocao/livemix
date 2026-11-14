@@ -1,6 +1,34 @@
 //! Audio mixing, metering, monitoring and the mixer panel.
 use super::*;
 
+fn input_bus(input: &Input, bus: usize) -> bool {
+    match bus {
+        0 => input.bus_m,
+        1 => input.bus_a,
+        2 => input.bus_b,
+        _ => input.extra_buses.get(bus - 3).copied().unwrap_or(false),
+    }
+}
+
+pub(crate) fn input_bus_mask(input: &Input) -> u8 {
+    (0..8).filter(|&bus| input_bus(input, bus)).fold(0, |mask, bus| mask | (1 << bus))
+}
+
+pub(crate) fn mix_selected_buses<'a>(
+    inputs: impl IntoIterator<Item = (&'a media::Shared, bool, f32, f32, u8, &'a [Option<audio::ChannelMatrix>; 4])>,
+    mask: u8, master_gain: f32, at: Instant, frames: usize,
+) -> audio::Packet {
+    audio::mix_routed(inputs.into_iter().flat_map(|(source, file, gain, delay, buses, routes)| {
+        (0..8).filter(move |&bus| mask & buses & (1 << bus) != 0).map(move |bus| {
+            let matrix = if source.audio_channels.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                routes.get(bus).filter(|_| bus < 3).and_then(Option::as_ref)
+            } else { None };
+            let gain = gain * if bus == 0 { master_gain } else { 1.0 };
+            (source, file, gain, delay, matrix)
+        })
+    }), at, frames)
+}
+
 impl App {
     pub(crate) fn audio_input(&self, input: &Input) -> Option<(&Arc<media::Shared>, bool, f32, f32)> {
         let (original, delay) = match input.kind {
@@ -16,31 +44,42 @@ impl App {
     /// Peak level of every audio input, kept for the mixer strips and the Input Settings meter.
     pub(crate) fn update_levels(&mut self) {
         let at = Instant::now();
-        let levels: Vec<(u32, [f32; 2])> = self.s.inputs.iter().filter(|input| input.kind.has_audio())
-            .map(|input| (input.id, self.audio_input(input).map_or([0.0; 2], |(source, file, gain, delay)| {
-                audio::delayed_peaks((source, file, gain, delay), at)
-            })))
+        let levels: Vec<_> = self.s.inputs.iter().filter(|input| input.kind.has_audio())
+            .map(|input| (input.id, self.audio_input(input).map_or([0.0; 2], |(source, file, _, delay)| {
+                audio::delayed_peaks((source, file, 1.0, delay), at)
+            }), if input.audio_on { input.volume / 100.0 } else { 0.0 }))
             .collect();
-        for (id, level) in levels {
+        for (id, level, gain) in levels {
             if let Some(input) = self.s.input_mut(id) {
-                input.level = level;
+                input.pre_fader_level = level;
+                input.level = if input.audio_effects.meter_pre_fader { level } else { level.map(|peak| peak * gain) };
             }
         }
     }
 
     pub(crate) fn mix_audio(&self, route: u32, at: Instant, frames: usize) -> audio::Packet {
+        if route & !0xff == AUDIO_BUS_ROUTE {
+            return mix_selected_buses(self.s.inputs.iter().filter_map(|input| {
+                let (source, file, gain, delay) = self.audio_input(input)?;
+                Some((source.as_ref(), file, gain * self.s.automatic_audio_gain(input), delay,
+                    input_bus_mask(input), &input.audio_effects.direct_routes))
+            }), route as u8, self.master_gain(), at, frames);
+        }
         let master = matches!(route, SRC_OUTPUT | SRC_MV1 | SRC_MV2);
         let selected = match route {
             SRC_PREVIEW => self.s.preview,
             _ => route.checked_sub(1),
         };
         let gain = if master { self.master_gain() } else { 1.0 };
-        audio::mix_delayed(self.s.inputs.iter().filter(|input| {
+        audio::mix_routed(self.s.inputs.iter().filter(|input| {
             if master { input.bus_m } else { Some(input.id) == selected }
         }).filter_map(|input| {
             let (source, file, level, delay) = self.audio_input(input)?;
             let auto = if master { self.s.automatic_audio_gain(input) } else { 1.0 };
-            Some((source.as_ref(), file, level * gain * auto, delay))
+            let matrix = if master && source.audio_channels.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                input.audio_effects.direct_routes[0].as_ref()
+            } else { None };
+            Some((source.as_ref(), file, level * gain * auto, delay, matrix))
         }), at, frames)
     }
 
@@ -50,16 +89,11 @@ impl App {
     }
 
     pub(crate) fn mix_external_audio(&self, bus: u8, delay_ms: u32, at: Instant, frames: usize) -> audio::Packet {
-        let bus_gain = if bus == 0 { self.master_gain() } else { 1.0 };
-        audio::mix_delayed(self.s.inputs.iter().filter(|input| match bus {
-            1 => input.bus_a,
-            2 => input.bus_b,
-            _ => input.bus_m,
-        }).filter_map(|input| {
+        mix_selected_buses(self.s.inputs.iter().filter_map(|input| {
             let (source, file, gain, delay) = self.audio_input(input)?;
-            Some((source.as_ref(), file, gain * bus_gain * self.s.automatic_audio_gain(input),
-                delay + delay_ms as f32 / 1000.0))
-        }), at, frames)
+            Some((source.as_ref(), file, gain * self.s.automatic_audio_gain(input),
+                delay + delay_ms as f32 / 1000.0, input_bus_mask(input), &input.audio_effects.direct_routes))
+        }), 1 << bus.min(7), self.master_gain(), at, frames)
     }
 
     pub(crate) fn update_audio_monitor(&mut self) {
@@ -72,25 +106,29 @@ impl App {
             return;
         }
         let solo = self.s.inputs.iter().any(|input| input.solo && input.kind.has_audio());
-        let bus_gain = if self.mixer.bus == 0 { self.master_gain() } else { 1.0 };
+        let bus_gain = if self.mixer.bus == 0 && self.s.cfg.headphones_post_master { self.master_gain() } else { 1.0 };
         let headphones = self.mixer.headphones / 100.0;
         let sources = self.s.inputs.iter().filter(|input| {
             if solo {
                 return input.solo && input.kind.has_audio();
             }
-            match self.mixer.bus {
-                1 => input.bus_a,
-                2 => input.bus_b,
-                _ => input.bus_m,
-            }
+            input.audio_effects.direct_routes[3].is_some() || input_bus(input, usize::from(self.mixer.bus))
         }).filter_map(|input| {
             let (source, file, volume, delay) = self.audio_input(input)?;
+            let routes = &input.audio_effects.direct_routes;
+            let matrix = if source.audio_channels.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                routes[3].or_else(|| {
+                    let bus = usize::from(self.mixer.bus);
+                    if !solo && bus < 3 { routes[bus] } else { None }
+                })
+            } else { None };
+            if !solo && matrix.is_none() && !input_bus(input, usize::from(self.mixer.bus)) { return None; }
             let gain = if solo {
                 if input.solo_pfl { 1.0 } else { volume }
             } else {
                 volume * bus_gain * self.s.automatic_audio_gain(input)
             };
-            Some((source.clone(), file, gain * headphones, delay))
+            Some((source.clone(), file, gain * headphones, delay, matrix))
         }).collect::<Vec<_>>().into();
         *monitor.sources.lock().unwrap() = sources;
     }
@@ -172,17 +210,23 @@ impl App {
                     ui.checkbox(&mut self.s.master_on, "Master audio");
                     ui.add(egui::Slider::new(&mut self.s.master_volume, 0.0..=100.0).text("Master volume").suffix("%"));
                     ui.add(egui::Slider::new(&mut self.mixer.headphones, 0.0..=100.0).text("Headphone volume").suffix("%"));
+                    if setting_toggle(ui, &mut self.s.cfg.headphones_post_master, "Headphones Post Master Fader").changed() {
+                        self.s.save_settings();
+                    }
                 });
             }
             MixerSettings::Input(id) => {
                 if let Some(input) = self.s.input_mut(id) {
+                    let screen = ctx.screen_rect();
                     egui::Window::new(format!("{} — {}", locale::text(ctx, "Audio Settings"), input.title))
                         .id(egui::Id::new(("mixer-audio-settings", id)))
                         .open(&mut open)
-                        .default_width(490.0)
-                        .default_height(215.0)
+                        .default_width(screen.width().min(690.0))
+                        .default_height((screen.height() * 0.66).min(540.0))
+                        .max_height((screen.height() - 40.0).max(160.0))
                         .show(ctx, |ui| {
-                            input_audio(ui, input, (ctx.screen_rect().height() - 110.0).clamp(100.0, 215.0));
+                            let page_height = (ui.available_height() - 34.0).max(120.0);
+                            input_audio(ui, input, page_height);
                         });
                 } else {
                     open = false;
@@ -273,7 +317,8 @@ pub(crate) fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, master: [f32; 2
                     if mixer_section(ui, "INPUTS", height) {
                         let category = if follow { s.filter } else { None };
                         for (index, input) in s.inputs.iter_mut().enumerate()
-                            .filter(|(_, i)| i.kind.has_audio() && category.is_none_or(|c| i.category == Some(c)))
+                            .filter(|(_, i)| i.kind.has_audio() && !i.audio_effects.hide_in_mixer
+                                && category.is_none_or(|c| i.category == Some(c)))
                         {
                             let name = format!("{} {}", index + 1, input.title);
                             let strip = MixerInputControls {
@@ -405,9 +450,9 @@ pub(crate) fn mixer_strip(ui: &mut egui::Ui, name: &str, volume: &mut f32, on: &
                 }
                 headphone_knob(ui, &mut controls.headphones);
                 egui::ComboBox::from_id_salt("audio-monitor-bus").width(35.0)
-                    .selected_text(["M", "A", "B"][usize::from(controls.bus)])
+                    .selected_text(AUDIO_BUS_NAMES[usize::from(controls.bus)])
                     .show_ui(ui, |ui| {
-                        for (index, label) in ["Master", "A", "B"].into_iter().enumerate() {
+                        for (index, label) in AUDIO_BUS_NAMES.into_iter().enumerate() {
                             ui.selectable_value(&mut controls.bus, index as u8, label);
                         }
                     });

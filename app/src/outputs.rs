@@ -4,7 +4,7 @@ use super::*;
 impl App {
     pub(crate) fn composed_recordings(&self) -> impl Iterator<Item = &ComposedRecording> {
         self.recordings.iter().chain(&self.multi_outputs).filter_map(Option::as_ref)
-            .chain(self.replay.current.iter().map(|track| &track.recording))
+            .chain(self.replay.current.iter().filter_map(|track| track.recording.as_ref()))
     }
 
     pub(crate) fn recording_error(&self, recording: &ComposedRecording) -> Option<String> {
@@ -69,7 +69,7 @@ impl App {
         let selected_camera = self.s.inputs.iter().any(|i| matches!(i.kind, Kind::Device { .. }) && !self.s.mc_off.contains(&i.id));
         if self.s.multicorder.is_some() && !selected_camera && !self.s.cfg.mc_outputs.contains(&true) {
             self.s.multicorder = None;
-            self.s.notice("Select a camera or Output 1–4 in MultiCorder");
+            self.s.notice("Select a camera or an output in MultiCorder");
         }
         let split = f64::from(self.s.cfg.mc_split_min) * 60.0;
         for channel in 0..OUTPUT_COUNT {
@@ -88,6 +88,10 @@ impl App {
                 let c = &self.s.cfg;
                 self.multi_outputs[channel] = Some(ComposedRecording::new(&c.mc_folder, &format!("MultiCorder Output {}", channel + 1), channel, now,
                     options(c.mc_mbps, c.mc_codec, c.hw_encoder, c.record_audio[2])));
+            }
+            if let Some(recording) = &mut self.multi_outputs[channel] {
+                let bus = self.s.cfg.mc_audio_bus;
+                recording.audio_override = (bus != 0).then_some(AUDIO_BUS_ROUTE | u32::from(bus));
             }
             if let Some(error) = self.multi_outputs[channel].as_ref().and_then(|r| self.recording_error(r)) {
                 self.multi_outputs[channel] = None;
@@ -150,6 +154,8 @@ impl App {
             let wanted = route.device.filter(|_| self.s.decklink_active[channel]).map(|device| decklink::OutputConfig {
                 device, mode: route.mode, port: route.port,
                 key_fill: route.key_fill,
+                ten_bit: route.ten_bit && !route.key_fill,
+                audio_channels: if route.multichannel_audio && !route.key_fill { 16 } else { 2 },
                 size: self.s.cfg.out_dims(), fps: self.s.cfg.frame_rate(), interlaced: self.s.cfg.interlaced,
             });
             let slot = &mut self.decklink_outputs[channel];
@@ -270,7 +276,8 @@ impl App {
                 continue;
             }
             let leader = groups.iter().position(|group| group.first().is_some_and(|(_, first)| {
-                (first.source, first.direct, first.quality, first.bitrate, first.hardware, first.hevc, first.source_audio, first.audio_rate())
+                !first.is_srt() && !destination.is_srt()
+                    && (first.source, first.direct, first.quality, first.bitrate, first.hardware, first.hevc, first.source_audio, first.audio_rate())
                     == (destination.source, destination.direct, destination.quality, destination.bitrate, destination.hardware,
                         destination.hevc, destination.source_audio, destination.audio_rate())
             })).unwrap_or(index);

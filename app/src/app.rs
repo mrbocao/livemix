@@ -276,6 +276,8 @@ impl App {
             network_thumbnail: None,
             thumbnail_attempts: Default::default(),
             multi: Default::default(),
+            multi_ndi: Default::default(),
+            multi_omt: Default::default(),
             browse_rx: None,
             browse_kind: media::PickKind::Video,
             snap_pending: None,
@@ -314,8 +316,31 @@ impl App {
             .collect();
         #[cfg(windows)]
         let pending_gpu = &mut self.pending_gpu;
-        let App { s, media: feeds, delays, multi, multi_started, multi_audio, .. } = self;
+        let App { s, media: feeds, delays, multi, multi_ndi, multi_omt, multi_started, multi_audio, .. } = self;
+        // Keep the selected audio feeds available while the input loop mutates the switcher.
+        let bus_sources: Vec<_> = if s.multicorder.is_some() && s.cfg.mc_audio_bus != 0 {
+            s.inputs.iter().filter_map(|input| {
+                let (id, delay) = match input.kind {
+                    Kind::VideoDelay { source, seconds, .. } => (source?, seconds),
+                    _ => (input.id, 0.0),
+                };
+                let original = s.input(id)?;
+                let source = feeds.get(&id)?.shared.clone()?;
+                let file = matches!(original.kind, Kind::VideoFile { .. } | Kind::AudioFile { .. }
+                    | Kind::VideoList { .. } | Kind::Replay { .. });
+                let gain = if input.audio_on { input.volume / 100.0 * s.automatic_audio_gain(input) } else { 0.0 };
+                Some((source, file, gain, delay, mixer::input_bus_mask(input), input.audio_effects.direct_routes))
+            }).collect()
+        } else { Vec::new() };
+        let mc_bus = s.cfg.mc_audio_bus;
+        let master_gain = if s.master_on {
+            s.master_volume / 100.0 * if s.ftb_audio { 1.0 - s.ftb_level / FULL } else { 1.0 }
+        } else { 0.0 };
         let ids: std::collections::HashSet<u32> = s.inputs.iter().map(|i| i.id).collect();
+        let direct_audio_inputs: std::collections::HashSet<_> = s.inputs.iter()
+            .filter(|input| input.audio_effects.direct_routes.iter().any(Option::is_some))
+            .filter_map(|input| match input.kind { Kind::VideoDelay { source, .. } => source, _ => None })
+            .collect();
         let mut audio_history = std::collections::HashMap::<u32, f32>::new();
         for input in &s.inputs {
             if let Kind::VideoDelay { source: Some(source), seconds, .. } = input.kind {
@@ -330,6 +355,11 @@ impl App {
         feeds.retain(|id, _| ids.contains(id));
         let multicorder = s.multicorder.is_some();
         let mc_split = s.cfg.mc_split_min as f64 * 60.0;
+        let mc_ndi_tool = (multicorder && s.cfg.mc_ndi_direct).then(ndi::record_tool).flatten();
+        multi_ndi.retain(|id, _| mc_ndi_tool.is_some() && !s.mc_off.contains(id)
+            && s.input(*id).is_some_and(|input| matches!(&input.kind, Kind::Device { link, .. } if link.starts_with("ndi:"))));
+        multi_omt.retain(|id, _| multicorder && s.cfg.mc_omt_direct && !s.mc_off.contains(id)
+            && s.input(*id).is_some_and(|input| matches!(&input.kind, Kind::Device { link, .. } if link.starts_with("omt:"))));
         if !multicorder {
             multi.clear();
             multi_started.clear();
@@ -378,10 +408,14 @@ impl App {
         let mut layer_parents: Vec<u32> = live.iter().copied().collect();
         for _ in 0..2 {
             let children: Vec<u32> = layer_parents.iter().filter_map(|id| s.input(*id))
-                .flat_map(|input| input.layers.iter().filter(|layer| layer.on).filter_map(|layer| layer.input))
+                .flat_map(|input| input.layers.iter().filter(|layer| layer.on).filter_map(|layer| layer.input)
+                    .chain(input.mix_fade.filter(|(_, until)| now < *until).map(|(source, _)| source)))
                 .filter(|id| live.insert(*id)).collect();
             layer_parents = children;
         }
+        let cam_watch = s.cam_match.watching();
+        let cam_roi = s.cam_match.roi;
+        let mut cam_samples: Vec<(u32, Option<cammatch::Stats>, Option<cammatch::Stats>)> = Vec::new();
         for inp in &mut s.inputs {
             match &inp.kind {
                 k if k.streamed() => {
@@ -407,8 +441,9 @@ impl App {
                         Kind::Device { link, .. } if decklink::device_index(link).is_some() => (
                             media::Source::DeckLink(decklink::CaptureConfig {
                                 device: decklink::device_index(link).unwrap(), port: inp.decklink_port, mode: inp.decklink_mode,
+                                audio_channels: inp.decklink_audio_channels,
                             }),
-                            format!("{link}|{}|{}", inp.decklink_port, inp.decklink_mode), false, true,
+                            format!("{link}|{}|{}|{}", inp.decklink_port, inp.decklink_mode, inp.decklink_audio_channels), false, true,
                         ),
                         Kind::Device { link, .. } => (
                             media::Source::Device(link.clone(), inp.cam_mode.clone(), inp.cam_audio.clone()),
@@ -428,7 +463,9 @@ impl App {
                             (source, format!("{idx}:{key}"), true, false)
                         }
                         Kind::Replay { path, .. } => (
-                            media::Source::File(path.clone()), format!("replay:{path}"), true, false,
+                            if std::path::Path::new(path).extension().is_some_and(|ext| ext == "mkv") {
+                                media::Source::FfmpegFile(path.clone(), 0, false)
+                            } else { media::Source::File(path.clone()) }, format!("replay:{path}"), true, false,
                         ),
                         Kind::Desktop => (media::Source::Desktop, "desktop".into(), false, false),
                         Kind::Web { url, transparent } => (
@@ -463,6 +500,9 @@ impl App {
                         gpu_size: None,
                     });
                     let Some(sh) = feed.shared.clone() else { continue };
+                    sh.direct_audio.store(inp.audio_effects.direct_routes.iter().any(Option::is_some)
+                        || direct_audio_inputs.contains(&inp.id), Relaxed);
+                    inp.audio_channels = sh.audio_channels.load(Relaxed).min(16) as u8;
                     if let Ok(mut buffer) = sh.audio.try_lock() {
                         buffer.retain_for_delay(audio_history.get(&inp.id).copied().unwrap_or(0.0));
                     }
@@ -543,7 +583,34 @@ impl App {
                     let seq = sh.seq.load(std::sync::atomic::Ordering::Acquire);
                     let recording_this = multicorder && is_device && !s.mc_off.contains(&inp.id);
                     // MultiCorder has its own source cadence, independent of display uploads.
-                    if recording_this && seq != feed.recorded {
+                    let direct_ndi = match (&inp.kind, &mc_ndi_tool) {
+                        (Kind::Device { link, .. }, Some(tool)) if recording_this => link.strip_prefix("ndi:").map(|name| (name, tool)),
+                        _ => None,
+                    };
+                    let direct_omt = match &inp.kind {
+                        Kind::Device { link, .. } if recording_this && s.cfg.mc_omt_direct => link.strip_prefix("omt:"),
+                        _ => None,
+                    };
+                    if let Some(address) = direct_omt {
+                        multi.remove(&inp.id);
+                        let (_, error) = multi_omt.entry(inp.id).or_insert_with(|| {
+                            let filename = format!("{}-omt-{}.mkv", safe_name(&inp.title), replay_stamp());
+                            let (recording, error, _, _) = omt::record_compressed(address.to_owned(),
+                                rec_dir(&mc_dir).join(filename), Instant::now(), mc_audio, false);
+                            (recording, error)
+                        });
+                        if let Ok(message) = error.try_lock() {
+                            if !message.is_empty() { inp.status.clone_from(&message); }
+                        }
+                    } else if let Some((name, tool)) = direct_ndi {
+                        multi.remove(&inp.id);
+                        let recording = multi_ndi.entry(inp.id).or_insert_with(|| {
+                            let extension = if s.cfg.mc_ndi_mkv { "mkv" } else { "mov" };
+                            let filename = format!("{}-ndi-{}.{extension}", safe_name(&inp.title), replay_stamp());
+                            ndi::DirectRecording::start(tool.clone(), name.to_owned(), rec_dir(&mc_dir).join(filename))
+                        });
+                        if let Ok(status) = recording.status.try_lock() { inp.status.clone_from(&status); }
+                    } else if recording_this && seq != feed.recorded {
                         let frame = sh.frame.lock().ok().and_then(|slot| slot.as_ref()
                             .map(|fr| (fr.rgba.clone(), fr.w, fr.h)));
                         if let Some((rgba, w, h)) = frame {
@@ -556,7 +623,13 @@ impl App {
                             let at = Instant::now();
                             let nominal = (f64::from(audio::RATE) / f64::from(mc_fps)).round() as usize;
                             let (end, count) = multi_audio.entry(inp.id).or_default().window(at, nominal);
-                            let packet = audio::mix([(&*sh, false, 1.0)], end, count);
+                            let packet = if mc_bus == 0 {
+                                audio::mix([(&*sh, false, 1.0)], end, count)
+                            } else {
+                                mixer::mix_selected_buses(bus_sources.iter().map(|(source, file, gain, delay, buses, routes)| {
+                                    (source.as_ref(), *file, *gain, *delay, *buses, routes)
+                                }), mc_bus, master_gain, end, count)
+                            };
                             rec.push_audio(rgba, w, h, at, packet);
                         }
                     }
@@ -582,10 +655,16 @@ impl App {
                         }
                         let fr = sh.frame.lock().ok().and_then(|mut f| f.take());
                         if let Some(mut fr) = fr {
+                            // Camera Match measures the picture as delivered and as corrected.
+                            let matching = cam_watch.contains(&Some(inp.id));
+                            let raw_stats = if matching { cammatch::measure(&fr.rgba, fr.w, fr.h, cam_roi) } else { None };
                             inp.colour_fx.luma.apply(&mut fr.rgba);
                             inp.colour_adjust.apply(&mut fr.rgba);
                             inp.colour_fx.apply_lut(&mut fr.rgba);
                             inp.colour_fx.apply_spatial(&mut fr.rgba, fr.w, fr.h);
+                            if matching {
+                                cam_samples.push((inp.id, raw_stats, cammatch::measure(&fr.rgba, fr.w, fr.h, cam_roi)));
+                            }
                             // Video Delay inputs that copy this one take the new picture.
                             for delay in delays.values_mut().filter(|delay| delay.source == inp.id) {
                                 delay.capture(&fr.rgba, fr.w, fr.h, now);
@@ -665,6 +744,7 @@ impl App {
                 _ => {}
             }
         }
+        for (id, raw, processed) in cam_samples { s.cam_match.feed(id, raw, processed); }
         // Video Delay: show (and upload) the picture that is `seconds` old.
         delays.retain(|id, _| ids.contains(id));
         for inp in &mut s.inputs {
@@ -802,7 +882,19 @@ impl App {
                 for (channel, _, packet) in &mut recorders.decklinks {
                     if recorders.key_fill { continue; }
                     let config = self.s.cfg.decklink_outputs[*channel];
-                    *packet = self.mix_external_audio(config.audio_bus, config.audio_delay_ms, end, count);
+                    if config.multichannel_audio {
+                        let mut interleaved = vec![0i16; count * 16];
+                        for bus in 0..AUDIO_BUS_NAMES.len() {
+                            let stereo = self.mix_external_audio(bus as u8, config.audio_delay_ms, end, count);
+                            for (frame, pair) in interleaved.chunks_exact_mut(16).zip(stereo.iter()) {
+                                frame[bus * 2..bus * 2 + 2].copy_from_slice(pair);
+                            }
+                        }
+                        *packet = interleaved.into();
+                    } else {
+                        *packet = self.mix_external_audio(config.audio_bus, config.audio_delay_ms, end, count)
+                            .iter().flatten().copied().collect();
+                    }
                 }
                 let painter = egui::Painter::new(ctx.clone(), layer, rect);
                 if recorders.key_fill {
@@ -825,7 +917,9 @@ impl App {
             if let Some(input) = self.scope_key.0.and_then(|id| self.s.input(id)) {
                 draw_source(&painter, rect, input, 1.0, now, &self.s.inputs);
             }
-            draw_overlay_channels(&painter, rect, &self.s, now, true);
+            if allows_overlays(&self.s, self.scope_key.0) {
+                draw_overlay_channels(&painter, rect, &self.s, now, true);
+            }
             let shapes = ctx.graphics_mut(|graphics| {
                 std::mem::take(graphics.entry(layer)).all_entries().cloned().collect()
             });
@@ -1068,6 +1162,9 @@ impl App {
                         (media::PickKind::Folder, 1) => self.s.cfg.rec_folder = p,
                         (media::PickKind::Folder, 2) => self.s.cfg.mc_folder = p,
                         (media::PickKind::Folder, 3) => self.s.replay_setup.folder = p,
+                        (media::PickKind::Folder, angle @ 4..=11) => {
+                            self.s.replay_setup.camera_folders[usize::from(angle - 4)] = p;
+                        }
                         (kind, _) => {
                             let d = &mut self.s.add_dialog;
                             match kind {

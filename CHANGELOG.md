@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- Add Camera Match: compare a reference and a target camera, get advice for exposure (shutter, iris, ISO), white balance, tint, contrast and saturation, and optionally match the target in software through its Colour Correction.
+
+- Record original OMT VMX1 video to MKV in MultiCorder and Replay, with source audio and indexed replay timestamps.
+- Add optional MKV stream copy after native NDI recording in MultiCorder.
+
+- Add optional native NDI MOV recording in MultiCorder through the NDI Record utility.
+- Add separate storage folders per Replay camera and retain each segment's original location for playback and export.
+
+- Add selectable DeckLink embedded audio capture on macOS, 16-channel DeckLink playback for Master and A–G, and per-input reverb tail reduction.
+
+- Add input noise suppression using RNNoise, up to 16 channels of DeckLink capture on Windows and optional v210 DeckLink output.
+
+- Add independent Preview selection, Cut and Fade to each Mix input.
+
+- Add reusable Mix inputs composed of existing layers, with optional Program and Preview tally passthrough.
+
+- Add buses C–G for input routing and monitoring, and select single or combined buses for MultiCorder audio.
+
+- Route original capture channels independently to stereo Master, A, B and headphones.
+
+- Add per-input GO shortcut actions, SRT destinations in Streaming Settings, eight output routes and an optional post-Master headphone feed.
+
+- Add input AGC, adjustable dynamics and routing for additional capture channels on audio devices and NDI/OMT.
+
+- Add pre- and post-fader input meters, a per-input mixer visibility toggle and right-channel gain trim.
+- Save named stereo matrix presets with each input.
+
+- Smooth compressor gain changes and preserve its envelope when adjusting or bypassing it during playback.
+
+- Expand input Audio Settings and add Channel Mixer, a stereo Channel Matrix, Bus Mixer and EQ, gate and compressor bypass controls.
+
+- Add a cancellable sequential disk write test to Recording Setup.
+
+- Move advanced External window controls to Outputs / NDI / OMT / SRT.
+
+- Exclude global overlays when showing the Teleprompter in Preview, Program or a routed output.
+- Show a status message when Pause Inputs is clicked, including how many video inputs were paused.
+
 - Add a documentation index, a Cameras and capture cards section in the operator guide, a quick start and FAQ in the README, issue and pull request templates, crate metadata, and a project page published with GitHub Pages from `docs/site`.
 - Skip drawing and laying out input card controls in rows outside the visible grid when resizing or scrolling.
 

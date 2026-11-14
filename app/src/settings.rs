@@ -191,7 +191,7 @@ pub(crate) fn external_menu(ui: &mut egui::Ui, s: &mut Switcher) {
     let button = egui::Button::new("").fill(BTN_DARK).min_size(Vec2::new(38.0, 30.0));
     let menu = egui::menu::menu_custom_button(ui, button, |ui| external_menu_items(ui, s));
     gear_icon(ui.painter(), menu.response.rect.center(), 8.0, Color32::WHITE, BTN_DARK);
-    menu.response.on_hover_text("Configure Output 1–4, NDI, OMT and SRT")
+    menu.response.on_hover_text("Configure Outputs, NDI, OMT and SRT")
         .context_menu(|ui| external_menu_items(ui, s));
 }
 
@@ -283,8 +283,8 @@ pub(crate) fn decklink_mode_picker(ui: &mut egui::Ui, id: &str, device: usize, p
 pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
     let key = ui.id().with("external-output-channel");
     let mut channel = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(OUTPUT_COUNT - 1);
-    ui.horizontal(|ui| {
-        let width = ((ui.available_width() - ui.spacing().item_spacing.x * 3.0) / OUTPUT_COUNT as f32).max(1.0);
+    ui.horizontal_wrapped(|ui| {
+        let width = ((ui.available_width() - ui.spacing().item_spacing.x * 3.0) / 4.0).max(1.0);
         for index in 0..OUTPUT_COUNT {
             let label = if index == 0 { "External".to_owned() } else { format!("External {}", index + 1) };
             if ui.add_sized([width, 34.0], egui::Button::new(label).selected(index == channel)).clicked() {
@@ -360,12 +360,16 @@ pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
             }
             ui.end_row();
             ui.label("Audio Channels");
-            let buses = ["Master", "A", "B"];
-            egui::ComboBox::from_id_salt("external-audio-bus").selected_text(buses[usize::from(route.audio_bus.min(2))]).show_ui(ui, |ui| {
-                for (index, name) in buses.into_iter().enumerate() {
+            ui.add_enabled_ui(!route.key_fill, |ui| {
+                setting_toggle(ui, &mut route.multichannel_audio, "16 channels (Master, A–G)");
+            });
+            ui.end_row();
+            ui.label("Stereo audio bus");
+            ui.add_enabled_ui(!route.key_fill && !route.multichannel_audio, |ui| egui::ComboBox::from_id_salt("external-audio-bus").selected_text(AUDIO_BUS_NAMES[usize::from(route.audio_bus.min(7))]).show_ui(ui, |ui| {
+                for (index, name) in AUDIO_BUS_NAMES.into_iter().enumerate() {
                     ui.selectable_value(&mut route.audio_bus, index as u8, name);
                 }
-            });
+            }));
             ui.end_row();
             ui.label("Audio Delay");
             ui.add_enabled(!route.key_fill, egui::DragValue::new(&mut route.audio_delay_ms).range(0..=1000).suffix(" ms"));
@@ -373,6 +377,9 @@ pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
             ui.label("Alpha Channel");
             setting_toggle(ui, &mut route.key_fill, "Key + Fill (Graphics Only)")
                 .on_hover_text("Send active Program overlays over transparent video. Requires DeckLink external keying.");
+            ui.end_row();
+            ui.label("Pixel format");
+            ui.add_enabled_ui(!route.key_fill, |ui| setting_toggle(ui, &mut route.ten_bit, "10-bit YUV (v210)"));
             ui.end_row();
         });
     });
@@ -393,11 +400,6 @@ pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
             ui.label("Install Desktop Video and use a DeckLink-enabled FFmpeg build, then refresh.");
         }
     }
-    ui.collapsing("Advanced Settings", |ui| {
-        setting_toggle(ui, &mut s.cfg.ext_on_top, "On Top");
-        setting_toggle(ui, &mut s.cfg.ext_hide_cursor, "Hide Cursor");
-        if ui.button("Configure Outputs / NDI / OMT / SRT…").clicked() { s.cfg.page = 1; }
-    });
 }
 
 /// MultiView 1 / 2 (frmSettings cmdMultiView1/2, lblMultiViewLayout "MultiView Layout",
@@ -778,6 +780,11 @@ pub(crate) fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapte
         1 => {
             output_routes(ui, s);
             ui.label(RichText::new("NDI, OMT and SRT use the selected video route.").size(11.0).color(TEXT_DIM));
+            ui.separator();
+            ui.collapsing(tr(ui, "Advanced Settings"), |ui| {
+                setting_toggle(ui, &mut s.cfg.ext_on_top, "On Top");
+                setting_toggle(ui, &mut s.cfg.ext_hide_cursor, "Hide Cursor");
+            });
         }
         6 => {
             external_output_settings(ui, s);
@@ -864,11 +871,12 @@ pub(crate) fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapte
 
 /// Streaming destinations offered in Streaming Settings (frmStreaming "Destination"); each fills
 /// in its usual RTMP address.
-pub(crate) const STREAM_DESTS: [(&str, &str); 4] = [
+pub(crate) const STREAM_DESTS: [(&str, &str); 5] = [
     ("Custom RTMP Server", ""),
     ("YouTube RTMPS", "rtmps://a.rtmps.youtube.com/live2"),
     ("Facebook", "rtmps://live-api-s.facebook.com:443/rtmp/"),
     ("Twitch", "rtmp://live.twitch.tv/app"),
+    ("Custom SRT Server", "srt://"),
 ];
 #[cfg(windows)]
 pub(crate) fn directshow_settings(ui: &mut egui::Ui, config: &mut settings_xml::DirectShow) {
