@@ -149,6 +149,7 @@ impl App {
             let route = self.s.cfg.decklink_outputs[channel];
             let wanted = route.device.filter(|_| self.s.decklink_active[channel]).map(|device| decklink::OutputConfig {
                 device, mode: route.mode, port: route.port,
+                key_fill: route.key_fill,
                 size: self.s.cfg.out_dims(), fps: self.s.cfg.frame_rate(), interlaced: self.s.cfg.interlaced,
             });
             let slot = &mut self.decklink_outputs[channel];
@@ -171,7 +172,8 @@ impl App {
                     self.s.notice(&format!("DeckLink Output {}: {error}", channel + 1));
                 } else {
                     self.s.decklink_status[channel] = if sink.frames() > 0 {
-                        "Sending DeckLink output".into()
+                        if wanted.is_some_and(|config| config.key_fill) { "Sending DeckLink Key + Fill".into() }
+                        else { "Sending DeckLink output".into() }
                     } else {
                         "Starting DeckLink output…".into()
                     };

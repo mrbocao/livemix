@@ -129,7 +129,7 @@ pub(crate) fn play_configured(shared: &Shared, path: &str, deinterlace: u8, hard
             }
             let ms = next_position as u64;
             shared.pos_ms.store(ms, Relaxed);
-            crate::audio::mark_position(shared, ms);
+            crate::audio::mark_position(shared, next_position);
             publish(shared, frame);
             next_position += 1000.0 / metadata.map_or(30.0, |info| info.fps);
             count += 1;
@@ -254,19 +254,24 @@ pub(crate) fn publish(shared: &Shared, mut frame: Frame) {
 
 pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecOpts, index: Option<&crate::media_common::ReplayIndex>) -> Result<(), String> {
     let Ok(first) = rx.recv() else { return Ok(()) };
-    let profile = opts.format.ffmpeg_profile(opts.hw);
-    let encoder = profile.video;
+    let profile = opts.format.ffmpeg_profile();
     let (n, d) = rate_fraction(opts.fps);
     let size = opts.size.unwrap_or((first.w as u32, first.h as u32));
+    let bitrate = format!("{}M", opts.mbps.clamp(1, 100));
+    let hardware_requested = opts.hw && matches!(profile.video, "libx264" | "libx265");
+    let encoder = if hardware_requested {
+        crate::stream::hardware_encoder(profile.video == "libx265", [size.0, size.1], (n, d),
+            &["-b:v", &bitrate], || false).unwrap_or(profile.video)
+    } else { profile.video };
     let mut cmd = crate::stream::command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "matroska", "-i", "pipe:0",
         "-map", "0:v:0", "-vf", &format!("scale={}:{}", size.0, size.1), "-pix_fmt", profile.pixel, "-c:v", encoder]);
-    if profile.bitrate { cmd.args(["-b:v", &format!("{}M", opts.mbps.clamp(1, 100))]); }
+    if profile.bitrate { cmd.args(["-b:v", &bitrate]); }
     if opts.audio {
         cmd.args(["-map", "0:a:0", "-c:a", profile.audio]);
         if !profile.audio.starts_with("pcm") { cmd.args(["-b:a", "192k"]); }
     } else { cmd.arg("-an"); }
-    if encoder.ends_with("_videotoolbox") { cmd.args(["-allow_sw", "1"]); }
+    crate::stream::hardware_only(&mut cmd, encoder);
     cmd.args(profile.extra);
     let mut child = cmd.args(["-f", profile.container]).arg(path)
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
@@ -276,7 +281,9 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
         BufReader::new(stderr).lines().map_while(Result::ok)
             .filter(|line| !line.trim().is_empty()).last().unwrap_or_default()
     });
-    *status.lock().unwrap() = format!("FFmpeg · {encoder}");
+    *status.lock().unwrap() = if hardware_requested && encoder == profile.video {
+        format!("FFmpeg · {encoder} · hardware unavailable for this format")
+    } else { format!("FFmpeg · {encoder}") };
     let write_result = (|| {
         let start = first.timeline_origin.unwrap_or(first.captured_at);
         let dimensions = (first.w, first.h, first.bgra);
@@ -288,6 +295,8 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
             if (frame.w, frame.h, frame.bgra) != dimensions { continue; }
             let slot = (frame.captured_at.saturating_duration_since(start).as_secs_f64()
                 * f64::from(n) / f64::from(d)).round() as u64;
+            // A late frame's audio also covers the repeated pictures written before it.
+            pipe.queue_audio(&frame.audio);
             if slot < next { continue; }
             let mut pixels = frame.pixels;
             if !frame.bgra {
@@ -300,7 +309,7 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
                     written += 1;
                 }
             }
-            pipe.frame(&pixels, &frame.audio)?;
+            pipe.frame(&pixels, &[])?;
             if let Some(index) = index {
                 index.lock().unwrap().push((frame.captured_at, written * 1000 * u64::from(d) / u64::from(n)));
             }

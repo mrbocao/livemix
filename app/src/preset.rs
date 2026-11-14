@@ -98,6 +98,7 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
             Kind::VideoList { .. } => (14, "", None, false),
             Kind::VideoDelay { .. } => (10, "", None, false),
             Kind::Telestrator { .. } => (5001, "", None, false),
+            Kind::Teleprompter(_) => (5007, "", None, false),
             Kind::Replay { .. } => (5002, "", None, false),
             Kind::Device { .. } => (5, "", None, false),
             Kind::Colour(c) => (12, "", Some(*c), false),
@@ -108,6 +109,8 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         attr(&mut out, "Type", kind);
         if let Kind::Web { transparent: true, .. } = i.kind { attr(&mut out, "LiveMixWebAlpha", "True"); }
         if !i.colour_fx.lut_path.is_empty() { attr(&mut out, "LiveMixLut", &i.colour_fx.lut_path); }
+        if i.colour_fx.blur > 0 { attr(&mut out, "LiveMixBlur", &i.colour_fx.blur.to_string()); }
+        if !i.colour_fx.mask_path.is_empty() { attr(&mut out, "LiveMixAlphaMask", &i.colour_fx.mask_path); }
         if i.colour_fx.luma != Default::default() {
             if let Ok(luma) = serde_json::to_string(&i.colour_fx.luma) { attr(&mut out, "LiveMixLumaKey", luma); }
         }
@@ -181,6 +184,11 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         if let Kind::Telestrator { strokes } = &i.kind {
             if let Ok(value) = serde_json::to_string(strokes) {
                 attr(&mut out, "LiveMixTelestrator", value);
+            }
+        }
+        if let Kind::Teleprompter(prompter) = &i.kind {
+            if let Ok(value) = serde_json::to_string(prompter) {
+                attr(&mut out, "LiveMixTeleprompter", value);
             }
         }
         if i.place != Position::default() {
@@ -291,7 +299,9 @@ impl ImportReport {
                 Kind::VideoList { paths, .. } => paths,
                 _ => &[],
             };
-            for asset in paths.iter().chain(Some(&input.colour_fx.lut_path).filter(|path| !path.is_empty())) {
+            for asset in paths.iter().chain([&input.colour_fx.lut_path, &input.colour_fx.mask_path]
+                .into_iter().filter(|path| !path.is_empty()))
+            {
                 if !Path::new(asset).exists() {
                     missing.push((input.title.clone(), asset.clone()));
                 }
@@ -394,6 +404,8 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
                     strokes: node.attribute("LiveMixTelestrator")
                         .and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default(),
                 },
+                "5007" => Kind::Teleprompter(node.attribute("LiveMixTeleprompter")
+                    .and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default()),
                 "9000" => Kind::GtTitle { path: resolve(file), texts: title_texts(node), document: None },
                 "12" if bool_value(node.attribute("ColourBars")) => Kind::Bars,
                 "12" => {
@@ -464,6 +476,14 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             (c.len() == 3).then(|| [c[0], c[1], c[2]])
         });
         input.colour_fx.luma = node.attribute("LiveMixLumaKey").and_then(|value| serde_json::from_str(value).ok()).unwrap_or_default();
+        input.colour_fx.blur = node.attribute("LiveMixBlur").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0).min(12);
+        if let Some(path) = node.attribute("LiveMixAlphaMask").filter(|path| !path.is_empty()) {
+            let path = resolve(path);
+            if let Err(error) = input.colour_fx.load_mask(Path::new(&path)) {
+                input.colour_fx.mask_path = path;
+                warnings.push(format!("Input {} alpha mask: {error}", input.title));
+            }
+        }
         if let Some(path) = node.attribute("LiveMixLut").filter(|path| !path.is_empty()) {
             let path = resolve(path);
             if let Err(error) = input.colour_fx.load(Path::new(&path)) {
@@ -602,10 +622,14 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("livemix-picture-fx-{}", guid().unwrap()));
         fs::create_dir(&folder).unwrap();
         let lut = folder.join("identity.cube");
+        let mask = folder.join("mask.png");
+        image::GrayImage::from_raw(2, 1, vec![0, 128]).unwrap().save(&mask).unwrap();
         fs::write(&lut, "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1").unwrap();
         let mut s = Switcher::empty();
         let mut input = Input::new(0, "Browser", Kind::Web { url: "https://example.test/a?x=1&y=2".into(), transparent: true });
         input.colour_fx.load(&lut).unwrap();
+        input.colour_fx.load_mask(&mask).unwrap();
+        input.colour_fx.blur = 2;
         input.colour_fx.luma = crate::colour_fx::LumaKey { enabled: true, threshold: 10, softness: 33, invert: true };
         s.add(input);
         let preset = folder.join("test-project.xml");
@@ -615,6 +639,10 @@ mod tests {
         assert!(matches!(&input.kind, Kind::Web { url, transparent: true } if url.ends_with("?x=1&y=2")));
         assert_eq!(input.colour_fx.luma, s.inputs[0].colour_fx.luma);
         assert_eq!(input.colour_fx.lut.as_ref().unwrap().size, 2);
+        assert_eq!(input.colour_fx.blur, 2);
+        let mut pixels = [255; 8];
+        input.colour_fx.apply_spatial(&mut pixels, 2, 1);
+        assert_eq!([pixels[3], pixels[7]], [0, 128]);
         fs::remove_dir_all(folder).unwrap();
     }
     use std::path::PathBuf;

@@ -299,7 +299,7 @@ unsafe fn play_graph(shared: &Shared, path: &str, config: &DirectShow, blocked: 
                 crate::ffmpeg_media::publish(shared, Frame { w: format.width, h: format.height, rgba });
                 let ms = (position.max(0) / 10_000) as u64;
                 shared.pos_ms.store(ms, Relaxed);
-                crate::audio::mark_position(shared, ms);
+                crate::audio::mark_position(shared, position.max(0) as f64 / 10_000.0);
                 frame_at = Some(target_position + (position - target_position).max(0) / format.period * format.period);
             } else if frame_at.is_none() && Instant::now() >= deadline {
                 return Err("DirectShow timed out waiting for the first picture".into());

@@ -80,7 +80,7 @@ impl App {
                     }), position, range, direction, paused: false, file: None, seek: None, due: 0.0, take: None, mix: None,
                 });
                 if explicit.is_none() && (self.s.replay_channel < 2 || channel == 0) && self.s.output != Some(inputs[channel]) {
-                    self.s.preview = Some(inputs[channel]);
+                    self.s.select_preview(inputs[channel]);
                 }
             } else {
                 self.s.replay_status = if self.replay.session.native {
@@ -196,7 +196,7 @@ impl App {
                 let duration = mix.unwrap_or(self.s.replay_setup.transition_ms);
                 self.s.transition_input(id, if duration == 0 { Effect::Cut } else { Effect::Fade }, duration);
             } else {
-                self.s.preview = Some(id);
+                self.s.select_preview(id);
             }
             self.s.replay_status = "Replay playing directly from the recording".into();
         }
@@ -635,7 +635,7 @@ impl App {
                             }
                             self.s.transition_input(id, if transition == 0 { Effect::Cut } else { Effect::Fade }, transition);
                         } else if !replay.sync_playback || channel == 0 {
-                            self.s.preview = Some(id);
+                            self.s.select_preview(id);
                         }
                         self.s.replay_status = format!("Replay {} playing", ["A", "B"][channel]);
                     }

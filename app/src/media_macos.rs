@@ -36,6 +36,11 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         .collect()
 }
 
+/// The FFmpeg AVFoundation capture does not list a camera's modes up front: the dialog offers Auto only.
+pub fn camera_modes(_link: &str) -> Vec<CamMode> {
+    Vec::new()
+}
+
 pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
     let shared = Arc::new(Shared::default());
     shared.paused.store(paused, Relaxed);
@@ -43,6 +48,10 @@ pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
     if let Source::File(path) | Source::FfmpegFile(path, _, _) = &src {
         let (source, path) = (shared.clone(), path.clone());
         std::thread::spawn(move || crate::audio::play_file(source, path));
+    }
+    if let Source::Device(_, _, Some(audio)) = &src {
+        let (source, audio) = (shared.clone(), audio.clone());
+        std::thread::spawn(move || crate::audio::capture_device(source, &audio));
     }
     let worker = shared.clone();
     std::thread::spawn(move || match src {
@@ -63,7 +72,7 @@ pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
                 worker.set_status("No AVFoundation screen found. Check FFmpeg and Screen Recording permissions.");
             }
         }
-        Source::Device(link, mode) => match link.strip_prefix("avfoundation:") {
+        Source::Device(link, mode, _) => match link.strip_prefix("avfoundation:") {
             Some(index) if index.parse::<usize>().is_ok() => capture(&worker, index, mode),
             _ => worker.set_status("Select a camera available on this Mac"),
         },

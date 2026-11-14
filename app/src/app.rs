@@ -1,7 +1,52 @@
 //! Application start-up, the media update loop, frame completion and UI requests.
 use super::*;
 
+fn thumbnail_image(frame: &media::Frame, [max_w, max_h]: [usize; 2]) -> egui::ColorImage {
+    let ratio = (max_w as f64 / frame.w as f64).min(max_h as f64 / frame.h as f64).min(1.0);
+    let w = ((frame.w as f64 * ratio).round() as usize).max(1);
+    let h = ((frame.h as f64 * ratio).round() as usize).max(1);
+    let pixels = (0..h).flat_map(|y| {
+        (0..w).map(move |x| {
+            let offset = ((2 * y + 1) * frame.h / (2 * h) * frame.w
+                + (2 * x + 1) * frame.w / (2 * w)) * 4;
+            let p = &frame.rgba[offset..offset + 4];
+            Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
+        })
+    }).collect();
+    egui::ColorImage { size: [w, h], pixels }
+}
+
+fn update_video_texture(texture: &mut egui::TextureHandle, image: egui::ColorImage) {
+    // egui_glow uses glTexSubImage2D for partial updates and glTexImage2D for full ones.
+    let options = egui::TextureOptions::LINEAR;
+    if texture.size() == image.size {
+        texture.set_partial([0, 0], image, options);
+    } else {
+        texture.set(image, options);
+    }
+}
+
+#[test]
+fn tile_thumbnail_preserves_aspect_and_alpha() {
+    let rgba = [255, 0, 0, 128].repeat(8 * 4);
+    let frame = media::Frame { w: 8, h: 4, rgba };
+    let thumbnail = thumbnail_image(&frame, [4, 4]);
+    assert_eq!(thumbnail.size, [4, 2]);
+    assert!(thumbnail.pixels.iter().all(|pixel| *pixel == Color32::from_rgba_unmultiplied(255, 0, 0, 128)));
+}
+
 impl App {
+    pub(crate) fn refresh_external_devices(ctx: egui::Context) {
+        std::thread::spawn(move || {
+            decklink::refresh_devices();
+            ctx.data_mut(|data| {
+                let generation = egui::Id::new("decklink-device-generation");
+                let next = data.get_temp::<u64>(generation).unwrap_or(0).wrapping_add(1);
+                data.insert_temp(generation, next);
+            });
+            ctx.request_repaint();
+        });
+    }
     pub(crate) fn new(screenshot: Option<String>) -> Self {
         let mut s = Switcher::demo();
         // Settings window options saved last time (defaults are the original's config defaults).
@@ -222,6 +267,7 @@ impl App {
             multi_outputs: Default::default(),
             multi_output_failed: [false; OUTPUT_COUNT],
             decklink_outputs: Default::default(),
+            decklink_settings_visible: false,
             ndi_outputs: Default::default(),
             omt_outputs: Default::default(),
             srt_outputs: Default::default(),
@@ -236,6 +282,9 @@ impl App {
             snap_rx: None,
             photo_filter: 0,
             multi_started: Default::default(),
+            multi_audio: Default::default(),
+            group_audio: Vec::new(),
+            window_audio: Default::default(),
             scopes: Default::default(),
             next_wave: 0.0,
             scope_frame: Default::default(),
@@ -258,15 +307,21 @@ impl App {
             .chain(self.s.cfg.outputs.iter().enumerate().filter(|(channel, _)| {
                 self.ndi_outputs[*channel].as_ref().is_some_and(|(_, sender)| sender.subscribed())
                     || self.omt_outputs[*channel].as_ref().is_some_and(|(_, sender)| sender.subscribed())
-                    || self.s.srt_active[*channel]
+                    || self.s.srt_active[*channel] || self.s.decklink_active[*channel]
             }).map(|(_, route)| route.source))
             .chain(self.s.cfg.streams.iter().zip(&self.s.stream_active).filter(|(_, active)| **active)
                 .map(|(stream, _)| stream_route(&self.s, stream).source))
             .collect();
         #[cfg(windows)]
         let pending_gpu = &mut self.pending_gpu;
-        let App { s, media: feeds, delays, multi, multi_started, .. } = self;
+        let App { s, media: feeds, delays, multi, multi_started, multi_audio, .. } = self;
         let ids: std::collections::HashSet<u32> = s.inputs.iter().map(|i| i.id).collect();
+        let mut audio_history = std::collections::HashMap::<u32, f32>::new();
+        for input in &s.inputs {
+            if let Kind::VideoDelay { source: Some(source), seconds, .. } = input.kind {
+                audio_history.entry(source).and_modify(|current| *current = current.max(seconds)).or_insert(seconds);
+            }
+        }
         #[cfg(windows)]
         let delay_sources: std::collections::HashSet<u32> = s.inputs.iter().filter_map(|input| match input.kind {
             Kind::VideoDelay { source, .. } => source,
@@ -278,10 +333,12 @@ impl App {
         if !multicorder {
             multi.clear();
             multi_started.clear();
+            multi_audio.clear();
         } else {
             // Inputs ticked off in the MultiCorder window stop recording; "New File Every"
             // closes a file once it is old enough (a new one starts with the next frame).
             multi.retain(|id, _| ids.contains(id) && !s.mc_off.contains(id) && !(mc_split > 0.0 && now - multi_started.get(id).copied().unwrap_or(now) >= mc_split));
+            multi_audio.retain(|id, _| multi.contains_key(id));
         }
         let (mc_dir, mc_mbps, mc_fps, mc_hw, mc_format, mc_audio) = (
             s.cfg.mc_folder.clone(), s.cfg.mc_mbps, s.cfg.frame_rate(), s.cfg.hw_encoder, s.cfg.mc_codec, s.cfg.record_audio[2],
@@ -289,11 +346,18 @@ impl App {
         // Inputs seen big right now (Preview, Output, transitions, overlays and their layers).
         let skip = u64::from(s.cfg.preview_skip.max(1));
         let ui_frame = s.ui_frame;
+        let thumbnail_size = [s.cfg.input_w, s.cfg.input_h]
+            .map(|points| (points * ctx.pixels_per_point()).ceil().max(1.0) as usize);
         let mut live: std::collections::HashSet<u32> = [s.preview, s.output].into_iter().flatten().collect();
         live.extend(s.input_preview);
+        if s.replay_arm || s.replay_open {
+            live.extend(s.replay_angles.into_iter().filter_map(|source| source.checked_sub(1))
+                .filter(|id| s.input(*id).is_some()));
+        }
         if let Some(tr) = &s.trans {
             live.insert(tr.to);
             live.extend(tr.from);
+            live.extend(tr.stinger.as_ref().map(|stinger| stinger.input));
         }
         live.extend(s.overlays.iter().filter(|c| c.on || c.level > 0.0).filter_map(|c| c.input));
         // A Video Delay keeps its source reading even while the source is not on screen.
@@ -310,11 +374,13 @@ impl App {
                 live.insert(id);
             }
         }
-        let tops: Vec<u32> = live.iter().copied().collect();
-        for id in tops {
-            if let Some(i) = s.input(id) {
-                live.extend(i.layers.iter().filter(|l| l.on).filter_map(|l| l.input));
-            }
+        // The renderer draws layers and their children (depth two).
+        let mut layer_parents: Vec<u32> = live.iter().copied().collect();
+        for _ in 0..2 {
+            let children: Vec<u32> = layer_parents.iter().filter_map(|id| s.input(*id))
+                .flat_map(|input| input.layers.iter().filter(|layer| layer.on).filter_map(|layer| layer.input))
+                .filter(|id| live.insert(*id)).collect();
+            layer_parents = children;
         }
         for inp in &mut s.inputs {
             match &inp.kind {
@@ -345,8 +411,9 @@ impl App {
                             format!("{link}|{}|{}", inp.decklink_port, inp.decklink_mode), false, true,
                         ),
                         Kind::Device { link, .. } => (
-                            media::Source::Device(link.clone(), inp.cam_mode.clone()),
-                            format!("{link}|{}|{}", inp.cam_mode.as_ref().map(|m| m.code()).unwrap_or_default(), s.cfg.low_latency_capture),
+                            media::Source::Device(link.clone(), inp.cam_mode.clone(), inp.cam_audio.clone()),
+                            format!("{link}|{}|{}|{}", inp.cam_mode.as_ref().map(|m| m.code()).unwrap_or_default(), s.cfg.low_latency_capture,
+                                inp.cam_audio.as_deref().unwrap_or_default()),
                             false,
                             true,
                         ),
@@ -375,13 +442,13 @@ impl App {
                     let reload_page = matches!(inp.kind, Kind::Web { .. }) && std::mem::take(&mut inp.restart_req);
                     if feeds.get(&inp.id).is_some_and(|f| f.key != key || reload_page) {
                         // keep the last picture while the next list item starts
-                        let old_tex = feeds.remove(&inp.id).and_then(|mut feed| {
+                        let (old_tex, thumbnail_source) = feeds.remove(&inp.id).map(|mut feed| {
                             #[cfg(windows)]
-                            if feed.gpu_size.is_some() { return None; }
-                            feed.tex.take()
-                        });
+                            if feed.gpu_size.is_some() { return (None, None); }
+                            (feed.tex.take(), feed.thumbnail_source.take())
+                        }).unwrap_or_default();
                         feeds.insert(inp.id, Feed { shared: Some(media::start_for_gl(src.clone(), is_file && !inp.playing)),
-                            tex: old_tex, seen: 0, recorded: 0, key: key.clone(), prev_tex: None, fade_start: 0.0,
+                            tex: old_tex, thumbnail_source, seen: 0, recorded: 0, key: key.clone(), prev_tex: None, fade_start: 0.0,
                             colour_adjust: Default::default(),
                             colour_fx: Default::default(),
                             #[cfg(windows)]
@@ -389,16 +456,21 @@ impl App {
                         });
                     }
                     let feed = feeds.entry(inp.id).or_insert_with(|| Feed { shared: Some(media::start_for_gl(src, is_file && !inp.playing)),
-                        tex: None, seen: 0, recorded: 0, key, prev_tex: None, fade_start: 0.0,
+                        tex: None, thumbnail_source: None, seen: 0, recorded: 0, key, prev_tex: None, fade_start: 0.0,
                         colour_adjust: Default::default(),
                         colour_fx: Default::default(),
                         #[cfg(windows)]
                         gpu_size: None,
                     });
                     let Some(sh) = feed.shared.clone() else { continue };
+                    if let Ok(mut buffer) = sh.audio.try_lock() {
+                        buffer.retain_for_delay(audio_history.get(&inp.id).copied().unwrap_or(0.0));
+                    }
                     #[cfg(windows)]
-                    let delay_changed = sh.cpu_frames_required.swap(delay_sources.contains(&inp.id),
-                        std::sync::atomic::Ordering::AcqRel) != delay_sources.contains(&inp.id);
+                    let delay_changed = {
+                        let required = delay_sources.contains(&inp.id) || inp.colour_fx.needs_cpu();
+                        sh.cpu_frames_required.swap(required, std::sync::atomic::Ordering::AcqRel) != required
+                    };
                     #[cfg(not(windows))]
                     let delay_changed = false;
                     let k = inp.key;
@@ -482,18 +554,21 @@ impl App {
                                 media::Recorder::start_opts(p.to_string_lossy().to_string(), media::RecOpts { mbps: mc_mbps, size: None, fps: mc_fps, hw: mc_hw, format: mc_format, audio: mc_audio })
                             });
                             let at = Instant::now();
-                            let count = (f64::from(audio::RATE) / f64::from(mc_fps)).ceil() as usize;
-                            let packet = audio::mix([(&*sh, false, 1.0)], at, count);
+                            let nominal = (f64::from(audio::RATE) / f64::from(mc_fps)).round() as usize;
+                            let (end, count) = multi_audio.entry(inp.id).or_default().window(at, nominal);
+                            let packet = audio::mix([(&*sh, false, 1.0)], end, count);
                             rec.push_audio(rgba, w, h, at, packet);
                         }
                     }
                     // Preview Skip counts project pictures, even during rapid UI events.
-                    let skip_now = feed.tex.is_some() && skip > 1 && !live.contains(&inp.id) && !recording_this && ui_frame % skip != 0;
+                    let grade_only = !live.contains(&inp.id) && !recording_this;
+                    let skip_now = feed.tex.is_some() && skip > 1 && grade_only && ui_frame % skip != 0;
                     if video_due && seq != feed.seen && !skip_now {
                         feed.seen = seq;
                         #[cfg(windows)]
                         if let Some(picture) = sh.gpu_frame.lock().unwrap().take()
                         {
+                            feed.thumbnail_source = None;
                             let resize = feed.gpu_size != Some(picture.size);
                             if feed.gpu_size.is_none() {
                                 feed.tex = Some(ctx.load_texture(format!("gpu-input-{}", inp.id),
@@ -510,14 +585,22 @@ impl App {
                             inp.colour_fx.luma.apply(&mut fr.rgba);
                             inp.colour_adjust.apply(&mut fr.rgba);
                             inp.colour_fx.apply_lut(&mut fr.rgba);
+                            inp.colour_fx.apply_spatial(&mut fr.rgba, fr.w, fr.h);
                             // Video Delay inputs that copy this one take the new picture.
                             for delay in delays.values_mut().filter(|delay| delay.source == inp.id) {
                                 delay.capture(&fr.rgba, fr.w, fr.h, now);
                             }
                             #[cfg(windows)]
                             if feed.gpu_size.take().is_some() { feed.tex = None; }
-                            let img = egui::ColorImage::from_rgba_unmultiplied([fr.w, fr.h], &fr.rgba);
                             let photos = matches!(inp.kind, Kind::Photos { .. });
+                            let img = if grade_only && !photos && (fr.w > thumbnail_size[0] || fr.h > thumbnail_size[1]) {
+                                let image = thumbnail_image(&fr, thumbnail_size);
+                                feed.thumbnail_source = Some(fr);
+                                image
+                            } else {
+                                feed.thumbnail_source = None;
+                                egui::ColorImage::from_rgba_unmultiplied([fr.w, fr.h], &fr.rgba)
+                            };
                             if photos && feed.tex.is_some() {
                                 // Keep the old picture and fade the new one in over it.
                                 feed.prev_tex = feed.tex.take();
@@ -525,10 +608,18 @@ impl App {
                                 feed.tex = Some(ctx.load_texture(format!("input-{}-{}", inp.id, seq), img, egui::TextureOptions::LINEAR));
                             } else {
                                 match &mut feed.tex {
-                                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                    Some(t) => update_video_texture(t, img),
                                     None => feed.tex = Some(ctx.load_texture(format!("input-{}", inp.id), img, egui::TextureOptions::LINEAR)),
                                 }
                             }
+                        }
+                    }
+                    // If a new picture arrived, it already replaced the retained frame.
+                    // Otherwise promote the retained picture, including for paused clips.
+                    if !grade_only {
+                        if let (Some(frame), Some(tex)) = (feed.thumbnail_source.take(), &mut feed.tex) {
+                            update_video_texture(tex,
+                                egui::ColorImage::from_rgba_unmultiplied([frame.w, frame.h], &frame.rgba));
                         }
                     }
                     inp.tex = feed.tex.as_ref().map(|t| (t.id(), t.size()));
@@ -546,7 +637,7 @@ impl App {
                 }
                 Kind::ImageFile { path } => {
                     if feeds.get(&inp.id).is_none_or(|feed| feed.colour_adjust != inp.colour_adjust || feed.colour_fx != inp.colour_fx) {
-                        let mut f = Feed { shared: None, tex: None, seen: 0, recorded: 0, key: String::new(), prev_tex: None, fade_start: 0.0,
+                        let mut f = Feed { shared: None, tex: None, thumbnail_source: None, seen: 0, recorded: 0, key: String::new(), prev_tex: None, fade_start: 0.0,
                             colour_adjust: inp.colour_adjust,
                             colour_fx: inp.colour_fx.clone(),
                             #[cfg(windows)]
@@ -558,6 +649,8 @@ impl App {
                                 inp.colour_fx.luma.apply(im.as_mut());
                                 inp.colour_adjust.apply(im.as_mut());
                                 inp.colour_fx.apply_lut(im.as_mut());
+                                let (width, height) = im.dimensions();
+                                inp.colour_fx.apply_spatial(im.as_mut(), width as usize, height as usize);
                                 let (w, h) = im.dimensions();
                                 let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], im.as_raw());
                                 f.tex = Some(ctx.load_texture(format!("input-{}", inp.id), ci, egui::TextureOptions::LINEAR));
@@ -579,13 +672,15 @@ impl App {
             let size = [resolution[0].max(1) as usize, resolution[1].max(1) as usize];
             let seconds = *seconds;
             let feed = delays.entry(inp.id).or_insert_with(|| DelayFeed::new(size));
-            if feed.size != size {
+            let source = source.unwrap_or(0);
+            if feed.size != size || feed.source != source {
                 feed.size = size;
                 feed.frames.clear();
                 feed.last = -1.0;
+                feed.tex = None;
             }
             feed.seconds = seconds;
-            if let Some(source) = source { feed.source = *source; }
+            feed.source = source;
             match feed.ready(now) {
                 Some(time) => {
                     if time != feed.last {
@@ -595,7 +690,7 @@ impl App {
                             egui::ColorImage::from_rgba_unmultiplied([frame.2, frame.3], &frame.1)
                         };
                         match &mut feed.tex {
-                            Some(texture) => texture.set(img, egui::TextureOptions::LINEAR),
+                            Some(texture) => update_video_texture(texture, img),
                             None => feed.tex = Some(ctx.load_texture(format!("delay-{}", inp.id), img,
                                 egui::TextureOptions::LINEAR)),
                         }
@@ -632,23 +727,29 @@ impl App {
             for recording in self.composed_recordings() {
                 let route = recording.route(&self.s.cfg);
                 let audio_source = recording.audio_override.unwrap_or(route.source);
-                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == audio_source) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == audio_source && !destinations.key_fill) {
                     destinations.recorders.push(Arc::clone(&recording.recorder));
                 } else {
                     groups.push((route, audio_source, program::Destinations { recorders: vec![Arc::clone(&recording.recorder)], ..Default::default() }));
                 }
             }
-            for (channel, (_, sink)) in self.decklink_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))) {
+            for (channel, (config, sink)) in self.decklink_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
-                    destinations.decklinks.push(sink.clone());
+                if config.key_fill {
+                    groups.push((route, route.source, program::Destinations {
+                        key_fill: true, decklinks: vec![(channel, sink.clone(), Default::default())], ..Default::default()
+                    }));
+                    continue;
+                }
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == route.source && !destinations.key_fill) {
+                    destinations.decklinks.push((channel, sink.clone(), Default::default()));
                 } else {
-                    groups.push((route, route.source, program::Destinations { decklinks: vec![sink.clone()], ..Default::default() }));
+                    groups.push((route, route.source, program::Destinations { decklinks: vec![(channel, sink.clone(), Default::default())], ..Default::default() }));
                 }
             }
             for (channel, (_, sink)) in self.ndi_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))).filter(|(_, (_, sink))| sink.subscribed()) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == route.source && !destinations.key_fill) {
                     destinations.ndi.push(sink.clone());
                 } else {
                     groups.push((route, route.source, program::Destinations { ndi: vec![sink.clone()], ..Default::default() }));
@@ -656,7 +757,7 @@ impl App {
             }
             for (channel, (_, sink)) in self.omt_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))).filter(|(_, (_, sink))| sink.subscribed()) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == route.source && !destinations.key_fill) {
                     destinations.omt.push(sink.clone());
                 } else {
                     groups.push((route, route.source, program::Destinations { omt: vec![sink.clone()], ..Default::default() }));
@@ -664,7 +765,7 @@ impl App {
             }
             for (channel, (_, sink)) in self.srt_outputs.iter().enumerate().filter_map(|(channel, sink)| sink.as_ref().map(|sink| (channel, sink))) {
                 let route = self.s.cfg.outputs[channel];
-                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == route.source) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == route.source && !destinations.key_fill) {
                     destinations.streams.push(sink.clone());
                 } else {
                     groups.push((route, route.source, program::Destinations { streams: vec![sink.clone()], ..Default::default() }));
@@ -674,17 +775,41 @@ impl App {
                 let destination = &self.s.cfg.streams[index];
                 let route = stream_route(&self.s, destination);
                 let audio_source = if destination.source_audio { route.source } else { SRC_OUTPUT };
-                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, _)| *existing == route && *audio == audio_source) {
+                if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == audio_source && !destinations.key_fill) {
                     destinations.streams.push(sink.clone());
                 } else {
                     groups.push((route, audio_source, program::Destinations { streams: vec![sink.clone()], ..Default::default() }));
                 }
             }
             let captured_at = Instant::now();
+            let nominal = (f64::from(audio::RATE) / self.record_format.1).round() as usize;
+            // Groups that ended lose their cursor, so a new output starts a new run.
+            self.group_audio.retain(|(key, _)| groups.iter().any(|(route, audio, _)| (*route, *audio) == *key));
             for (route, audio_source, mut recorders) in groups {
-                let count = (f64::from(audio::RATE) / self.record_format.1).ceil() as usize;
-                recorders.audio = self.mix_audio(audio_source, captured_at, count);
-                draw_src(&egui::Painter::new(ctx.clone(), layer, rect), rect, &self.s, now, route.source, route.overlays);
+                let cursor = match self.group_audio.iter().position(|(key, _)| *key == (route, audio_source)) {
+                    Some(index) => &mut self.group_audio[index].1,
+                    None => {
+                        self.group_audio.push(((route, audio_source), audio::AudioCursor::default()));
+                        &mut self.group_audio.last_mut().unwrap().1
+                    }
+                };
+                let (end, count) = cursor.window(captured_at, nominal);
+                if !recorders.recorders.is_empty() || !recorders.ndi.is_empty() || !recorders.omt.is_empty()
+                    || !recorders.streams.is_empty()
+                {
+                    recorders.audio = self.mix_audio(audio_source, end, count);
+                }
+                for (channel, _, packet) in &mut recorders.decklinks {
+                    if recorders.key_fill { continue; }
+                    let config = self.s.cfg.decklink_outputs[*channel];
+                    *packet = self.mix_external_audio(config.audio_bus, config.audio_delay_ms, end, count);
+                }
+                let painter = egui::Painter::new(ctx.clone(), layer, rect);
+                if recorders.key_fill {
+                    draw_overlay_channels(&painter, rect, &self.s, now, false);
+                } else {
+                    draw_src(&painter, rect, &self.s, now, route.source, route.overlays);
+                }
                 let shapes = ctx.graphics_mut(|graphics| {
                     std::mem::take(graphics.entry(layer)).all_entries().cloned().collect()
                 });
@@ -843,8 +968,9 @@ impl App {
             }
             if !recorders.is_empty() && w > 0 && h > 0 {
                 let at = Instant::now();
-                let count = (f64::from(audio::RATE) / self.record_format.1).ceil() as usize;
-                let audio = self.mix_audio(SRC_OUTPUT, at, count);
+                let nominal = (f64::from(audio::RATE) / self.record_format.1).round() as usize;
+                let (end, count) = self.window_audio.window(at, nominal);
+                let audio = self.mix_audio(SRC_OUTPUT, end, count);
                 media::Recorder::push_group_audio(&recorders, px, w, h, at, false, audio);
             }
         }
@@ -916,6 +1042,20 @@ impl App {
                                 });
                             }
                         }
+                        (media::PickKind::Script(target), _) => match model::read_script(std::path::Path::new(&p)) {
+                            Ok(text) => match target {
+                                None => self.s.add_dialog.script = text,
+                                Some(id) => {
+                                    if let Some(input) = self.s.input_mut(id) {
+                                        if let Kind::Teleprompter(cfg) = &mut input.kind {
+                                            cfg.text = text;
+                                            input.pos = 0.0;
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => self.s.notice(&error),
+                        },
                         (media::PickKind::SettingsOpen, _) => {
                             let result = self.s.import_settings_from(std::path::Path::new(&p));
                             self.s.notice(&result.unwrap_or_else(|error| error));

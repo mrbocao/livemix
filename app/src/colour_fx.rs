@@ -40,6 +40,9 @@ pub struct Lut {
 #[derive(Clone, Debug, Default)]
 pub struct Effects {
     pub luma: LumaKey,
+    pub blur: u8,
+    pub mask_path: String,
+    mask: Option<Arc<image::GrayImage>>,
     pub lut_path: String,
     pub lut: Option<Arc<Lut>>,
 }
@@ -47,6 +50,12 @@ pub struct Effects {
 impl PartialEq for Effects {
     fn eq(&self, other: &Self) -> bool {
         self.luma == other.luma && self.lut_path == other.lut_path
+            && self.blur == other.blur && self.mask_path == other.mask_path
+            && match (&self.mask, &other.mask) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
             && match (&self.lut, &other.lut) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
@@ -56,6 +65,53 @@ impl PartialEq for Effects {
 }
 
 impl Effects {
+    pub fn load_mask(&mut self, path: &Path) -> Result<(), String> {
+        let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let mut reader = image::ImageReader::open(&path).map_err(|error| error.to_string())?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(96 * 1024 * 1024);
+        reader.limits(limits);
+        let pixels = reader.decode().map_err(|error| error.to_string())?.into_rgba8();
+        let use_alpha = pixels.pixels().any(|pixel| pixel[3] < 255);
+        let mask = image::GrayImage::from_fn(pixels.width(), pixels.height(), |x, y| {
+            use image::Pixel;
+            let pixel = pixels.get_pixel(x, y);
+            if use_alpha { image::Luma([pixel[3]]) } else { pixel.to_luma() }
+        });
+        self.mask_path = path.to_string_lossy().into_owned();
+        self.mask = Some(Arc::new(mask));
+        Ok(())
+    }
+
+    pub fn clear_mask(&mut self) {
+        self.mask_path.clear();
+        self.mask = None;
+    }
+
+    pub fn needs_cpu(&self) -> bool {
+        self.blur > 0 || self.mask.is_some()
+    }
+
+    pub fn apply_spatial(&self, pixels: &mut [u8], width: usize, height: usize) {
+        if !self.needs_cpu() || width == 0 || height == 0 { return; }
+        if self.blur > 0 {
+            if let Some(buffer) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, &mut *pixels) {
+                let blurred = image::imageops::blur(&buffer, f32::from(self.blur.min(12)));
+                pixels.copy_from_slice(blurred.as_raw());
+            }
+        }
+        if let Some(mask) = &self.mask {
+            let (mw, mh) = (mask.width() as usize, mask.height() as usize);
+            for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (index % width * mw / width, index / width * mh / height);
+                let opacity = u16::from(mask.get_pixel(x as u32, y as u32)[0]);
+                pixel[3] = ((u16::from(pixel[3]) * opacity + 127) / 255) as u8;
+            }
+        }
+    }
+
     pub fn load(&mut self, path: &Path) -> Result<(), String> {
         let path = std::path::absolute(path).map_err(|error| error.to_string())?;
         let lut = Lut::read(&path)?;

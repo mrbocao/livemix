@@ -7,7 +7,9 @@ pub const EXAMPLES: &str = "ActiveInput 1 · Effect1 · MasterAudioOn · SoloOn 
 InputPreviewShow 1 · InputPreviewHide · SetInputName 1 Camera One · SetText 1 Title.Text Updated headline\n\
 SetLayer 1 2 3 · LayerOnOff 1 2 · SetLayer2Width 1 640 · SetLayer2Crop 1 0,0,1,1 · SetLayerDynamicZoom 1 2 0.5\n\
 SetOutput2 Preview · SetOutputFullscreen2 MultiView1 · StartSRTOutput 2 · StopSRTOutput 2\n\
-ReplayPlayEventToOutput 0 · ReplaySetSelectedEventText Great save · ReplayToggleSelectedEventCamera2 · ReplayDeleteLastEvent";
+ReplayPlayEventToOutput 0 · ReplaySetSelectedEventText Great save · ReplayToggleSelectedEventCamera2 · ReplayDeleteLastEvent\n\
+TeleprompterPlayPause · TeleprompterFaster · TeleprompterSlower 10 · TeleprompterSpeed 40 · TeleprompterScroll -3 · TeleprompterHome · TeleprompterEnd\n\
+TeleprompterBigger · TeleprompterSmaller · TeleprompterFlipSides · TeleprompterFlipVertical · TeleprompterLoop · TeleprompterSpeed {value}";
 
 fn parse_index(text: &str, count: usize) -> Result<usize, String> {
     text.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).filter(|&n| n < count)
@@ -319,6 +321,42 @@ pub fn run(
             s.replay_command = Some(Action::Export { event, angle: s.replay_cameras[s.replay_channel.min(1)] });
         }
         "replayjumptonow" => s.replay_command = Some(Action::Live),
+        "teleprompterplaypause" | "teleprompterfaster" | "teleprompterslower" | "teleprompterspeed"
+        | "teleprompterscroll" | "teleprompterbigger" | "telepromptersmaller" | "teleprompterstart"
+        | "teleprompterstop" | "teleprompterhome" | "teleprompterend" | "teleprompterloop"
+        | "teleprompterfliptext" | "teleprompterflipvertical" | "teleprompterflipsides" => {
+            // "TeleprompterSpeed 40" sets the speed of the default prompter; "TeleprompterSpeed 2 40" names input 2.
+            let lone_value = args.len() == 1 && matches!(op, "teleprompterspeed" | "teleprompterscroll");
+            let named = if lone_value { None } else { args.first().copied() };
+            let Some((id, at)) = prompter_target(s, named, &target) else {
+                // The default keys are bound whether or not a script is on the desk.
+                return Ok(true);
+            };
+            let value = args.get(at).copied();
+            let item = s.input_mut(id).unwrap();
+            let lines = if let Kind::Teleprompter(cfg) = &item.kind { cfg.lines() } else { 0.0 };
+            let Kind::Teleprompter(cfg) = &mut item.kind else { unreachable!() };
+            let step = |default: f32| value.map_or(Ok(default), scalar);
+            match op {
+                "teleprompterplaypause" => item.playing = !item.playing,
+                "teleprompterstart" => item.playing = true,
+                "teleprompterstop" => item.playing = false,
+                "teleprompterhome" => item.pos = 0.0,
+                "teleprompterend" => item.pos = lines.max(0.0),
+                "teleprompterloop" => item.loop_on = !item.loop_on,
+                "teleprompterfaster" => cfg.lines_per_min = (cfg.lines_per_min + step(5.0)?).clamp(0.0, 240.0),
+                "teleprompterslower" => cfg.lines_per_min = (cfg.lines_per_min - step(5.0)?).clamp(0.0, 240.0),
+                "teleprompterspeed" => cfg.lines_per_min = scalar(value.ok_or("Missing speed in lines per minute")?)?.clamp(0.0, 240.0),
+                "teleprompterscroll" => {
+                    let moved = item.pos + scalar(value.ok_or("Missing number of lines")?)?;
+                    item.pos = if lines > 0.0 { moved.clamp(0.0, lines) } else { moved.max(0.0) };
+                }
+                "teleprompterbigger" => cfg.size = (cfg.size + step(0.01)?).clamp(0.02, 0.25),
+                "telepromptersmaller" => cfg.size = (cfg.size - step(0.01)?).clamp(0.02, 0.25),
+                "teleprompterfliptext" | "teleprompterflipsides" => cfg.mirror_x = !cfg.mirror_x,
+                _ => cfg.flip_y = !cfg.flip_y,
+            }
+        }
         _ => {
             let Some(rest) = op.strip_prefix("setlayer") else { return Ok(false); };
             let (layer, property, value_index) = if let Some(property) = rest.strip_prefix("dynamic") {
@@ -335,6 +373,18 @@ pub fn run(
         }
     }
     Ok(true)
+}
+
+/// The Teleprompter a command acts on: the one named by the first argument, otherwise the one on
+/// Output, otherwise the first one. Returns the id and the index of the command's own value.
+fn prompter_target(s: &Switcher, first: Option<&str>, target: &impl Fn(&Switcher, &str) -> Option<u32>) -> Option<(u32, usize)> {
+    let is_prompter = |id: u32| s.input(id).is_some_and(|input| matches!(input.kind, Kind::Teleprompter(_)));
+    if let Some(id) = first.and_then(|name| target(s, name)).filter(|id| is_prompter(*id)) {
+        return Some((id, 1));
+    }
+    let id = s.output.filter(|id| is_prompter(*id))
+        .or_else(|| s.inputs.iter().find(|input| matches!(input.kind, Kind::Teleprompter(_))).map(|input| input.id))?;
+    Some((id, 0))
 }
 
 fn set_title_text(input: &mut Input, field: &str, value: String, now: f64) -> Result<(), String> {
@@ -382,6 +432,59 @@ mod tests {
         loaded.load_preset_text(&switcher.preset_text());
         assert_eq!(loaded.inputs[0].layers[9].scale, expected.scale);
         assert_eq!(loaded.inputs[0].layers[9].place, expected.place);
+    }
+
+    #[test]
+    fn teleprompter_commands_use_the_default_prompter_or_a_named_one() {
+        let mut s = Switcher::demo();
+        // No Teleprompter on the desk: the keys do nothing and report no error.
+        s.perform_action("TeleprompterFaster", 1.0).unwrap();
+        let first = s.add(Input::new(0, "A", Kind::Teleprompter(Default::default())));
+        let second = s.add(Input::new(0, "B", Kind::Teleprompter(Default::default())));
+        let speed = |s: &Switcher, id| match &s.input(id).unwrap().kind {
+            Kind::Teleprompter(cfg) => cfg.lines_per_min, _ => unreachable!(),
+        };
+        let number = |id| s.inputs.iter().position(|i| i.id == id).unwrap() + 1;
+        let (n1, n2) = (number(first), number(second));
+        s.perform_action("TeleprompterFaster", 1.0).unwrap();
+        assert_eq!(speed(&s, first), 35.0, "the first prompter is the default");
+        s.perform_action(&format!("TeleprompterSlower {n2} 10"), 1.0).unwrap();
+        assert_eq!(speed(&s, second), 20.0);
+        s.perform_action("TeleprompterSpeed 60", 1.0).unwrap();
+        assert_eq!(speed(&s, first), 60.0, "a lone value is the speed, not an input number");
+        s.perform_action(&format!("TeleprompterSpeed {n1} 400"), 1.0).unwrap();
+        assert_eq!(speed(&s, first), 240.0);
+        s.perform_action("TeleprompterPlayPause", 1.0).unwrap();
+        assert!(s.input(first).unwrap().playing);
+        s.perform_action("TeleprompterScroll -3", 1.0).unwrap();
+        assert_eq!(s.input(first).unwrap().pos, 0.0, "never before the first line");
+        s.perform_action("TeleprompterScroll 7", 1.0).unwrap();
+        assert_eq!(s.input(first).unwrap().pos, 7.0);
+        s.perform_action("TeleprompterHome", 1.0).unwrap();
+        assert_eq!(s.input(first).unwrap().pos, 0.0);
+        s.perform_action("TeleprompterFlipSides", 1.0).unwrap();
+        assert!(matches!(&s.input(first).unwrap().kind, Kind::Teleprompter(cfg) if cfg.mirror_x));
+        assert!(s.perform_action("TeleprompterSpeed", 1.0).is_err());
+    }
+
+    #[test]
+    fn script_files_decode_utf8_utf16_and_windows_text() {
+        use crate::model::decode_script;
+        assert_eq!(decode_script(b"\xEF\xBB\xBFOl\xC3\xA1\r\nmundo"), "Olá\nmundo");
+        assert_eq!(decode_script(&[0xFF, 0xFE, b'O', 0, 0xE1, 0, b'\r', 0, b'\n', 0, b'!', 0]), "Oá\n!");
+        assert_eq!(decode_script(&[0xFE, 0xFF, 0, b'O', 0, 0xE1]), "Oá");
+        // Windows-1252: "ação" with a curly quote.
+        assert_eq!(decode_script(b"a\xE7\xE3o \x93ok\x94"), "ação “ok”");
+    }
+
+    #[test]
+    fn teleprompter_keys_skip_bound_keys() {
+        let mut keys = crate::model::default_shortcuts();
+        let before = keys.len();
+        let added = crate::model::add_teleprompter_shortcuts(&mut keys);
+        assert_eq!(added, crate::model::TELEPROMPTER_KEYS.len());
+        assert_eq!(crate::model::add_teleprompter_shortcuts(&mut keys), 0);
+        assert_eq!(keys.len(), before + added);
     }
 
     #[test]

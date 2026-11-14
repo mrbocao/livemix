@@ -176,6 +176,76 @@ fn fit_aspect(r: Rect, ar: f32) -> Rect {
     Rect::from_center_size(r.center(), Vec2::new(w, h))
 }
 
+/// Teleprompter: the script laid out at the chosen size, scrolled `pos` lines so the line being
+/// read sits on the reading line, optionally mirrored or flipped for a prompter glass.
+fn draw_prompter(p: &Painter, r: Rect, cfg: &crate::model::Prompter, pos: f32, a: f32) {
+    let p = p.with_clip_rect(p.clip_rect().intersect(r));
+    let [br, bg, bb] = cfg.background;
+    p.rect_filled(r, 0.0, fade(Color32::from_rgb(br, bg, bb), a));
+    let (w, h) = (r.width(), r.height());
+    if w < 4.0 || h < 4.0 {
+        return;
+    }
+    let font = (h * cfg.size.clamp(0.01, 0.5)).max(6.0);
+    let line_h = font * cfg.line_spacing.clamp(1.0, 3.0);
+    let margin = w * cfg.margin.clamp(0.0, 0.4);
+    let wrap = (w - 2.0 * margin).max(font);
+    let [tr, tg, tb] = cfg.text_colour;
+    let mut job = egui::text::LayoutJob::simple(cfg.text.clone(), FontId::proportional(font),
+        Color32::from_rgb(tr, tg, tb), wrap);
+    job.halign = if cfg.centre { egui::Align::Center } else { egui::Align::Min };
+    if let Some(section) = job.sections.first_mut() {
+        section.format.line_height = Some(line_h);
+    }
+    let galley = p.layout_job(job);
+    // The renderer is the only one that knows how the script wraps: tell the scroll how long it is.
+    cfg.measured.store((galley.rows.len() as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+    let guide_y = r.top() + h * cfg.guide_pos.clamp(0.05, 0.9);
+    let origin = pos2(if cfg.centre { r.center().x } else { r.left() + margin }, guide_y - pos.max(0.0) * line_h);
+    let centre = r.center();
+    // Mirrored positions: reflect a point or a rectangle about the picture's centre.
+    let flip_x = |x: f32| if cfg.mirror_x { 2.0 * centre.x - x } else { x };
+    let flip_y = |y: f32| if cfg.flip_y { 2.0 * centre.y - y } else { y };
+    if cfg.guide {
+        let (y0, y1) = (flip_y(guide_y), flip_y(guide_y + line_h));
+        let band = Rect::from_min_max(pos2(r.left(), y0.min(y1)), pos2(r.right(), y0.max(y1)));
+        p.rect_filled(band, 0.0, fade(Color32::from_white_alpha(28), a));
+        let tick = font * 0.5;
+        for (x, dir) in [(r.left(), 1.0), (r.right(), -1.0)] {
+            let c = pos2(x, band.center().y);
+            p.add(Shape::convex_polygon(
+                vec![c + Vec2::new(0.0, -tick * 0.5), c + Vec2::new(dir * tick * 0.8, 0.0), c + Vec2::new(0.0, tick * 0.5)],
+                fade(Color32::from_rgb(0xff, 0xb4, 0x20), a), Stroke::NONE));
+        }
+    }
+
+    // The galley's glyph meshes are drawn directly so they can be reflected; rows outside the
+    // picture are skipped, which keeps long scripts cheap.
+    let size = p.ctx().fonts(|fonts| fonts.font_image_size());
+    let norm = Vec2::new(1.0 / size[0].max(1) as f32, 1.0 / size[1].max(1) as f32);
+    let visible = p.clip_rect().expand(2.0);
+    let mut mesh = Mesh::default();
+    for row in &galley.rows {
+        if row.visuals.mesh.is_empty() {
+            continue;
+        }
+        let b = row.visuals.mesh_bounds.translate(origin.to_vec2());
+        let (y0, y1) = (flip_y(b.top()), flip_y(b.bottom()));
+        if y0.max(y1) < visible.top() || y0.min(y1) > visible.bottom() {
+            continue;
+        }
+        let base = mesh.vertices.len() as u32;
+        mesh.indices.extend(row.visuals.mesh.indices.iter().map(|i| i + base));
+        mesh.vertices.extend(row.visuals.mesh.vertices.iter().map(|v| egui::epaint::Vertex {
+            pos: pos2(flip_x(origin.x + v.pos.x), flip_y(origin.y + v.pos.y)),
+            uv: pos2(v.uv.x * norm.x, v.uv.y * norm.y),
+            color: v.color.gamma_multiply(a),
+        }));
+    }
+    p.add(Shape::mesh(mesh));
+}
+
 /// Draws the input's own picture filling `r` with opacity `a`.
 fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
     if a <= 0.0 {
@@ -254,6 +324,7 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             p.text(r.center() - Vec2::new(0.0, h * 0.06), Align2::CENTER_CENTER, clock(t), FontId::monospace((h * 0.2).max(8.0)), fade(Color32::from_rgb(0xff, 0xd0, 0x40), a));
             p.text(r.center() + Vec2::new(0.0, h * 0.14), Align2::CENTER_CENTER, "SHOW TIME", FontId::proportional((h * 0.06).max(5.0)), fade(TEXT_DIM, a));
         }
+        Kind::Teleprompter(cfg) => draw_prompter(p, r, cfg, inp.pos, a),
         Kind::Camera(seed) => {
             let sd = *seed as f32;
             let tint = (sd * 0.27) % 1.0;
@@ -295,7 +366,7 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             p.text(r.center(), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.11).max(6.0)), fade(Color32::from_white_alpha(230), a));
         }
         Kind::AudioFile { .. } | Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. } | Kind::Web { .. } | Kind::VideoDelay { .. } => {
-            let keyed = inp.key.on || inp.colour_fx.luma.enabled
+            let keyed = inp.key.on || inp.colour_fx.luma.enabled || !inp.colour_fx.mask_path.is_empty()
                 || matches!(inp.kind, Kind::ImageFile { .. } | Kind::ImageSequence { .. } | Kind::Web { transparent: true, .. });
             match inp.tex {
                 Some((tex, [tw, th])) if tw > 0 && th > 0 => {

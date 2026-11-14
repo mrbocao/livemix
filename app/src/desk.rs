@@ -67,9 +67,7 @@ pub(crate) fn top_bar(ctx: &egui::Context, s: &mut Switcher) {
                         s.settings_open = !s.settings_open;
                     }
                     if bar_btn(ui, "Pause Inputs", false).on_hover_text(tr(ui, "Pause all currently playing video inputs")).clicked() {
-                        for i in &mut s.inputs {
-                            i.playing = false;
-                        }
+                        s.pause_video_inputs();
                     }
                 });
             });
@@ -344,8 +342,12 @@ pub(crate) fn video_transport(ui: &mut egui::Ui, inp: &mut Input, width: f32, pi
         p.line_segment([egui::pos2(track.left(), y), egui::pos2(track.right(), y)], Stroke::new(2.0_f32, BTN));
         let thumb = egui::Rect::from_center_size(egui::pos2(track.left() + fraction * track.width(), y), Vec2::new(8.0, 16.0));
         p.rect(thumb, 0.0, if response.hovered() { BTN_HOVER } else { BTN }, Stroke::new(1.0_f32, TEXT), egui::StrokeKind::Inside);
-        let time = format!("{}  /  {}  /  {}", clock(inp.pos as f64), clock(inp.duration as f64),
-            clock((inp.duration - inp.pos).max(0.0) as f64));
+        let time = if matches!(inp.kind, Kind::Teleprompter(_)) {
+            format!("Line {:.0} / {:.0}", inp.pos.floor() + 1.0, inp.duration)
+        } else {
+            format!("{}  /  {}  /  {}", clock(inp.pos as f64), clock(inp.duration as f64),
+                clock((inp.duration - inp.pos).max(0.0) as f64))
+        };
         let pos = picture.center_bottom() - Vec2::new(0.0, 4.0);
         let p = ui.painter_at(picture);
         let text = p.layout_no_wrap(time, egui::FontId::monospace(14.0), Color32::WHITE);

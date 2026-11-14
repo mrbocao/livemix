@@ -5,9 +5,23 @@
 3. Choose the source for each output in **Settings → Outputs / NDI / OMT / SRT**. Set the corresponding destination or hardware connector before enabling it.
 4. Save the show as a `.livemix` project preset. To open an older XML preset in Windows, select **All files** in the Open dialog. Use **Save As** to save it with the new extension. Reopening it shows an import report with unsupported inputs and missing asset references. Keep the media files accessible from the machine that opens the show.
 
+Enable **Settings → Options → Start External Output** to open the local External 1 window when LiveMix starts. The window uses the source configured for Output 1.
+
 **Last** restores the automatic recovery preset in the LiveMix storage directory. LiveMix writes this copy roughly every 60 seconds and before **New** or a normal exit. The untouched startup demo and empty projects are skipped. Use **Save As** after restoring to create an ordinary project file.
 
 ## Display and source selection
+
+In **Input Settings → Effects**, use **Blur** and load an **Alpha mask** for supported video and image inputs. Transparent masks use their alpha channel, and opaque masks use brightness. Both settings are saved with the project. These effects process frames in system memory.
+
+Under **External Output**, each DeckLink tab can select Master, A or B for embedded audio and apply up to 1,000 ms of audio delay.
+
+For an external graphics keyer, choose a DeckLink playback device and a supported format, enable **Alpha Channel → Key + Fill (Graphics Only)**, then start **External Renderer**. Put graphics on Program overlay channels. This mode sends those overlays over a transparent background and uses the hardware to generate the two SDI signals. Match the format on the switcher and use the key inputs and connector mapping for the selected Desktop Video profile. Graphics Only sends video without embedded audio.
+
+NDI and OMT inputs use sender timestamps, when available, to schedule audio and video on the same local clock with a 60 ms initial buffer. Video Delay uses the chosen delay for both the picture and the source audio. Use the delay input's mixer strip to route or mute its audio.
+
+**Settings → About** shows the FFmpeg executable selected by LiveMix. With hardware encoding enabled, FFmpeg streaming and H.264/HEVC recordings test the encoder at the selected output size and frame rate. If no hardware encoder passes, LiveMix selects software and reports the fallback in the stream log or recording encoder status.
+
+**Settings → Performance → Preview Skip** controls how often off-air input cards refresh. Video frames in system memory used only by those cards are uploaded at card size, with the latest full-size frame retained for immediate promotion to Preview or Program.
 
 In **Settings → Display**, set the theme and the Preview and Output colors. The colors also apply to the matching input and MultiView title bars. Set the monitor, source and overlay option separately for **Fullscreen 1** and **Fullscreen 2**. Open them from the top toolbar. Active outputs use separate monitors. Click the Production Clock under the overlay buttons to pause or resume, and right-click to reset.
 
@@ -55,6 +69,16 @@ Use **Import**, **Export** and **Default** in the Settings footer. Choose **Lega
 6. **Export** writes an MP4 into a LiveMix session's `export/` folder. The session saves event IDs, time ranges, available angles, descriptions and event speeds in `livemix-replay.json`. FFmpeg prepares clips for playback and export. Keep the manifest and original camera segments together.
 
 Add a **Telestrator** input and assign it to an overlay. Draw freehand in its input settings or start **Settings → Web Controller** and open `http://127.0.0.1:8088/telestrator/` on the LiveMix machine. The browser sends its strokes to the first Telestrator input. Use the editor's undo or clear controls during the show.
+
+## Cameras and capture cards
+
+Choose **Add Input → Camera** and pick the device. For webcams, USB cameras and capture cards, LiveMix reads the modes the device reports and lists **Resolution**, **Frame Rate** (interlaced modes are marked) and **Video Format**. **Auto** takes the best mode up to the Performance limit. Capture cards usually send audio on a separate Windows audio input, so choose it in **Audio Device**; LiveMix selects an input whose name matches the card when it finds one, and **None** leaves the picture without audio. The same options are in **Input Settings → General**, and a new choice restarts the camera. Blackmagic DeckLink devices use their own connector and video format list. On macOS the mode list is not available and the camera stays on **Auto**.
+
+## Teleprompter
+
+Use **Add Input → Teleprompter**, paste the script or choose **Load text file…** (UTF-8, UTF-16 or Windows text, up to 4 MB), and press OK. **Import text file…** in Input Settings replaces the script of an existing input and returns to the first line. Press play on the input tile to scroll; the bar under the picture seeks by line. In **Input Settings → Teleprompter** set the speed in lines per minute, text size, line spacing, margins, alignment, colours and the highlighted reading line, and turn on **Mirror** or **Flip** for a prompter glass. **Loop at the end** restarts the script; otherwise scrolling stops on the last line. To show the script only to the presenter, choose the input as the source of an external output window. The scroll length comes from the picture the last time it was drawn, so a script that has never been visible does not stop at its end.
+
+To control the scroll during the show, press **Settings → Shortcuts → Add Teleprompter keys**: **Space** plays or pauses, **Up** and **Down** scroll three lines, **Right** and **Left** change the speed by 5 lines per minute, **Home** returns to the top, and **+** and **−** change the text size. Keys that are already bound are skipped, and you can rebind any of them. The commands also work from MIDI and automation scripts: `TeleprompterPlayPause`, `TeleprompterFaster [step]`, `TeleprompterSlower [step]`, `TeleprompterSpeed <lines/min>`, `TeleprompterScroll <lines>` (negative goes back), `TeleprompterHome`, `TeleprompterEnd`, `TeleprompterBigger`, `TeleprompterSmaller`, `TeleprompterFlipSides`, `TeleprompterFlipVertical` and `TeleprompterLoop`. They act on the Teleprompter on Output, or the first one, and do nothing when there is none. With several, give the input number first, for example `TeleprompterSpeed 3 40`. For a MIDI knob use `TeleprompterSpeed {value}`.
 
 ## Control and automation
 

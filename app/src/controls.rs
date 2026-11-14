@@ -272,6 +272,13 @@ impl Controls {
             }
             if ui.button(tr(ui, "Default Keyboard")).clicked() { s.cfg.shortcuts = model::default_shortcuts(); self.learn = None; }
             if ui.button(tr(ui, "Import template XML")).clicked() { self.import = Some(String::new()); self.learn = None; }
+            if ui.button("Add Teleprompter keys").on_hover_text("Space play/pause, arrows scroll and change speed, Home to the top; keys already in use are skipped")
+                .clicked()
+            {
+                let added = model::add_teleprompter_shortcuts(&mut s.cfg.shortcuts);
+                self.status = format!("Added {added} Teleprompter shortcut(s)");
+                self.learn = None;
+            }
         });
         if let Some(xml) = &mut self.import {
             ui.add(egui::TextEdit::multiline(xml).desired_rows(3).hint_text(tr(ui, "Paste a shortcut template XML")));

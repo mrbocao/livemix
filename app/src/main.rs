@@ -24,6 +24,9 @@ mod preset;
 #[cfg(target_os = "macos")]
 #[path = "decklink_macos.rs"]
 mod decklink;
+#[cfg(target_os = "macos")]
+mod decklink_keyer_macos;
+mod decklink_pixels;
 #[cfg(windows)]
 mod decklink;
 mod scopes;
@@ -57,6 +60,7 @@ const PHOTO_SECS: f32 = 2.0;
 use model::FULL;
 use render::*;
 mod app;
+mod startup;
 mod outputs;
 mod desk;
 mod sources;
@@ -81,10 +85,12 @@ fn main() -> eframe::Result<()> {
         }
         i += 1;
     }
+    let icon = startup::icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 900.0])
             .with_min_inner_size([1000.0, 640.0])
+            .with_icon(Arc::clone(&icon))
             .with_title("LiveMix — Live Production"),
         ..Default::default()
     };
@@ -92,25 +98,10 @@ fn main() -> eframe::Result<()> {
         "LiveMix",
         options,
         Box::new(move |cc| {
-            let mut app = App::new(screenshot);
-            apply_style(&cc.egui_ctx, app.s.cfg.theme);
-            if let Some(gl) = &cc.gl {
-                app.graphics_adapter = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
-                app.performance.set_adapter(&app.graphics_adapter);
+            if screenshot.is_some() {
+                return Ok(Box::new(startup::initialize(&cc.egui_ctx, cc.gl.as_deref(), screenshot)));
             }
-            #[cfg(windows)]
-            {
-                let mut preference = app.s.cfg.video_adapter.clone();
-                if preference.is_empty() {
-                    if let Some(adapter) = media::video_adapter_names().into_iter()
-                        .find(|adapter| media::renderer_matches_adapter(&app.graphics_adapter, adapter))
-                    {
-                        preference = adapter;
-                    }
-                }
-                media::select_video_adapter(&preference);
-            }
-            Ok(Box::new(app))
+            Ok(Box::new(startup::Startup::new(&cc.egui_ctx, &icon)))
         }),
     )
 }
@@ -182,6 +173,7 @@ struct Feed {
     gpu_size: Option<[usize; 2]>,
     shared: Option<std::sync::Arc<media::Shared>>,
     tex: Option<egui::TextureHandle>,
+    thumbnail_source: Option<media::Frame>,
     seen: u64,
     recorded: u64,
     /// Which source this reader was started for (a List moves on by changing it).
@@ -247,9 +239,13 @@ impl DelayFeed {
     }
 
     /// The frame that is at least `seconds` old, if the buffer is full enough.
-    fn ready(&self, now: f64) -> Option<f64> {
+    fn ready(&mut self, now: f64) -> Option<f64> {
+        let target = now - f64::from(self.seconds);
+        while self.frames.get(1).is_some_and(|frame| frame.0 <= target) {
+            self.frames.pop_front();
+        }
         self.frames.front().map(|frame| frame.0)
-            .filter(|time| *time <= now - f64::from(self.seconds))
+            .filter(|time| *time <= target)
     }
 }
 
@@ -360,6 +356,7 @@ struct App {
     multi_outputs: [Option<ComposedRecording>; OUTPUT_COUNT],
     multi_output_failed: [bool; OUTPUT_COUNT],
     decklink_outputs: [Option<(decklink::OutputConfig, decklink::OutputSink)>; OUTPUT_COUNT],
+    decklink_settings_visible: bool,
     ndi_outputs: [Option<(f64, ndi::Sender)>; OUTPUT_COUNT],
     omt_outputs: [Option<((f64, u8), omt::Sender)>; OUTPUT_COUNT],
     srt_outputs: [Option<(([u32; 2], f64), stream::Output)>; OUTPUT_COUNT],
@@ -378,6 +375,12 @@ struct App {
     photo_filter: u32,
     /// When the current Output recording file / each MultiCorder file was started.
     multi_started: std::collections::HashMap<u32, f64>,
+    /// Contiguous audio for each MultiCorder input.
+    multi_audio: std::collections::HashMap<u32, audio::AudioCursor>,
+    /// Contiguous audio for each offscreen output group, by route and audio source.
+    group_audio: Vec<((OutputRoute, u32), audio::AudioCursor)>,
+    /// Contiguous audio for recordings captured from the window.
+    window_audio: audio::AudioCursor,
     /// Preview waveform picture and when to refresh it.
     scopes: std::collections::HashMap<u8, egui::TextureHandle>,
     next_wave: f64,
@@ -652,6 +655,11 @@ impl eframe::App for App {
             self.s.tick(t, dt);
             self.s.ui_frame += 1;
         }
+        let external_settings = self.s.settings_open && self.s.cfg.page == 6;
+        if external_settings && !self.decklink_settings_visible {
+            Self::refresh_external_devices(ctx.clone());
+        }
+        self.decklink_settings_visible = external_settings;
         let picture_time = self.video_clock.picture_time;
         self.frame += 1;
         if !self.s.automation.active() {

@@ -50,7 +50,6 @@ struct AudioPacketVtable {
     frame_count: unsafe extern "system" fn(*mut c_void) -> u32,
     bytes: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
 }
-
 /// Connectors, as the original's Input/Output Settings list them.
 pub const CONNECTIONS: [(&str, u32); 7] = [
     ("Auto", 0),
@@ -127,6 +126,20 @@ unsafe trait IDeckLinkInput: IUnknown {
         time_in_frame: *mut i64,
         ticks_per_frame: *mut i64,
     ) -> HRESULT;
+}
+
+#[interface("89AFCAF5-65F8-421E-98F7-96FE5F5BFBA3")]
+unsafe trait IDeckLinkKeyer: IUnknown {
+    unsafe fn Enable(&self, external: i32) -> HRESULT;
+    unsafe fn SetLevel(&self, level: u8) -> HRESULT;
+    unsafe fn RampUp(&self, frames: u32) -> HRESULT;
+    unsafe fn RampDown(&self, frames: u32) -> HRESULT;
+    unsafe fn Disable(&self) -> HRESULT;
+}
+
+#[interface("17D4BF8E-4911-473A-80A0-731CF6FF345B")]
+unsafe trait IDeckLinkProfileAttributes: IUnknown {
+    unsafe fn GetFlag(&self, attribute: u32, value: *mut i32) -> HRESULT;
 }
 
 #[interface("1A8077F1-9FE2-4533-8147-2294305E253F")]
@@ -390,12 +403,7 @@ fn device_list() -> Vec<Device> {
 }
 
 pub fn devices_cached() -> Vec<Device> {
-    if let Some(list) = DEVICES.lock().unwrap().as_ref() {
-        return list.clone();
-    }
-    let list = device_list();
-    *DEVICES.lock().unwrap() = Some(list.clone());
-    list
+    DEVICES.lock().unwrap().clone().unwrap_or_default()
 }
 
 pub fn refresh_devices() -> Vec<Device> {
@@ -457,6 +465,7 @@ impl Mode {
             fps_n: self.fps_n,
             fps_d: self.fps_d.max(1),
             format: "DeckLink".into(),
+            interlaced: self.interlaced,
         }
     }
 }
@@ -568,6 +577,7 @@ impl CaptureCallback {
                 fps_n: time_scale as u32,
                 fps_d: time_value.max(1) as u32,
                 format: "DeckLink".into(),
+                interlaced: matches!(display_mode.GetFieldDominance(), 0x7570_7072 | 0x6C6F_7772),
             };
             if mode.w > 0 && mode.h > 0 {
                 *self.shared.size.lock().unwrap() = (mode.w as usize, mode.h as usize);
@@ -775,6 +785,7 @@ pub fn run_capture(shared: Arc<Shared>, config: CaptureConfig) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputConfig {
     pub device: usize,
+    pub key_fill: bool,
     /// Wanted display mode (0 = pick one matching the project).
     pub mode: u32,
     pub port: u32,
@@ -828,7 +839,13 @@ impl OutputSink {
         if self.shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        *self.shared.latest.lock().unwrap() = Some(Latest { pixels, w, h, audio });
+        let mut latest = self.shared.latest.lock().unwrap();
+        // A picture replaced before it was scheduled hands its audio on to the next one.
+        let audio = match latest.take() {
+            Some(previous) if !previous.audio.is_empty() => previous.audio.iter().chain(audio.iter()).copied().collect(),
+            _ => audio,
+        };
+        *latest = Some(Latest { pixels, w, h, audio });
     }
 
     pub fn stop(&self) {
@@ -872,20 +889,44 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
             if width <= 0 || height <= 0 {
                 return Err("Invalid DeckLink output mode".into());
             }
+            let keyer = if config.key_fill {
+                let attributes = device.cast::<IDeckLinkProfileAttributes>()
+                    .map_err(|_| "Could not query the DeckLink profile for Key + Fill")?;
+                let mut enabled = 0;
+                if attributes.GetFlag(u32::from_be_bytes(*b"keye"), &mut enabled).is_err() || enabled == 0 {
+                    return Err("External keying is unavailable in the selected DeckLink profile".into());
+                }
+                let mut supported = 0;
+                let mut actual = 0;
+                if output.DoesSupportVideoMode(config.port, mode.mode, PIXEL_BGRA, 0, 1,
+                    &mut actual, &mut supported).is_err() || supported == 0
+                {
+                    return Err(format!("{} does not support BGRA external keying on this DeckLink output", mode.label()));
+                }
+                Some(device.cast::<IDeckLinkKeyer>().map_err(|_| "DeckLink keyer is unavailable")?)
+            } else { None };
             output
                 .EnableVideoOutput(mode.mode, 0)
                 .ok()
                 .map_err(|e| format!("DeckLink EnableVideoOutput ({}): {e}", mode.label()))?;
+            if let Some(keyer) = &keyer {
+                if let Err(error) = keyer.Enable(1).ok().and_then(|_| keyer.SetLevel(255).ok()) {
+                    let _ = keyer.Disable();
+                    let _ = output.DisableVideoOutput();
+                    return Err(format!("Could not enable DeckLink Key + Fill: {error}"));
+                }
+            }
             let time_scale = mode.fps_n.max(1) as i64;
             let time_value = mode.fps_d.max(1) as i64;
-            let audio_enabled = output.EnableAudioOutput(crate::audio::RATE, AUDIO_DEPTH, AUDIO_CHANNELS, AUDIO_TIMESTAMPED).is_ok();
+            let audio_enabled = !config.key_fill
+                && output.EnableAudioOutput(crate::audio::RATE, AUDIO_DEPTH, AUDIO_CHANNELS, AUDIO_TIMESTAMPED).is_ok();
             shared.error.lock().unwrap().clear();
             let playback = (|| -> Result<(), String> {
                 let mut display_time: i64 = 0;
                 let mut latest: Option<Latest> = None;
                 let mut started = false;
                 let mut audio_time = 0_i64;
-                let mut audio = Vec::new();
+                let mut queue = crate::audio::AudioFifo::default();
                 while !shared.stop.load(Ordering::Relaxed) {
                 if let Some(frame) = shared.latest.lock().unwrap().take() {
                     latest = Some(frame);
@@ -926,7 +967,9 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                     .map_err(|e| format!("DeckLink frame write access: {e}"))?;
                 let bytes_result = buffer.GetBytes(&mut bytes).ok();
                 if bytes_result.is_ok() && !bytes.is_null() {
-                    blit_bgra(bytes as *mut u8, width as usize, height as usize, &frame.pixels, frame.w, frame.h);
+                    let target = std::slice::from_raw_parts_mut(bytes.cast::<u8>(), width as usize * height as usize * 4);
+                    crate::decklink_pixels::blit(target, width as usize, height as usize,
+                        &frame.pixels, frame.w, frame.h, config.key_fill);
                 }
                 let _ = buffer.EndAccess(2);
                 bytes_result.map_err(|e| format!("DeckLink frame bytes: {e}"))?;
@@ -942,10 +985,8 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 if audio_enabled {
                     let slot = (display_time / time_value) as u64;
                     let count = crate::audio::frames_for_slot(slot, time_scale as u32, time_value as u32);
-                    let samples = std::mem::take(&mut frame.audio);
-                    audio.clear();
-                    audio.extend(samples.iter().copied().take(count));
-                    audio.resize(count, [0, 0]);
+                    queue.push(&std::mem::take(&mut frame.audio));
+                    let mut audio = queue.pop(count);
                     let mut written = 0;
                     output.ScheduleAudioSamples(audio.as_mut_ptr().cast(), count as u32, audio_time,
                         i64::from(crate::audio::RATE), &mut written).ok()
@@ -966,46 +1007,12 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
             })();
             let _ = output.StopScheduledPlayback(0, std::ptr::null_mut(), time_scale);
             if audio_enabled { let _ = output.DisableAudioOutput(); }
+            if let Some(keyer) = &keyer { let _ = keyer.Disable(); }
             let _ = output.DisableVideoOutput();
             playback
         })();
         if let Err(error) = result {
             *shared.error.lock().unwrap() = error;
-        }
-    }
-}
-
-/// Copies BGRA pixels into a DeckLink frame, scaling (letterboxed) when sizes differ.
-unsafe fn blit_bgra(dst: *mut u8, dst_w: usize, dst_h: usize, src: &[u8], src_w: usize, src_h: usize) {
-    if src_w == 0 || src_h == 0 || src.len() < src_w * src_h * 4 {
-        return;
-    }
-    if (src_w, src_h) == (dst_w, dst_h) {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, dst_w * dst_h * 4);
-        return;
-    }
-    // Black, opaque.
-    let words = dst as *mut u32;
-    for i in 0..dst_w * dst_h {
-        words.add(i).write_unaligned(0xFF00_0000);
-    }
-    let scale = (dst_w as f64 / src_w as f64).min(dst_h as f64 / src_h as f64);
-    let draw_w = ((src_w as f64 * scale) as usize).clamp(1, dst_w);
-    let draw_h = ((src_h as f64 * scale) as usize).clamp(1, dst_h);
-    let ox = (dst_w - draw_w) / 2;
-    let oy = (dst_h - draw_h) / 2;
-    for y in 0..draw_h {
-        let sy = y * src_h / draw_h;
-        let src_row = src.as_ptr().add(sy * src_w * 4);
-        let dst_row = dst.add(((oy + y) * dst_w + ox) * 4);
-        for x in 0..draw_w {
-            let sx = x * src_w / draw_w;
-            let s = src_row.add(sx * 4);
-            let d = dst_row.add(x * 4);
-            *d = *s;
-            *d.add(1) = *s.add(1);
-            *d.add(2) = *s.add(2);
-            *d.add(3) = *s.add(3);
         }
     }
 }

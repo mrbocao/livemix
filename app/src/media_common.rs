@@ -60,6 +60,8 @@ pub struct CamMode {
     pub fps_n: u32,
     pub fps_d: u32,
     pub format: String,
+    /// The camera sends fields (1080i) rather than whole pictures.
+    pub interlaced: bool,
 }
 
 impl CamMode {
@@ -69,18 +71,19 @@ impl CamMode {
     pub fn label(&self) -> String {
         let f = self.fps();
         let fps = if (f - f.round()).abs() < 0.01 { format!("{}", f.round() as i64) } else { format!("{f:.2}") };
-        format!("{}x{} {} fps {}", self.w, self.h, fps, self.format)
+        format!("{}x{}{} {} fps {}", self.w, self.h, if self.interlaced { "i" } else { "" }, fps, self.format)
     }
     /// One-line form for saving in presets: "w,h,n,d,format".
     pub fn code(&self) -> String {
-        format!("{},{},{},{},{}", self.w, self.h, self.fps_n, self.fps_d, self.format)
+        let base = format!("{},{},{},{},{}", self.w, self.h, self.fps_n, self.fps_d, self.format);
+        if self.interlaced { format!("{base},i") } else { base }
     }
     pub fn parse(s: &str) -> Option<CamMode> {
         let f: Vec<&str> = s.split(',').collect();
-        if f.len() != 5 {
+        if f.len() != 5 && !(f.len() == 6 && f[5] == "i") {
             return None;
         }
-        Some(CamMode { w: f[0].parse().ok()?, h: f[1].parse().ok()?, fps_n: f[2].parse().ok()?, fps_d: f[3].parse().ok()?, format: f[4].to_string() })
+        Some(CamMode { w: f[0].parse().ok()?, h: f[1].parse().ok()?, fps_n: f[2].parse().ok()?, fps_d: f[3].parse().ok()?, format: f[4].to_string(), interlaced: f.len() == 6 })
     }
 }
 
@@ -105,7 +108,8 @@ pub fn is_blackmagic(name: &str) -> bool {
 #[derive(Clone)]
 pub enum Source {
     /// Camera: symbolic link and the chosen mode (None = Auto: best up to 1920x1080).
-    Device(String, Option<CamMode>),
+    /// The third field is an audio input read into the same input: capture cards carry audio.
+    Device(String, Option<CamMode>, Option<String>),
     DeckLink(crate::decklink::CaptureConfig),
     Ndi(String),
     Omt(String),
@@ -149,6 +153,8 @@ pub struct Recorder {
     pub error: Arc<Mutex<String>>,
     encoder: Arc<Mutex<String>>,
     dropped: AtomicU64,
+    /// Audio of frames dropped at a full queue, carried by the next accepted frame.
+    lost_audio: Mutex<Vec<crate::audio::Stereo>>,
     pub(crate) replay_index: Option<ReplayIndex>,
     #[cfg(windows)]
     gpu: Arc<AtomicBool>,
@@ -190,7 +196,7 @@ impl Recorder {
             #[cfg(windows)]
             gpu_worker,
         ));
-        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0), replay_index,
+        (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0), lost_audio: Mutex::default(), replay_index,
             #[cfg(windows)]
             gpu,
         }, worker)
@@ -226,9 +232,18 @@ impl Recorder {
         for recorder in recorders { recorder.enqueue(frame.clone()); }
     }
 
-    fn enqueue(&self, frame: RecFrame) {
-        if matches!(self.tx.try_send(frame), Err(std::sync::mpsc::TrySendError::Full(_))) {
+    fn enqueue(&self, mut frame: RecFrame) {
+        let mut lost = self.lost_audio.lock().unwrap();
+        if !lost.is_empty() {
+            lost.extend(frame.audio.iter().copied());
+            frame.audio = std::mem::take(&mut *lost).into();
+        }
+        if let Err(std::sync::mpsc::TrySendError::Full(frame)) = self.tx.try_send(frame) {
             self.note_dropped_frames(1);
+            // Keep the samples so the recording's audio stays continuous, up to one second.
+            if lost.len() + frame.audio.len() <= crate::audio::RATE as usize {
+                lost.extend(frame.audio.iter().copied());
+            }
         }
     }
 
@@ -333,13 +348,12 @@ impl RecordFormat {
         }
     }
 
-    pub(crate) fn ffmpeg_profile(self, hw: bool) -> FfmpegProfile {
+    pub(crate) fn ffmpeg_profile(self) -> FfmpegProfile {
         let profile = |video, audio, container, pixel, bitrate, extra| FfmpegProfile {
             video, audio, container, pixel, bitrate, extra,
         };
-        let apple_hw = cfg!(target_os = "macos") && hw;
-        let h264 = if apple_hw { "h264_videotoolbox" } else { "libx264" };
-        let hevc = if apple_hw { "hevc_videotoolbox" } else { "libx265" };
+        let h264 = "libx264";
+        let hevc = "libx265";
         match self {
             Self::H264 => profile(h264, "aac", "mp4", "yuv420p", true, &["-movflags", "+faststart"]),
             Self::Hevc => profile(hevc, "aac", "mp4", "yuv420p", true, &["-tag:v", "hvc1", "-movflags", "+faststart"]),
@@ -407,6 +421,8 @@ pub enum PickKind {
     VideoMany,
     /// A folder (Image Sequence / Photos).
     Folder,
+    /// A text file for a Teleprompter script: the input it replaces, or None for the Add Input dialog.
+    Script(Option<u32>),
 }
 
 fn picture_files(folder: &str) -> Vec<std::path::PathBuf> {

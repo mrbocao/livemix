@@ -144,49 +144,48 @@ pub(crate) fn inputs_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                 const GAP: f32 = TILE_MARGIN * 2.0;
                 let (tile_w, tile_h) = tile_size(s);
                 let avail = ui.available_width() - TILE_MARGIN * 2.0;
-                let cols = (((avail + GAP) / (tile_w + GAP)).floor() as usize).max(1);
-                // Visible inputs (category filter) with their input numbers; None = "Add Input" tile.
-                let mut cells: Vec<Option<(u32, usize)>> = s
+                // Carry the layout flags from the filter pass so reflow doesn't look up every ID.
+                let mut cells: Vec<_> = s
                     .inputs
                     .iter()
                     .enumerate()
                     .filter(|(_, i)| s.filter.map_or(true, |f| i.category == Some(f)))
-                    .map(|(n, i)| Some((i.id, n + 1)))
+                    .map(|(n, input)| Some((input.id, n + 1, input.collapsed, match input.kind {
+                        Kind::Replay { channel, .. } if !input.collapsed => Some(channel),
+                        _ => None,
+                    })))
                     .collect();
                 cells.push(None);
                 // Tiles flow in input order, left to right, then on to the next row; every tile
                 // keeps the full row height. A shrunk tile is a narrow upright strip (26 px wide),
                 // so it stays in its place and the inputs after it just move up beside it.
-                let _ = cols;
                 let mut placed = Vec::new();
                 let (mut x, mut y) = (TILE_MARGIN, 0.0_f32);
                 for (index, cell) in cells.iter().enumerate() {
-                    let w = match cell {
-                        Some((id, _)) if s.input(*id).map(|i| i.collapsed).unwrap_or(false) => TILE_HEADER,
-                        _ => tile_w,
-                    };
-                    let strip = cell.and_then(|(id, _)| s.input(id)).is_some_and(|input| {
-                        !input.collapsed && matches!(input.kind, Kind::Replay { channel: 0, .. })
-                    });
+                    let w = if cell.is_some_and(|(_, _, collapsed, _)| collapsed) { TILE_HEADER } else { tile_w };
+                    let strip = cell.is_some_and(|(_, _, _, replay)| replay == Some(0));
                     let span = w + if strip { REPLAY_STRIP_WIDTH + GAP } else { 0.0 };
                     let next_is_replay_b = cells.get(index + 1).and_then(|next| *next)
-                        .and_then(|(id, _)| s.input(id)).is_some_and(|input| {
-                            !input.collapsed && matches!(input.kind, Kind::Replay { channel: 1, .. })
-                        });
+                        .is_some_and(|(_, _, _, replay)| replay == Some(1));
                     let pair = span + GAP + tile_w;
                     let row_width = if strip && next_is_replay_b && pair <= avail { pair } else { span };
                     if x > TILE_MARGIN && x + row_width > TILE_MARGIN + avail + 0.5 {
                         x = TILE_MARGIN;
                         y += tile_h + GAP;
                     }
-                    placed.push((*cell, x, y, w, strip));
+                    placed.push((cell.map(|(id, number, _, _)| (id, number)), x, y, w, strip));
                     x += span + GAP;
                 }
                 let total_h = y + tile_h;
                 let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total_h.max(1.0)), Sense::hover());
+                let visible = ui.clip_rect();
+                let dragging = egui::DragAndDrop::payload::<u32>(ui.ctx()).is_some();
                 let mut rects: Vec<(u32, egui::Rect)> = Vec::new();
                 for (cell, x, y, w, strip) in placed {
                     let r = egui::Rect::from_min_size(area.min + Vec2::new(x, y), Vec2::new(w, tile_h));
+                    if r.bottom() < visible.top() || r.top() > visible.bottom() {
+                        continue;
+                    }
                     match cell {
                         Some((id, number)) => {
                             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)).id_salt(("tile", id)));
@@ -196,7 +195,7 @@ pub(crate) fn inputs_panel(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::top_down(egui::Align::Center)).id_salt(("replay-strip", id)));
                                 replay_strip(&mut child, s, t);
                             }
-                            rects.push((id, r));
+                            if dragging { rects.push((id, r)); }
                         }
                         None => {
                             let r = egui::Rect::from_min_size(r.min, Vec2::new(tile_w, tile_h));
@@ -379,7 +378,7 @@ pub(crate) fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, 
                 i.collapsed = !i.collapsed;
             }
         } else if header.clicked() {
-            s.preview = Some(id);
+            s.select_preview(id);
         }
         let header = header.on_hover_text(if collapsed {
             "Click: send to Preview · Double-click: show the whole input · Drag onto another input: move it there · Right-click: menu"
@@ -458,7 +457,7 @@ pub(crate) fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, 
         if resp.double_clicked() {
             s.settings_input = Some(id);
         } else if resp.clicked() {
-            s.preview = Some(id);
+            s.select_preview(id);
         }
         resp.on_hover_text(tr(ui, "Click: send to Preview · Double-click: Input Settings"));
 
@@ -558,7 +557,7 @@ pub(crate) fn tile(ui: &mut egui::Ui, s: &mut Switcher, id: u32, number: usize, 
 /// The original's Input Settings sections, in its order (frmInputSettings.tMenu.*), plus the
 /// Audio is mixed in the separate Audio Mixer. In Input Settings it is
 /// reachable from General > Audio Settings, so it lives here as its own section.
-pub(crate) const INPUT_PAGES: [&str; 13] = [
+pub(crate) const INPUT_PAGES: [&str; 14] = [
     "General",
     "Colour Adjust",
     "Colour Key",
@@ -572,9 +571,10 @@ pub(crate) const INPUT_PAGES: [&str; 13] = [
     "PTZ",
     "Advanced",
     "Telestrator",
+    "Teleprompter",
 ];
 /// Sections built in this version (indexes into INPUT_PAGES).
-pub(crate) const INPUT_PAGES_BUILT: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+pub(crate) const INPUT_PAGES_BUILT: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// cboAspectRatio entries: value 0 keeps the source's own shape.
 pub(crate) const ASPECTS: [(f32, &str); 9] = [
@@ -649,15 +649,51 @@ pub(crate) fn input_ptz(ui: &mut egui::Ui, input: &mut Input) {
 /// modes the camera itself offers; "Auto" takes the best one up to the Performance limit.
 /// A new choice restarts the camera with that mode.
 pub(crate) fn camera_mode_rows(ui: &mut egui::Ui, inp: &mut Input) {
-    let modes = inp.cam_modes.clone();
-    let cur = inp.cam_current.clone();
+    let (modes, cur, id) = (inp.cam_modes.clone(), inp.cam_current.clone(), inp.id);
+    if camera_mode_fields(ui, id, &modes, cur.as_ref(), &mut inp.cam_mode, "Reading the camera's formats…") {
+        inp.cam_current = None;
+    }
+    // Audio inputs are listed once per session here (listing them takes a moment).
+    let key = egui::Id::new("camera-audio-devices");
+    let devices: Arc<Vec<media::DeviceInfo>> = ui.data_mut(|d| {
+        d.get_temp_mut_or_insert_with(key, || Arc::new(audio::devices())).clone()
+    });
+    camera_audio_row(ui, id, &devices, &mut inp.cam_audio);
+}
+
+/// Audio Device row: the audio input captured together with the camera picture. Capture cards
+/// carry their audio on a separate Windows audio input, so it is picked here (None = no audio).
+pub(crate) fn camera_audio_row(ui: &mut egui::Ui, id: u32, devices: &[media::DeviceInfo], chosen: &mut Option<String>) {
+    ui.label(tr(ui, "Audio Device"));
+    let name_of = |link: &str| link.strip_prefix("audio:").unwrap_or(link).to_owned();
+    let selected = chosen.clone().unwrap_or_else(|| "None".into());
+    egui::ComboBox::from_id_salt(("cam-audio", id)).width(200.0).selected_text(selected).show_ui(ui, |ui| {
+        if ui.selectable_label(chosen.is_none(), "None").clicked() {
+            *chosen = None;
+        }
+        for d in devices {
+            let name = name_of(&d.link);
+            if ui.selectable_label(chosen.as_deref() == Some(name.as_str()), &d.name).clicked() {
+                *chosen = Some(name);
+            }
+        }
+    });
+    ui.end_row();
+}
+
+/// The shared Resolution / Frame Rate / Video Format rows, used by Input Settings and the Add
+/// Input dialog. `chosen` is None for Auto. Returns true when the user picked another mode.
+pub(crate) fn camera_mode_fields(ui: &mut egui::Ui, id: u32, modes: &[media::CamMode], cur: Option<&media::CamMode>,
+    chosen_mode: &mut Option<media::CamMode>, empty_text: &str) -> bool {
+    let modes = modes.to_vec();
+    let cur = cur.cloned();
     ui.label(tr(ui, "Resolution"));
     if modes.is_empty() {
-        ui.label(RichText::new("Reading the camera's formats…").color(TEXT_DIM));
+        ui.label(RichText::new(empty_text).color(TEXT_DIM));
         ui.end_row();
-        return;
+        return false;
     }
-    let chosen = inp.cam_mode.clone();
+    let chosen = chosen_mode.clone();
     // What the three lists show: the chosen mode, or (Auto) the one in use.
     let shown = chosen.clone().or(cur.clone());
     let res_name = |w: u32, h: u32| format!("{w} x {h}");
@@ -672,7 +708,7 @@ pub(crate) fn camera_mode_rows(ui: &mut egui::Ui, inp: &mut Input) {
         None => format!("Auto ({})", cur.as_ref().map(|m| res_name(m.w, m.h)).unwrap_or_default()),
         Some(m) => res_name(m.w, m.h),
     };
-    egui::ComboBox::from_id_salt(("cam-res", inp.id)).width(200.0).selected_text(res_text).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(("cam-res", id)).width(200.0).selected_text(res_text).show_ui(ui, |ui| {
         if ui.selectable_label(chosen.is_none(), "Auto").clicked() {
             pick = Some(None);
         }
@@ -694,9 +730,10 @@ pub(crate) fn camera_mode_rows(ui: &mut egui::Ui, inp: &mut Input) {
         rates.dedup_by(|a, b| (a.fps() - b.fps()).abs() < 0.001);
         let rate_name = |m: &media::CamMode| {
             let f = m.fps();
-            if (f - f.round()).abs() < 0.01 { format!("{} fps", f.round() as i64) } else { format!("{f:.2} fps") }
+            let rate = if (f - f.round()).abs() < 0.01 { format!("{} fps", f.round() as i64) } else { format!("{f:.2} fps") };
+            if m.interlaced { format!("{rate} interlaced") } else { rate }
         };
-        egui::ComboBox::from_id_salt(("cam-fps", inp.id)).width(200.0).selected_text(rate_name(s)).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(("cam-fps", id)).width(200.0).selected_text(rate_name(s)).show_ui(ui, |ui| {
             let mut seen: Vec<String> = Vec::new();
             for m in modes.iter().filter(|m| (m.w, m.h) == (s.w, s.h)) {
                 let n = rate_name(m);
@@ -705,7 +742,7 @@ pub(crate) fn camera_mode_rows(ui: &mut egui::Ui, inp: &mut Input) {
                 }
                 seen.push(n.clone());
                 if ui.selectable_label(chosen.is_some() && n == rate_name(s), n).clicked() {
-                    let same_fmt = modes.iter().find(|x| (x.w, x.h) == (s.w, s.h) && (x.fps() - m.fps()).abs() < 0.001 && x.format == s.format);
+                    let same_fmt = modes.iter().find(|x| (x.w, x.h) == (s.w, s.h) && (x.fps() - m.fps()).abs() < 0.001 && x.interlaced == m.interlaced && x.format == s.format);
                     pick = Some(Some(same_fmt.unwrap_or(m).clone()));
                 }
             }
@@ -713,24 +750,31 @@ pub(crate) fn camera_mode_rows(ui: &mut egui::Ui, inp: &mut Input) {
         let _ = rates;
         ui.end_row();
         ui.label("Video Format");
-        egui::ComboBox::from_id_salt(("cam-fmt", inp.id)).width(200.0).selected_text(s.format.clone()).show_ui(ui, |ui| {
-            for m in modes.iter().filter(|m| (m.w, m.h) == (s.w, s.h) && (m.fps() - s.fps()).abs() < 0.001) {
+        egui::ComboBox::from_id_salt(("cam-fmt", id)).width(200.0).selected_text(s.format.clone()).show_ui(ui, |ui| {
+            for m in modes.iter().filter(|m| (m.w, m.h) == (s.w, s.h) && (m.fps() - s.fps()).abs() < 0.001 && m.interlaced == s.interlaced) {
                 if ui.selectable_label(chosen.as_ref() == Some(m), m.format.clone()).clicked() {
                     pick = Some(Some(m.clone()));
                 }
             }
         });
         ui.end_row();
-        ui.label("In use");
-        ui.label(RichText::new(cur.as_ref().map(|m| m.label()).unwrap_or_else(|| "—".into())).color(TEXT_DIM));
+        // Reported by the camera for the selected mode; changing the Frame Rate picks the interlaced one.
+        ui.label("");
+        ui.add_enabled(false, egui::Checkbox::new(&mut { s.interlaced }, "Interlaced"));
         ui.end_row();
-    }
-    if let Some(p) = pick {
-        if p != inp.cam_mode {
-            inp.cam_mode = p;
-            inp.cam_current = None;
+        if cur.is_some() {
+            ui.label("In use");
+            ui.label(RichText::new(cur.as_ref().map(|m| m.label()).unwrap_or_default()).color(TEXT_DIM));
+            ui.end_row();
         }
     }
+    if let Some(p) = pick {
+        if p != *chosen_mode {
+            *chosen_mode = p;
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn slide_buttons(ui: &mut egui::Ui, input: &mut Input) {
@@ -771,6 +815,7 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
             Kind::VirtualSet { .. } => "Virtual Set",
             Kind::VideoDelay { .. } => "Video Delay",
             Kind::Telestrator { .. } => "Telestrator",
+            Kind::Teleprompter(_) => "Teleprompter",
             Kind::Desktop => "Desktop Capture",
             Kind::Colour(_) => "Colour",
             Kind::Bars => "Colour Bars",
@@ -1013,6 +1058,7 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
     setting_toggle(ui, &mut inp.play_active, "Automatically Play with Transition");
     setting_toggle(ui, &mut inp.pause_preview, "Automatically Pause after Transition");
     setting_toggle(ui, &mut inp.restart_active, "Automatically Restart with Transition");
+    setting_toggle(ui, &mut inp.auto_mix_audio, "Automatically mix audio");
     setting_toggle(ui, &mut inp.flatten, "Flatten Layers").on_hover_text("Render the layers into one picture");
     ui.horizontal(|ui| {
         ui.label("Aspect Ratio");
@@ -1042,6 +1088,85 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
                 }
             });
     });
+}
+
+/// Teleprompter: the script, the reading speed and the look of the scrolling text.
+pub(crate) fn input_teleprompter(ui: &mut egui::Ui, inp: &mut Input, browse_script: &mut bool) {
+    let Kind::Teleprompter(cfg) = &mut inp.kind else {
+        ui.label(RichText::new("This section belongs to Teleprompter inputs. Add one from Add Input.").color(TEXT_DIM));
+        return;
+    };
+    ui.horizontal(|ui| {
+        if ui.button("Import text file…").on_hover_text("Replace the script with a .txt file (UTF-8, UTF-16 or Windows text)").clicked() {
+            *browse_script = true;
+        }
+        ui.label(RichText::new(format!("{} characters", cfg.text.chars().count())).size(11.0).color(TEXT_DIM));
+    });
+    ui.add(egui::TextEdit::multiline(&mut cfg.text).desired_rows(10).desired_width(f32::INFINITY)
+        .hint_text("Paste the script here"));
+    let lines = cfg.lines();
+    ui.horizontal(|ui| {
+        if ui.button(if inp.playing { "Pause" } else { "Play" }).clicked() {
+            inp.playing = !inp.playing;
+        }
+        if ui.button("Restart").on_hover_text("Back to the first line").clicked() {
+            inp.pos = 0.0;
+        }
+        if ui.button("Back 5 lines").clicked() {
+            inp.pos = (inp.pos - 5.0).max(0.0);
+        }
+        if ui.button("Forward 5 lines").clicked() {
+            inp.pos = if lines > 0.0 { (inp.pos + 5.0).min(lines) } else { inp.pos + 5.0 };
+        }
+        ui.label(RichText::new(if lines > 0.0 { format!("Line {:.0} of {:.0}", inp.pos.floor() + 1.0, lines) }
+            else { "Line 1".into() }).color(TEXT_DIM));
+    });
+    egui::Grid::new(("teleprompter", inp.id)).num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+        ui.label("Speed");
+        ui.add(egui::Slider::new(&mut cfg.lines_per_min, 0.0..=240.0).suffix(" lines/min"));
+        ui.end_row();
+        ui.label("Text size");
+        let mut percent = cfg.size * 100.0;
+        if ui.add(egui::Slider::new(&mut percent, 2.0..=25.0).suffix(" % of height")).changed() {
+            cfg.size = percent / 100.0;
+        }
+        ui.end_row();
+        ui.label("Line spacing");
+        ui.add(egui::Slider::new(&mut cfg.line_spacing, 1.0..=2.5));
+        ui.end_row();
+        ui.label("Side margin");
+        let mut margin = cfg.margin * 100.0;
+        if ui.add(egui::Slider::new(&mut margin, 0.0..=35.0).suffix(" %")).changed() {
+            cfg.margin = margin / 100.0;
+        }
+        ui.end_row();
+        ui.label("Alignment");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut cfg.centre, false, "Left");
+            ui.selectable_value(&mut cfg.centre, true, "Centre");
+        });
+        ui.end_row();
+        ui.label("Text colour");
+        ui.color_edit_button_srgb(&mut cfg.text_colour);
+        ui.end_row();
+        ui.label("Background");
+        ui.color_edit_button_srgb(&mut cfg.background);
+        ui.end_row();
+        ui.label("Reading line");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut cfg.guide, "Highlight");
+            let mut at = cfg.guide_pos * 100.0;
+            if ui.add(egui::Slider::new(&mut at, 10.0..=80.0).suffix(" % from top")).changed() {
+                cfg.guide_pos = at / 100.0;
+            }
+        });
+        ui.end_row();
+    });
+    ui.checkbox(&mut cfg.mirror_x, "Mirror (left to right)");
+    ui.checkbox(&mut cfg.flip_y, "Flip (top to bottom)");
+    ui.checkbox(&mut inp.loop_on, "Loop at the end");
+    ui.label(RichText::new("Show it to the presenter by choosing this input as the source of an external output window. Mirror and Flip suit a prompter glass.")
+        .size(11.0).color(TEXT_DIM));
 }
 
 /// Telestrator (frmInput tTelestrator): the original only points at its web page; here the page
@@ -1294,6 +1419,32 @@ pub(crate) fn input_colour_correction(ui: &mut egui::Ui, inp: &mut Input, browse
 /// properties). The original loads render-effect plug-ins; this version lists the render
 /// effects it implements, with quick controls and links to their full pages.
 pub(crate) fn input_effects(ui: &mut egui::Ui, inp: &mut Input, page: &mut usize) {
+    if inp.kind.supports_picture_fx() {
+        ui.add(egui::Slider::new(&mut inp.colour_fx.blur, 0..=12).text("Blur"));
+        let id = ui.id().with(("alpha-mask-path", inp.id));
+        let mut path = ui.data(|data| data.get_temp::<String>(id))
+            .unwrap_or_else(|| inp.colour_fx.mask_path.clone());
+        let mut error = ui.data(|data| data.get_temp::<String>(id.with("error"))).unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Alpha mask");
+            ui.add(egui::TextEdit::singleline(&mut path).hint_text("Image path").desired_width(210.0));
+            if ui.button("Load").clicked() {
+                error = inp.colour_fx.load_mask(std::path::Path::new(path.trim().trim_matches('"')))
+                    .err().unwrap_or_default();
+            }
+            if ui.button("Clear").clicked() {
+                inp.colour_fx.clear_mask();
+                path.clear();
+                error.clear();
+            }
+        });
+        if !error.is_empty() { ui.colored_label(Color32::LIGHT_RED, &error); }
+        ui.data_mut(|data| {
+            data.insert_temp(id, path);
+            data.insert_temp(id.with("error"), error);
+        });
+        ui.separator();
+    }
     let sel_id = egui::Id::new(("effects-sel", inp.id));
     let mut sel: usize = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0).min(5);
     setting_toggle(ui, &mut inp.effects_source, "Use Source Settings")
@@ -1538,7 +1689,6 @@ pub(crate) fn input_audio_general(ui: &mut egui::Ui, inp: &mut Input) {
                     fx.pan = 0.0;
                 }
             });
-            setting_toggle(ui, &mut inp.auto_mix_audio, "Automatically mix audio");
             setting_toggle(ui, &mut inp.solo_pfl, "Solo PFL (pre-fader)");
         });
     });

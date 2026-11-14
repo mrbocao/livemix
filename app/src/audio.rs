@@ -17,7 +17,8 @@ const BLOCK: usize = 480;
 /// move it backwards and forwards (which skipped or repeated samples).
 #[derive(Clone, Copy, Debug)]
 pub struct AudioClock {
-    pub ms: u64,
+    /// Fractional milliseconds, so sub-millisecond corrections do not move the read position.
+    pub ms: f64,
     pub stamp: Instant,
 }
 
@@ -67,6 +68,7 @@ pub struct Buffer {
     live_latency: i64,
     file_epoch: u64,
     live_resyncs: u64,
+    extra_history: usize,
 }
 
 impl Buffer {
@@ -92,7 +94,14 @@ impl Buffer {
                 [(pair[0] * 32768.0).round() as i16, (pair[1] * 32768.0).round() as i16]
             }));
         }
-        let excess = self.data.len().saturating_sub(HISTORY);
+        let excess = self.data.len().saturating_sub(HISTORY + self.extra_history);
+        self.data.drain(..excess);
+        self.first += excess as u64;
+    }
+
+    pub fn retain_for_delay(&mut self, seconds: f32) {
+        self.extra_history = (seconds.clamp(0.0, 120.0) * RATE as f32) as usize;
+        let excess = self.data.len().saturating_sub(HISTORY + self.extra_history);
         self.data.drain(..excess);
         self.first += excess as u64;
     }
@@ -125,22 +134,24 @@ impl Buffer {
         self.append(samples.iter().copied());
     }
 
-    fn read(&self, shared: &crate::media::Shared, at: Instant, frames: usize, file: bool,
+    fn read(&self, shared: &crate::media::Shared, at: Instant, frames: usize, file: bool, delay: f32,
         mut add: impl FnMut(usize, Stereo))
     {
         let index = if file {
-            let Ok(transport) = shared.audio_position.try_lock() else { return };
+            // Waiting for the clock is inaudible; skipping it silenced the whole block.
+            let Ok(transport) = shared.audio_position.lock() else { return };
             let Some(clock) = *transport else { return };
             if self.file_epoch != shared.audio_epoch.load(Relaxed)
                 || shared.paused.load(Relaxed) || shared.ended.load(Relaxed) { return; }
             let offset = signed_frames(at, clock.stamp).clamp(-4800, 2400);
-            (clock.ms * u64::from(RATE) / 1000) as i64 + offset - frames as i64 - self.first as i64
+            (clock.ms * f64::from(RATE) / 1000.0).round() as i64 + offset - frames as i64 - self.first as i64
         } else {
             let Some(end) = self.live_end else { return };
             // Read slightly behind capture arrival to accommodate packet delivery jitter.
             let offset = signed_frames(at, end) - self.live_latency;
             self.data.len() as i64 + offset - frames as i64
         };
+        let index = index - (delay * RATE as f32).round() as i64;
         let first = index.max(0);
         let end = (index + frames as i64).min(self.data.len() as i64);
         if first >= end { return; }
@@ -160,22 +171,91 @@ pub fn sample_duration(frames: usize) -> Duration {
     Duration::from_secs_f64(frames as f64 / f64::from(RATE))
 }
 
-pub fn mark_position(shared: &crate::media::Shared, ms: u64) {
+/// Marks where the file's audio is now, in fractional milliseconds. Integer milliseconds
+/// quantise the position by up to 48 samples, which the clock then has to filter out.
+pub fn mark_position(shared: &crate::media::Shared, ms: f64) {
     let mut position = shared.audio_position.lock().unwrap();
     *position = Some(smooth_clock(*position, ms, Instant::now()));
 }
 
 /// Advances the audio anchor to `ms`. Small deviations from the predicted
-/// position (video delivery jitter) are corrected gradually; a large one is a
-/// seek, a loop or a new file and is followed at once.
-fn smooth_clock(previous: Option<AudioClock>, ms: u64, now: Instant) -> AudioClock {
+/// position (video delivery jitter) are corrected by at most one sample per
+/// update, so the read position never jumps; a large one is a seek, a loop or
+/// a new file and is followed at once.
+fn smooth_clock(previous: Option<AudioClock>, ms: f64, now: Instant) -> AudioClock {
     let smoothed = previous.and_then(|clock| {
         let elapsed = now.saturating_duration_since(clock.stamp).as_secs_f64() * 1000.0;
-        let predicted = clock.ms as f64 + elapsed;
-        let error = ms as f64 - predicted;
-        (error.abs() <= 120.0).then(|| (predicted + error * 0.125).max(0.0) as u64)
+        let predicted = clock.ms + elapsed;
+        let error = ms - predicted;
+        let sample = 1000.0 / f64::from(RATE);
+        (error.abs() <= 120.0).then(|| (predicted + (error * 0.125).clamp(-sample, sample)).max(0.0))
     });
     AudioClock { ms: smoothed.unwrap_or(ms), stamp: now }
+}
+
+/// Contiguous audio for a consumer that mixes once per video frame. Each window starts
+/// where the previous one ended, whatever the time between frames, so samples are neither
+/// repeated nor skipped. A gap longer than half a second starts a new run.
+#[derive(Default)]
+pub struct AudioCursor {
+    origin: Option<Instant>,
+    emitted: u64,
+}
+
+impl AudioCursor {
+    /// End time and length of the next window at `now`; `nominal` is one frame of samples.
+    pub fn window(&mut self, now: Instant, nominal: usize) -> (Instant, usize) {
+        let due = self.origin.and_then(|origin| now.checked_duration_since(origin))
+            .map(|elapsed| (elapsed.as_secs_f64() * f64::from(RATE)).round() as u64)
+            .filter(|&due| due >= self.emitted && due - self.emitted <= u64::from(RATE) / 2);
+        if let (Some(origin), Some(due)) = (self.origin, due) {
+            let count = (due - self.emitted) as usize;
+            self.emitted = due;
+            return (origin + sample_duration(due as usize), count);
+        }
+        self.origin = Some(now.checked_sub(sample_duration(nominal)).unwrap_or(now));
+        self.emitted = nominal as u64;
+        (now, nominal)
+    }
+}
+
+/// Largest shortfall, in samples, that a consumer may cover by holding the last sample.
+/// Mixer windows and output frames count samples in different ways, so they can differ by
+/// a few samples. That is inaudible, unlike a cushion of delay between audio and picture.
+const FIFO_HOLD: usize = 96;
+/// A consumer that falls this far behind is resynchronised instead of delaying the sound.
+const FIFO_LIMIT: usize = RATE as usize / 20;
+
+/// Per-output queue between contiguous mixer windows and a consumer that takes a fixed
+/// number of samples per video frame, so outputs that started at different times or repeat
+/// a frame still write every sample exactly once. It adds no delay: audio leaves the queue
+/// in the frame that carries its picture.
+#[derive(Default)]
+pub struct AudioFifo {
+    data: VecDeque<Stereo>,
+    last: Stereo,
+}
+
+impl AudioFifo {
+    pub fn push(&mut self, samples: &[Stereo]) {
+        self.data.extend(samples.iter().copied());
+        if self.data.len() > FIFO_LIMIT {
+            let excess = self.data.len() - FIFO_LIMIT;
+            self.data.drain(..excess);
+        }
+    }
+
+    pub fn pop(&mut self, count: usize) -> Vec<Stereo> {
+        let take = count.min(self.data.len());
+        let mut samples: Vec<Stereo> = self.data.drain(..take).collect();
+        if let Some(&last) = samples.last() { self.last = last; }
+        if take < count {
+            // A few missing samples repeat the last one; a real underrun is silence.
+            let fill = if count - take <= FIFO_HOLD { self.last } else { [0; 2] };
+            samples.resize(count, fill);
+        }
+        samples
+    }
 }
 
 pub fn reset_position(shared: &crate::media::Shared) {
@@ -187,20 +267,28 @@ pub fn reset_position(shared: &crate::media::Shared) {
 pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32)>,
     at: Instant, frames: usize) -> Packet
 {
+    mix_delayed(inputs.into_iter().map(|(source, file, gain)| (source, file, gain, 0.0)), at, frames)
+}
+
+pub fn mix_delayed<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32, f32)>,
+    at: Instant, frames: usize) -> Packet
+{
     let mut mixed = vec![[0.0f32; 2]; frames];
     mix_into(inputs, at, &mut mixed);
     mixed.into_iter().map(|[l, r]| [l.round() as i16, r.round() as i16]).collect()
 }
 
-fn mix_into<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32)>,
+fn mix_into<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool, f32, f32)>,
     at: Instant, mixed: &mut [[f32; 2]])
 {
     mixed.fill([0.0; 2]);
     let frames = mixed.len();
-    for (source, file, gain) in inputs {
+    for (source, file, gain, delay) in inputs {
         if gain == 0.0 { continue; }
-        if let Ok(buffer) = source.audio.try_lock() {
-            buffer.read(source, at, frames, file, |i, sample| {
+        // Writers hold the buffer for microseconds. Waiting is inaudible; skipping the
+        // input (try_lock) silenced a whole block whenever the reader was appending.
+        if let Ok(buffer) = source.audio.lock() {
+            buffer.read(source, at, frames, file, delay, |i, sample| {
                 mixed[i][0] += f32::from(sample[0]) * gain;
                 mixed[i][1] += f32::from(sample[1]) * gain;
             });
@@ -240,21 +328,43 @@ pub fn test_tone(frames: usize) -> Packet {
 
 #[cfg(test)]
 pub fn input_peak(source: (&crate::media::Shared, bool, f32), at: Instant) -> f32 {
-    let [left, right] = input_peaks(source, at);
+    let (shared, file, gain) = source;
+    let [left, right] = delayed_peaks((shared, file, gain, 0.0), at);
     left.max(right)
 }
 
-pub fn input_peaks((shared, file, gain): (&crate::media::Shared, bool, f32), at: Instant) -> [f32; 2] {
+pub fn delayed_peaks((shared, file, gain, delay): (&crate::media::Shared, bool, f32, f32), at: Instant) -> [f32; 2] {
     let mut peaks = [0u16; 2];
     if gain > 0.0 {
         if let Ok(buffer) = shared.audio.try_lock() {
-            buffer.read(shared, at, 960, file, |_, [left, right]| {
+            buffer.read(shared, at, 960, file, delay, |_, [left, right]| {
                 peaks[0] = peaks[0].max(left.unsigned_abs());
                 peaks[1] = peaks[1].max(right.unsigned_abs());
             });
         }
     }
     peaks.map(|peak| f32::from(peak) * gain / 32768.0)
+}
+
+/// Level where the soft knee starts, as a fraction of full scale.
+const KNEE: f32 = 0.8;
+
+/// Maps a decoded sample to 16 bits. Masters that peak above 0 dBFS (decoded AAC and MP3
+/// overshoot by a dB or more) would be hard-clipped by the converter, which is harsh; above
+/// the knee the curve rolls off smoothly towards full scale instead, without any latency.
+pub(crate) fn soft_clip(sample: f32) -> i16 {
+    let magnitude = sample.abs();
+    let shaped = if magnitude <= KNEE { magnitude }
+        else { KNEE + (1.0 - KNEE) * ((magnitude - KNEE) / (1.0 - KNEE)).tanh() };
+    (shaped.copysign(sample) * 32767.0).round() as i16
+}
+
+/// Interleaved little-endian f32 stereo from FFmpeg.
+pub(crate) fn pcm_f32(bytes: &[u8]) -> impl Iterator<Item = Stereo> + '_ {
+    bytes.chunks_exact(8).map(|b| {
+        let channel = |at: usize| f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        [soft_clip(channel(0)), soft_clip(channel(4))]
+    })
 }
 
 pub(crate) fn pcm(bytes: &[u8]) -> impl Iterator<Item = Stereo> + '_ {
@@ -354,7 +464,7 @@ where
     }, move |error| errors.set_status(format!("Audio input: {error}")), None).map_err(|e| e.to_string())
 }
 
-type MonitorSource = (Arc<crate::media::Shared>, bool, f32);
+type MonitorSource = (Arc<crate::media::Shared>, bool, f32, f32);
 
 pub struct Monitor {
     _stream: cpal::Stream,
@@ -417,7 +527,7 @@ where
             sources_snapshot = latest.clone();
         }
         mixed.resize(frames, [0.0; 2]);
-        mix_into(sources_snapshot.iter().map(|(source, file, gain)| (&**source, *file, *gain)), at, &mut mixed);
+        mix_into(sources_snapshot.iter().map(|(source, file, gain, delay)| (&**source, *file, *gain, *delay)), at, &mut mixed);
         packet.clear();
         packet.extend(mixed.iter().map(|[l, r]| [l.round() as i16, r.round() as i16]));
         for (i, frame) in data.chunks_exact_mut(channels).enumerate() {
@@ -497,12 +607,15 @@ pub fn play_audio_input(shared: Arc<crate::media::Shared>, path: String) {
     let duration_ms = (duration * 1000.0) as u64;
     shared.dur_ms.store(duration_ms, Relaxed);
     shared.set_status("Audio file");
-    mark_position(&shared, 0);
+    // The first mark and the integration start share one instant; otherwise the clock
+    // starts a few milliseconds off and spends seconds slewing back.
+    let mut last = Instant::now();
+    mark_position(&shared, 0.0);
     let source = shared.clone();
     std::thread::scope(|scope| {
         scope.spawn(move || play_file(source, path));
-        let mut last = Instant::now();
         let mut position = 0.0;
+        let mut running = false;
         while !shared.stop.load(Relaxed) {
             let now = Instant::now();
             let seek = shared.seek_ms.swap(0, Relaxed).checked_sub(1);
@@ -512,11 +625,18 @@ pub fn play_audio_input(shared: Arc<crate::media::Shared>, path: String) {
                 shared.pos_ms.store(position as u64, Relaxed);
                 shared.ended.store(false, Relaxed);
                 reset_position(&shared);
-                mark_position(&shared, position as u64);
+                mark_position(&shared, position);
+                running = true;
             } else if !shared.paused.load(Relaxed) && !shared.ended.load(Relaxed) {
+                if !running {
+                    // The clock kept time while paused. Starting again re-anchors it at once
+                    // instead of spending seconds slewing back, which detunes the sound.
+                    *shared.audio_position.lock().unwrap() = None;
+                }
                 position = (position + now.duration_since(last).as_secs_f64() * 1000.0).min(duration_ms as f64);
                 shared.pos_ms.store(position as u64, Relaxed);
-                mark_position(&shared, position as u64);
+                mark_position(&shared, position);
+                running = true;
                 if position >= duration_ms as f64 {
                     if shared.looping.load(Relaxed) {
                         shared.restart.store(true, Relaxed);
@@ -525,6 +645,7 @@ pub fn play_audio_input(shared: Arc<crate::media::Shared>, path: String) {
                     }
                 }
             }
+            if shared.paused.load(Relaxed) || shared.ended.load(Relaxed) { running = false; }
             last = now;
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -536,7 +657,7 @@ pub fn play_file(shared: Arc<crate::media::Shared>, path: String) {
     while !shared.stop.load(Relaxed) {
         let (position, epoch) = {
             let position = shared.audio_position.lock().unwrap();
-            (position.map(|clock| clock.ms), shared.audio_epoch.load(Relaxed))
+            (position.map(|clock| clock.ms as u64), shared.audio_epoch.load(Relaxed))
         };
         let Some(position) = position.filter(|_| Some(epoch) != last_epoch) else {
             std::thread::sleep(Duration::from_millis(30));
@@ -560,8 +681,8 @@ pub fn play_file(shared: Arc<crate::media::Shared>, path: String) {
             }
             if shared.audio_epoch.load(Relaxed) != epoch { return false; }
             let mut buffer = shared.audio.lock().unwrap();
-            buffer.append(pcm(samples));
-            cursor += (samples.len() / 4) as u64;
+            buffer.append(pcm_f32(samples));
+            cursor += (samples.len() / 8) as u64;
             true
         });
     }
@@ -570,7 +691,7 @@ pub fn play_file(shared: Arc<crate::media::Shared>, path: String) {
 fn read_pcm(shared: &crate::media::Shared, mut command: std::process::Command,
     mut consume: impl FnMut(&[u8]) -> bool) -> bool
 {
-    let Ok(mut child) = command.args(["-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1"])
+    let Ok(mut child) = command.args(["-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1"])
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return false };
     let mut pipe = BufReader::new(child.stdout.take().unwrap());
     let child = Mutex::new(child);
@@ -586,7 +707,7 @@ fn read_pcm(shared: &crate::media::Shared, mut command: std::process::Command,
             let _ = child.kill();
             let _ = child.wait();
         });
-        let mut bytes = [0; BLOCK * 4];
+        let mut bytes = [0; BLOCK * 8];
         while !shared.stop.load(Relaxed) {
             let mut len = 0;
             while len < bytes.len() {
@@ -616,7 +737,7 @@ pub fn planar(packet: &[Stereo], scale: f32) -> Vec<f32> {
 
 /// Read a borrowed SDK buffer, before returning it to the receiver.
 pub unsafe fn capture_planar(shared: &crate::media::Shared, data: *const u8, frames: usize,
-    stride: usize, channels: usize, rate: usize, scale: f32, phase: &mut usize)
+    stride: usize, channels: usize, rate: usize, scale: f32, phase: &mut usize, start: Option<Instant>)
 {
     if data.is_null() || !(1..=192_000).contains(&rate) || !(1..=rate / 2).contains(&frames)
         || !(1..=64).contains(&channels) || !(frames * 4..=1_048_576).contains(&stride)
@@ -635,7 +756,116 @@ pub unsafe fn capture_planar(shared: &crate::media::Shared, data: *const u8, fra
             *phase -= rate;
         }
     }
-    shared.audio.lock().unwrap().capture(&samples);
+    let mut buffer = shared.audio.lock().unwrap();
+    if let Some(start) = start {
+        let end = start + sample_duration(samples.len());
+        if !samples.is_empty() {
+            let gap = buffer.live_end.map(|previous| signed_frames(start, previous)).unwrap_or(0);
+            if gap.abs() > i64::from(RATE) / 4 {
+                buffer.data.clear();
+                buffer.live_resyncs += 1;
+            } else if gap > 0 {
+                buffer.append(std::iter::repeat_n([0; 2], gap as usize));
+            } else if gap < 0 {
+                let skip = (-gap) as usize;
+                if skip >= samples.len() { return; }
+                buffer.append(samples[skip..].iter().copied());
+                buffer.live_end = Some(end);
+                buffer.live_latency = 0;
+                return;
+            }
+            buffer.append(samples.iter().copied());
+            buffer.live_end = Some(end);
+        }
+        buffer.live_latency = 0;
+    } else {
+        buffer.capture(&samples);
+    }
+}
+
+/// Maps a sender's 100 ns timestamps to one local playout clock for audio and video.
+#[derive(Default)]
+pub(crate) struct NetworkClock {
+    anchor: Option<(i64, Instant)>,
+    video: VecDeque<(Instant, crate::media::Frame)>,
+}
+
+impl NetworkClock {
+    pub fn stamp(&mut self, ticks: i64, now: Instant) -> Option<Instant> {
+        if ticks <= 0 || ticks == i64::MAX { return None; }
+        let lead = Duration::from_millis(60);
+        if let Some((origin, local)) = self.anchor {
+            let delta = ticks.abs_diff(origin).checked_mul(100).map(Duration::from_nanos);
+            let mapped = delta.and_then(|delta| {
+                if ticks >= origin { local.checked_add(delta) } else { local.checked_sub(delta) }
+            });
+            if let Some(mapped) = mapped.filter(|stamp| {
+                stamp.saturating_duration_since(now).max(now.saturating_duration_since(*stamp))
+                    <= Duration::from_millis(500)
+            }) { return Some(mapped); }
+            self.video.clear();
+        }
+        self.anchor = Some((ticks, now + lead));
+        Some(now + lead)
+    }
+
+    pub fn queue_video(&mut self, frame: crate::media::Frame, stamp: Instant) {
+        // Limit the queue by both frame count and decoded memory.
+        let limit = (128 * 1024 * 1024 / frame.rgba.len().max(1)).clamp(2, 12);
+        let index = self.video.partition_point(|(when, _)| *when <= stamp);
+        self.video.insert(index, (stamp, frame));
+        while self.video.len() > limit { self.video.pop_back(); }
+    }
+
+    pub fn present(&mut self, shared: &crate::media::Shared, now: Instant) {
+        let mut latest = None;
+        while self.video.front().is_some_and(|(when, _)| *when <= now) {
+            latest = self.video.pop_front();
+        }
+        if let Some((_, frame)) = latest {
+            *shared.size.lock().unwrap() = (frame.w, frame.h);
+            *shared.frame.lock().unwrap() = Some(frame);
+            shared.seq.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+#[test]
+fn network_timestamps_keep_sender_spacing_and_reset_after_discontinuity() {
+    let now = Instant::now();
+    let mut clock = NetworkClock::default();
+    let origin = clock.stamp(1_000_000, now).unwrap();
+    assert_eq!(origin, now + Duration::from_millis(60));
+    assert_eq!(clock.stamp(1_200_000, now), Some(origin + Duration::from_millis(20)));
+    assert_eq!(clock.stamp(i64::MAX, now), None);
+    assert_eq!(clock.stamp(90_000_000, now), Some(origin));
+}
+
+#[test]
+fn network_video_waits_for_its_playout_time() {
+    let now = Instant::now();
+    let shared = crate::media::Shared::default();
+    let mut clock = NetworkClock::default();
+    let when = clock.stamp(123, now).unwrap();
+    clock.queue_video(crate::media::Frame { w: 1, h: 1, rgba: vec![1, 2, 3, 255] }, when);
+    clock.present(&shared, now);
+    assert_eq!(shared.seq.load(Relaxed), 0);
+    clock.present(&shared, when);
+    assert_eq!(shared.seq.load(Relaxed), 1);
+}
+
+#[test]
+fn delayed_audio_reads_the_recorded_samples_at_the_requested_offset() {
+    let shared = crate::media::Shared::default();
+    let now = Instant::now();
+    let mut buffer = shared.audio.lock().unwrap();
+    buffer.retain_for_delay(3.0);
+    buffer.live_end = Some(now);
+    buffer.append(std::iter::repeat_n([1000, -1000], RATE as usize));
+    buffer.append(std::iter::repeat_n([2000, -2000], RATE as usize * 3));
+    drop(buffer);
+    assert_eq!(mix_delayed([(&shared, false, 1.0, 3.0)], now, 1)[0], [1000, -1000]);
+    assert_eq!(mix_delayed([(&shared, false, 1.0, 0.0)], now, 1)[0], [2000, -2000]);
 }
 
 pub fn write_pcm(mut output: impl Write, samples: &[Stereo], count: usize) -> std::io::Result<()> {
@@ -714,11 +944,11 @@ mod tests {
         for n in 0..240 {
             let scheduled = n as f64 * frame;
             let stamp = base + Duration::from_secs_f64((scheduled + jitter[n % jitter.len()]) / 1000.0);
-            clock = Some(smooth_clock(clock, scheduled.round() as u64, stamp));
+            clock = Some(smooth_clock(clock, scheduled.round(), stamp));
             let at = base + Duration::from_secs_f64(scheduled / 1000.0);
             let clock = clock.unwrap();
             // Same mapping the mixer uses to find the sample to output.
-            positions.push(clock.ms as f64
+            positions.push(clock.ms
                 + signed_frames(at, clock.stamp) as f64 * 1000.0 / f64::from(RATE));
         }
         for (i, pair) in positions[120..].windows(2).enumerate() {
@@ -727,6 +957,138 @@ mod tests {
                 "position step {step:.3} ms is not {frame:.3} ms at {i} ({:.3} -> {:.3})",
                 pair[0], pair[1]);
         }
+    }
+
+    #[test]
+    fn file_clock_without_jitter_never_moves_the_read_position() {
+        // Marks that agree with the wall clock must leave the position exactly on it, not
+        // wander by the sample-level rounding of the previous millisecond-based clock.
+        let base = Instant::now();
+        let mut clock = None;
+        for update in 0..2000 {
+            let at = base + Duration::from_micros(update * 5000);
+            clock = Some(smooth_clock(clock, update as f64 * 5.0, at));
+        }
+        let clock = clock.unwrap();
+        assert!((clock.ms - 1999.0 * 5.0).abs() < 1e-6, "clock drifted to {}", clock.ms);
+    }
+
+    #[test]
+    fn file_clock_converges_without_jumping_more_than_a_sample() {
+        let base = Instant::now();
+        let mut clock = Some(AudioClock { ms: 10.0, stamp: base });
+        let mut previous = 10.0;
+        for update in 1..400u64 {
+            let at = base + Duration::from_micros(update * 5000);
+            // A true position 11 ms ahead of the clock's: it must be reached gradually.
+            clock = Some(smooth_clock(clock, update as f64 * 5.0 + 21.0, at));
+            let moved = clock.unwrap().ms - previous - 5.0;
+            assert!(moved.abs() <= 1000.0 / f64::from(RATE) + 1e-9, "position stepped by {moved} ms");
+            previous = clock.unwrap().ms;
+        }
+    }
+
+    #[test]
+    fn soft_clip_is_transparent_below_the_knee_and_rolls_off_above_it() {
+        for level in [0.0f32, 0.1, 0.5, 0.79] {
+            for sign in [1.0f32, -1.0] {
+                let expected = (level * sign * 32767.0).round() as i16;
+                assert_eq!(soft_clip(level * sign), expected);
+            }
+        }
+        // Overshoot from a decoder is compressed, monotonic and never wraps.
+        let mut last = soft_clip(0.8);
+        for step in 1..=60 {
+            let value = soft_clip(0.8 + step as f32 * 0.01);
+            assert!(value >= last, "not monotonic at {step}");
+            last = value;
+        }
+        assert!(last > 32000);
+        assert_eq!(soft_clip(-4.0), -soft_clip(4.0));
+        // The curve is smooth where the knee begins: no kink between neighbouring samples.
+        let step = i32::from(soft_clip(0.805)) - i32::from(soft_clip(0.795));
+        assert!((step - 328).abs() < 8, "slope changed at the knee: {step}");
+    }
+
+    #[test]
+    fn mixing_never_drops_a_block_while_a_writer_holds_the_buffer() {
+        let shared = Arc::new(crate::media::Shared::default());
+        {
+            let mut buffer = shared.audio.lock().unwrap();
+            buffer.data.extend((0..RATE as usize * 4).map(|n| {
+                let v = (4000.0 * (n as f32 * std::f32::consts::TAU / 48.0).sin()) as i16;
+                [v, v]
+            }));
+        }
+        *shared.audio_position.lock().unwrap() = Some(AudioClock { ms: 0.0, stamp: Instant::now() });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (shared, stop) = (shared.clone(), stop.clone());
+            std::thread::spawn(move || while !stop.load(Relaxed) {
+                // The reader appends while the monitor callback mixes.
+                let guard = shared.audio.lock().unwrap();
+                let until = Instant::now() + Duration::from_micros(300);
+                while Instant::now() < until { std::hint::spin_loop(); }
+                drop(guard);
+                std::thread::sleep(Duration::from_micros(100));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        let mut silent = 0;
+        for _ in 0..150 {
+            let packet = mix([(&*shared, true, 1.0)], Instant::now(), 480);
+            if packet.iter().all(|&[l, r]| l == 0 && r == 0) { silent += 1; }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        stop.store(true, Relaxed);
+        writer.join().unwrap();
+        assert_eq!(silent, 0, "{silent} of 150 mixer blocks were silent");
+    }
+
+    #[test]
+    fn audio_cursor_windows_are_contiguous_whatever_the_frame_timing() {
+        let base = Instant::now();
+        let mut cursor = AudioCursor::default();
+        let mut previous_end: Option<Instant> = None;
+        let mut total = 0usize;
+        let mut first = None;
+        for frame in 0..600u64 {
+            // 59.94 Hz frames arriving up to 8 ms early or late.
+            let jitter = ((frame * 2654435761) % 17) as f64 - 8.0;
+            let at = base + Duration::from_secs_f64((frame as f64 * 1001.0 / 60.0 + 300.0 + jitter) / 1000.0);
+            let (end, count) = cursor.window(at, 801);
+            if let Some(previous) = previous_end {
+                // Each window ends exactly `count` samples after the previous one.
+                let gap = signed_frames(end, previous) - count as i64;
+                assert_eq!(gap, 0, "window {frame} is not contiguous");
+            } else {
+                first = Some(end);
+            }
+            previous_end = Some(end);
+            total += count;
+        }
+        let covered = signed_frames(previous_end.unwrap(), first.unwrap()) as usize + 801;
+        assert_eq!(total, covered, "samples were repeated or skipped");
+    }
+
+    #[test]
+    fn audio_fifo_adds_no_delay_and_covers_only_small_shortfalls() {
+        let ramp: Vec<Stereo> = (1..=800).map(|n| [n, -n]).collect();
+        let mut fifo = AudioFifo::default();
+        fifo.push(&ramp);
+        // The first frame carries its own audio: no cushion of silence in front of it.
+        assert_eq!(fifo.pop(800), ramp);
+        // A few missing samples hold the last one instead of dropping to silence.
+        fifo.push(&ramp[..790]);
+        let short = fifo.pop(800);
+        assert_eq!(&short[..790], &ramp[..790]);
+        assert!(short[790..].iter().all(|&sample| sample == [790, -790]));
+        // A real underrun is silence, and a consumer that stops is resynchronised.
+        assert!(fifo.pop(800).iter().all(|&sample| sample == [0, 0]));
+        for _ in 0..40 { fifo.push(&ramp); }
+        // 40 pushes of the 800-sample ramp keep only the newest FIFO_LIMIT samples.
+        let first = (40 * 800 - FIFO_LIMIT) % 800 + 1;
+        assert_eq!(fifo.pop(1)[0][0], first as i16);
     }
 
     #[test]
@@ -758,6 +1120,7 @@ pub struct AvPipe<W> {
     slot: u64,
     n: u32,
     d: u32,
+    queue: AudioFifo,
 }
 
 fn element_header(mut out: impl Write, id: &[u8], len: usize) -> std::io::Result<()> {
@@ -828,11 +1191,19 @@ impl<W: Write> AvPipe<W> {
             });
         });
         output.write_all(&header)?;
-        Ok(Self { output, slot: 0, n, d })
+        Ok(Self { output, slot: 0, n, d, queue: AudioFifo::default() })
     }
 
+    /// Queues mixer audio ahead of the frames that will carry it, such as repeated pictures.
+    pub fn queue_audio(&mut self, audio: &[Stereo]) {
+        self.queue.push(audio);
+    }
+
+    /// Writes one picture with `audio` and one frame's worth of the queued samples.
     pub fn frame(&mut self, bgra: &[u8], audio: &[Stereo]) -> std::io::Result<()> {
+        self.queue.push(audio);
         let count = frames_for_slot(self.slot, self.n, self.d);
+        let audio = self.queue.pop(count);
         let time = self.slot * 1_000_000 * u64::from(self.d) / u64::from(self.n);
         let mut stamp = Vec::new();
         uint(&mut stamp, &[0xe7], time);
@@ -845,7 +1216,7 @@ impl<W: Write> AvPipe<W> {
         self.output.write_all(bgra)?;
         element_header(&mut self.output, &[0xa3], 4 + count * 4)?;
         self.output.write_all(&[0x82, 0, 0, 0x80])?;
-        write_pcm(&mut self.output, audio, count)?;
+        write_pcm(&mut self.output, &audio, count)?;
         self.slot += 1;
         Ok(())
     }

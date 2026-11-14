@@ -55,7 +55,9 @@ unsafe fn mode_of(t: &IMFMediaType) -> Option<CamMode> {
     let (w, h) = unpack(t.GetUINT64(&MF_MT_FRAME_SIZE).ok()?);
     let (n, d) = t.GetUINT64(&MF_MT_FRAME_RATE).map(unpack).unwrap_or((0, 1));
     let format = t.GetGUID(&MF_MT_SUBTYPE).map(|g| subtype_name(&g)).unwrap_or_default();
-    Some(CamMode { w: w as u32, h: h as u32, fps_n: n as u32, fps_d: d.max(1) as u32, format })
+    // MFVideoInterlace_FieldInterleavedUpperFirst (3) to FieldSingleLower (6) carry fields.
+    let interlaced = t.GetUINT32(&MF_MT_INTERLACE_MODE).is_ok_and(|v| (3..=6).contains(&v));
+    Some(CamMode { w: w as u32, h: h as u32, fps_n: n as u32, fps_d: d.max(1) as u32, format, interlaced })
 }
 
 fn mf_init() -> bool {
@@ -121,6 +123,49 @@ pub fn list_devices() -> Vec<DeviceInfo> {
     .unwrap_or_default()
 }
 
+/// Every capture mode (size, frame rate, video format) the camera with this symbolic link
+/// reports, best first. Reads the device's native types without starting capture.
+pub fn camera_modes(link: &str) -> Vec<CamMode> {
+    let link = link.to_owned();
+    std::thread::spawn(move || {
+        if !mf_init() {
+            return Vec::new();
+        }
+        unsafe {
+            let mut modes: Vec<CamMode> = Vec::new();
+            let Ok(activates) = enum_activates() else { return modes };
+            for a in activates {
+                if get_string(&a, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK) != link {
+                    continue;
+                }
+                let Ok(source) = a.ActivateObject::<IMFMediaSource>() else { break };
+                if let Ok(reader) = MFCreateSourceReaderFromMediaSource(&source, None) {
+                    let vs = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+                    let mut i = 0;
+                    while let Ok(t) = reader.GetNativeMediaType(vs, i) {
+                        i += 1;
+                        if let Some(m) = mode_of(&t) {
+                            if !modes.contains(&m) {
+                                modes.push(m);
+                            }
+                        }
+                        if i > 500 {
+                            break;
+                        }
+                    }
+                }
+                let _ = source.Shutdown();
+                break;
+            }
+            modes.sort_by(|a, b| (b.w * b.h, b.fps_n * 1000 / b.fps_d.max(1), a.format.clone())
+                .cmp(&(a.w * a.h, a.fps_n * 1000 / a.fps_d.max(1), b.format.clone())));
+            modes
+        }
+    })
+    .join()
+    .unwrap_or_default()
+}
+
 /// Is the Blackmagic Desktop Video driver installed? (its API DLL lives in System32)
 pub fn blackmagic_driver_installed() -> bool {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
@@ -150,6 +195,10 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
     if let Source::File(path) | Source::AutoFile(path, _, _) | Source::FfmpegFile(path, _, _) | Source::DirectShowFile(path, _, _, _) = &src {
         let (source, path) = (sh.clone(), path.clone());
         std::thread::spawn(move || crate::audio::play_file(source, path));
+    }
+    if let Source::Device(_, _, Some(audio)) = &src {
+        let (source, audio) = (sh.clone(), audio.clone());
+        std::thread::spawn(move || crate::audio::capture_device(source, &audio));
     }
     let s2 = sh.clone();
     std::thread::spawn(move || match src {
@@ -334,7 +383,7 @@ unsafe fn open(src: &Source, manager: Option<&IMFDXGIDeviceManager>, sh: &Shared
     }
     let reader = open_reader(src, &attrs)?;
     let dev = match src {
-        Source::Device(_, want) => Some((want.as_ref(), sh)),
+        Source::Device(_, want, _) => Some((want.as_ref(), sh)),
         _ => None,
     };
     let dims = configure(&reader, dev)?;
@@ -343,7 +392,7 @@ unsafe fn open(src: &Source, manager: Option<&IMFDXGIDeviceManager>, sh: &Shared
 
 unsafe fn open_reader(src: &Source, attrs: &IMFAttributes) -> Res<IMFSourceReader> {
     match src {
-        Source::Device(link, _) => {
+        Source::Device(link, _, _) => {
             for a in enum_activates()? {
                 if get_string(&a, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK) == *link {
                     let source: IMFMediaSource = a.ActivateObject()?;
@@ -571,6 +620,14 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
             };
             match r {
                 Ok((r, d)) => {
+                    if is_file {
+                        let duration = unsafe {
+                            r.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
+                        }.ok().and_then(|value| u64::try_from(&value).ok());
+                        if let Some(ticks) = duration.filter(|&ticks| ticks >= 10_000) {
+                            sh.dur_ms.store(ticks / 10_000, Ordering::Relaxed);
+                        }
+                    }
                     *sh.video_adapter.lock().unwrap() = if is_file {
                         Some(manager.as_ref().map_or_else(|| "System-memory reader".into(), |(_, name)| name.clone()))
                     } else { None };
@@ -704,7 +761,7 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
                 std::thread::sleep(target - el);
             }
             sh.pos_ms.store((ts / 10_000).max(0) as u64, Ordering::Relaxed);
-            crate::audio::mark_position(&sh, (ts / 10_000).max(0) as u64);
+            crate::audio::mark_position(&sh, ts.max(0) as f64 / 10_000.0);
         }
         let (w, h) = (dims.w, dims.h);
         if w == 0 || h == 0 {
@@ -884,10 +941,13 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
     let mut first_frame = None;
     let mut last_t: i64 = -1;
     let mut next_audio_slot = 0;
+    let mut audio_queue = crate::audio::AudioFifo::default();
     let mut wrote_video = false;
     let (rn, rd) = rate_fraction(opts.fps);
     let frame_dur = (10_000_000u64 * u64::from(rd) / u64::from(rn.max(1))) as i64;
     while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, timeline_origin, bgra, audio, surface }) = rx.recv() {
+        // Every frame's audio is queued, including frames whose picture is not written.
+        audio_queue.push(&audio);
         if surface.is_some() && !gpu.load(Ordering::Acquire) { continue; }
         // Scale the picture to the project's Output Size.
         if let Some((tw, th)) = opts.size {
@@ -999,9 +1059,13 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 if let Some(index) = *audio_idx {
                     let slot = ((t + frame_dur / 2) / frame_dur) as u64;
                     let slot = slot.max(next_audio_slot);
+                    // Slots whose pictures were dropped still get their audio, up to one second.
+                    let first = if slot - next_audio_slot <= u64::from(rn / rd.max(1)) { next_audio_slot } else { slot };
                     next_audio_slot = slot + 1;
-                    let frame_count = crate::audio::frames_for_slot(slot, rn, rd);
-                    let audio_offset = slot * u64::from(crate::audio::RATE) * u64::from(rd) / u64::from(rn);
+                    let samples_at = |slot: u64| slot * u64::from(crate::audio::RATE) * u64::from(rd) / u64::from(rn);
+                    let audio_offset = samples_at(first);
+                    let frame_count = (samples_at(slot + 1) - audio_offset) as usize;
+                    let audio = audio_queue.pop(frame_count);
                     let to_hns = |samples| (samples * 10_000_000 / u64::from(crate::audio::RATE)) as i64;
                     let len = (frame_count * 4) as u32;
                     let buffer = MFCreateMemoryBuffer(len)?;
@@ -1108,6 +1172,10 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
                     all,
                 ])?,
                 PickKind::Image => d.SetFileTypes(&[image, all])?,
+                PickKind::Script(_) => d.SetFileTypes(&[
+                    COMDLG_FILTERSPEC { pszName: windows::core::w!("Text files"), pszSpec: windows::core::w!("*.txt;*.text;*.md") },
+                    all,
+                ])?,
                 PickKind::Title => d.SetFileTypes(&[
                     COMDLG_FILTERSPEC { pszName: windows::core::w!("GT Designer titles"), pszSpec: windows::core::w!("*.gtzip") },
                     all,
@@ -1462,6 +1530,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(sh.seq.load(Ordering::Relaxed), 1, "paused clip must show and hold its first frame");
+        assert!(sh.dur_ms.load(Ordering::Relaxed) >= 1_000, "total duration should be available while paused");
         sh.paused.store(false, Ordering::Relaxed);
         let t = Instant::now();
         while sh.seq.load(Ordering::Relaxed) < 5 && t.elapsed() < Duration::from_secs(10) {
@@ -1512,7 +1581,7 @@ mod camera_test {
     #[test]
     fn first_camera_delivers_frames() {
         let Some(dev) = list_devices().into_iter().next() else { return };
-        let sh = start(Source::Device(dev.link.clone(), None));
+        let sh = start(Source::Device(dev.link.clone(), None, None));
         let t = Instant::now();
         while sh.seq.load(Ordering::Relaxed) < 3 && t.elapsed() < Duration::from_secs(12) {
             std::thread::sleep(Duration::from_millis(50));

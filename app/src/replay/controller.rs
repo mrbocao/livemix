@@ -455,7 +455,7 @@ fn player_row(ui: &mut egui::Ui, s: &mut Switcher, channel: usize, cameras: &[us
     if select.clicked() && !s.replay_ui.preview_mode { s.replay_channel = channel; }
     if tool(ui, "P", 26.0, None).on_hover_text(tr(ui, "Send this player to Preview")).clicked() {
         let id = s.ensure_replay_inputs()[channel];
-        s.preview = Some(id);
+        s.select_preview(id);
     }
     for &angle in cameras {
         let active = (s.replay_cameras[channel] == angle).then_some(EVENTS_TAB);

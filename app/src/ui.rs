@@ -99,7 +99,7 @@ pub(crate) fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                 changed |= recording_profile(ui, "rec-profile", codec);
                 ui.end_row();
                 ui.label(tr(ui, "Video bitrate"));
-                changed |= ui.add_enabled(codec.ffmpeg_profile(false).bitrate,
+                changed |= ui.add_enabled(codec.ffmpeg_profile().bitrate,
                     egui::DragValue::new(mbps).range(1..=100).suffix(" Mbps")).changed();
                 ui.end_row();
                 ui.label(tr(ui, "Audio track"));
@@ -246,7 +246,7 @@ pub(crate) fn setup_windows(ctx: &egui::Context, s: &mut Switcher) {
                         changed |= recording_profile(ui, "mc-profile", &mut s.cfg.mc_codec);
                         ui.end_row();
                         ui.label(tr(ui, "Video bitrate"));
-                        changed |= ui.add_enabled(s.cfg.mc_codec.ffmpeg_profile(false).bitrate,
+                        changed |= ui.add_enabled(s.cfg.mc_codec.ffmpeg_profile().bitrate,
                             egui::DragValue::new(&mut s.cfg.mc_mbps).range(1..=100).suffix(" Mbps")).changed();
                         ui.end_row();
                         ui.label(tr(ui, "Audio track"));
@@ -702,6 +702,18 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                                 let _ = source;
                             }
                         }
+                        AddKind::Teleprompter => {
+                            ui.horizontal(|ui| {
+                                ui.label("Script");
+                                if ui.button("Load text file…").clicked() {
+                                    s.browse_req = Some(media::PickKind::Script(None));
+                                }
+                            });
+                            ui.add(egui::TextEdit::multiline(&mut s.add_dialog.script).desired_rows(8)
+                                .desired_width(f32::INFINITY).hint_text("Paste the script here (it can be edited later in Input Settings)"));
+                            ui.label(RichText::new("The text scrolls while the input plays. Speed, size and mirroring are in Input Settings → Teleprompter.")
+                                .size(11.0).color(TEXT_DIM));
+                        }
                         AddKind::Telestrator => {
                             if s.remote.is_some() {
                                 ui.label(RichText::new(format!("Web Controller: enabled at http://{}/telestrator/",
@@ -714,9 +726,9 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                             ui.label(RichText::new("The Telestrator is a transparent drawing layer. Add it as an Overlay over Program; draw from the Web Controller page or from Input Settings.")
                                 .size(11.0).color(TEXT_DIM));
                         }
-                        AddKind::Camera | AddKind::Blackmagic | AddKind::AudioInput => {
+                        AddKind::Camera | AddKind::AudioInput => {
                             let list = s.dialog_devices();
-                            if s.add_dialog.kind == AddKind::Blackmagic {
+                            if s.add_dialog.kind == AddKind::Camera && list.iter().any(|device| device.blackmagic) {
                                 let ok = media::blackmagic_driver_installed();
                                 ui.label(
                                     RichText::new(if ok { "Blackmagic Desktop Video driver: installed" } else { "Blackmagic Desktop Video driver: not found (needed for DeckLink / Intensity / UltraStudio)" })
@@ -755,6 +767,11 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                                     ui.label(tr(ui, "Video format"));
                                     decklink_mode_picker(ui, "add-decklink-mode", device, false, &mut s.add_dialog.decklink_mode);
                                 });
+                            }
+                            if s.add_dialog.kind == AddKind::Camera {
+                                let link = list.get(s.add_dialog.device).map(|d| d.link.clone())
+                                    .filter(|link| decklink::device_index(link).is_none());
+                                camera_mode_section(ui, &mut s.add_dialog, link);
                             }
                             if s.add_dialog.devices_loaded {
                                 ui.label(RichText::new(format!("{} device(s) found on this computer", list.len())).size(11.0).color(TEXT_DIM));
@@ -860,6 +877,7 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
         let web = s.remote.is_some();
         let mut copy_pos = None;
         let mut browse_lut = false;
+        let mut browse_script = false;
         if let Some(inp) = s.input_mut(id) {
             egui::Window::new(format!("{} — {} {}", locale::text(ctx, "Input Settings"), number, inp.title))
                 .id(egui::Id::new("input-settings"))
@@ -878,7 +896,7 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                         ui.vertical(|ui| {
                             ui.set_width(150.0);
                             settings_navigation(ui, &INPUT_PAGES, &INPUT_PAGES_BUILT, &[
-                                ("Source", &[0, 12]), ("Picture", &[1, 2, 3, 5, 6, 7]),
+                                ("Source", &[0, 12, 13]), ("Picture", &[1, 2, 3, 5, 6, 7]),
                                 ("Sound", &[4]), ("Automation", &[8, 9, 10, 11]),
                             ], &mut page, page_height);
                         });
@@ -928,6 +946,7 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                                 10 => input_ptz(ui, inp),
                                 11 => input_advanced(ui, inp, number),
                                 12 => input_telestrator(ui, inp, &all, t, output, web),
+                                13 => input_teleprompter(ui, inp, &mut browse_script),
                                 _ => {
                                     ui.label(RichText::new("This section of the original is not available in this version yet.").color(TEXT_DIM));
                                 }
@@ -947,6 +966,7 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
         }
         s.cfg.input_page = page;
         if browse_lut { s.browse_req = Some(media::PickKind::Lut(id)); }
+        if browse_script { s.browse_req = Some(media::PickKind::Script(Some(id))); }
         if let Some(p) = copy_pos {
             s.position_clipboard = Some(p);
         }
@@ -1050,6 +1070,52 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
 /// The original's gear ("cog") setup button that sits left of Record, External, Stream,
 /// MultiCorder and PlayList (frmmain cmdRecSetup, cmdExternal, cmdStreamingSetup,
 /// cmdMultiCorderSetup, cmdPlayListSetup).
+/// Add Input, Camera: the capture options the selected camera reports (Resolution, Frame Rate,
+/// Video Format). They are read from the device on a worker thread when it is selected.
+fn camera_mode_section(ui: &mut egui::Ui, d: &mut AddDialog, link: Option<String>) {
+    if let Some((read_for, modes)) = d.cam_modes_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        d.cam_modes_rx = None;
+        if read_for == d.cam_modes_link {
+            d.cam_modes = modes;
+        }
+    }
+    let Some(link) = link else {
+        d.cam_modes_link.clear();
+        d.cam_modes.clear();
+        d.cam_mode = None;
+        d.cam_modes_rx = None;
+        return;
+    };
+    if d.cam_modes_link != link {
+        d.cam_modes_link.clone_from(&link);
+        d.cam_modes.clear();
+        d.cam_mode = None;
+        // Capture cards expose their audio as a separate input that usually carries the card's
+        // name; pick it when one matches, else leave audio off.
+        let camera_name = d.devices.iter().find(|x| x.link == link).map(|x| x.name.to_lowercase()).unwrap_or_default();
+        d.cam_audio = d.devices.iter().filter(|x| x.link.starts_with("audio:")).find(|x| {
+            let audio = x.name.to_lowercase();
+            !camera_name.is_empty() && (audio.contains(&camera_name) || camera_name.contains(&audio))
+        }).map(|x| x.link["audio:".len()..].to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        d.cam_modes_rx = Some(rx);
+        let ctx = ui.ctx().clone();
+        std::thread::spawn(move || {
+            let modes = media::camera_modes(&link);
+            let _ = tx.send((link, modes));
+            ctx.request_repaint();
+        });
+    }
+    let reading = d.cam_modes_rx.is_some();
+    egui::Grid::new("add-camera-modes").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+        let text = if reading { "Reading the camera's formats…" } else { "The camera did not report its formats (Auto)." };
+        sources::camera_mode_fields(ui, u32::MAX, &d.cam_modes, None, &mut d.cam_mode, text);
+        let audio: Vec<media::DeviceInfo> = d.devices.iter().filter(|x| x.link.starts_with("audio:"))
+            .map(|x| media::DeviceInfo { name: x.name.clone(), link: x.link.clone(), blackmagic: false }).collect();
+        sources::camera_audio_row(ui, u32::MAX, &audio, &mut d.cam_audio);
+    });
+}
+
 pub(crate) fn gear_btn(ui: &mut egui::Ui, open: bool, tip: &str) -> egui::Response {
     let tip = tr(ui, tip);
     let (r, resp) = ui.allocate_exact_size(Vec2::new(38.0, 30.0), Sense::click());

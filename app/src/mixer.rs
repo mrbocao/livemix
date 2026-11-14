@@ -2,18 +2,24 @@
 use super::*;
 
 impl App {
-    pub(crate) fn audio_input(&self, input: &Input) -> Option<(&media::Shared, bool, f32)> {
-        let source = self.media.get(&input.id)?.shared.as_deref()?;
-        let file = matches!(input.kind, Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Replay { .. });
+    pub(crate) fn audio_input(&self, input: &Input) -> Option<(&Arc<media::Shared>, bool, f32, f32)> {
+        let (original, delay) = match input.kind {
+            Kind::VideoDelay { source: Some(source), seconds, .. } => (self.s.input(source)?, seconds),
+            _ => (input, 0.0),
+        };
+        let source = self.media.get(&original.id)?.shared.as_ref()?;
+        let file = matches!(original.kind, Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Replay { .. });
         let gain = if input.audio_on { input.volume / 100.0 } else { 0.0 };
-        Some((source, file, gain))
+        Some((source, file, gain, delay))
     }
 
     /// Peak level of every audio input, kept for the mixer strips and the Input Settings meter.
     pub(crate) fn update_levels(&mut self) {
         let at = Instant::now();
         let levels: Vec<(u32, [f32; 2])> = self.s.inputs.iter().filter(|input| input.kind.has_audio())
-            .map(|input| (input.id, self.audio_input(input).map_or([0.0; 2], |source| audio::input_peaks(source, at))))
+            .map(|input| (input.id, self.audio_input(input).map_or([0.0; 2], |(source, file, gain, delay)| {
+                audio::delayed_peaks((source, file, gain, delay), at)
+            })))
             .collect();
         for (id, level) in levels {
             if let Some(input) = self.s.input_mut(id) {
@@ -29,18 +35,31 @@ impl App {
             _ => route.checked_sub(1),
         };
         let gain = if master { self.master_gain() } else { 1.0 };
-        audio::mix(self.s.inputs.iter().filter(|input| {
+        audio::mix_delayed(self.s.inputs.iter().filter(|input| {
             if master { input.bus_m } else { Some(input.id) == selected }
         }).filter_map(|input| {
-            let (source, file, level) = self.audio_input(input)?;
+            let (source, file, level, delay) = self.audio_input(input)?;
             let auto = if master { self.s.automatic_audio_gain(input) } else { 1.0 };
-            Some((source, file, level * gain * auto))
+            Some((source.as_ref(), file, level * gain * auto, delay))
         }), at, frames)
     }
 
     pub(crate) fn master_gain(&self) -> f32 {
         let fade = if self.s.ftb_audio { 1.0 - self.s.ftb_level / FULL } else { 1.0 };
         if self.s.master_on { self.s.master_volume / 100.0 * fade } else { 0.0 }
+    }
+
+    pub(crate) fn mix_external_audio(&self, bus: u8, delay_ms: u32, at: Instant, frames: usize) -> audio::Packet {
+        let bus_gain = if bus == 0 { self.master_gain() } else { 1.0 };
+        audio::mix_delayed(self.s.inputs.iter().filter(|input| match bus {
+            1 => input.bus_a,
+            2 => input.bus_b,
+            _ => input.bus_m,
+        }).filter_map(|input| {
+            let (source, file, gain, delay) = self.audio_input(input)?;
+            Some((source.as_ref(), file, gain * bus_gain * self.s.automatic_audio_gain(input),
+                delay + delay_ms as f32 / 1000.0))
+        }), at, frames)
     }
 
     pub(crate) fn update_audio_monitor(&mut self) {
@@ -65,13 +84,13 @@ impl App {
                 _ => input.bus_m,
             }
         }).filter_map(|input| {
-            let (_, file, volume) = self.audio_input(input)?;
+            let (source, file, volume, delay) = self.audio_input(input)?;
             let gain = if solo {
                 if input.solo_pfl { 1.0 } else { volume }
             } else {
                 volume * bus_gain * self.s.automatic_audio_gain(input)
             };
-            Some((self.media.get(&input.id)?.shared.clone()?, file, gain * headphones))
+            Some((source.clone(), file, gain * headphones, delay))
         }).collect::<Vec<_>>().into();
         *monitor.sources.lock().unwrap() = sources;
     }

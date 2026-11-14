@@ -262,7 +262,8 @@ pub(crate) fn decklink_connector(ui: &mut egui::Ui, id: impl std::hash::Hash, po
 }
 
 pub(crate) fn decklink_mode_picker(ui: &mut egui::Ui, id: &str, device: usize, playback: bool, mode: &mut u32) {
-    let modes_key = ui.id().with((id, device));
+    let generation = ui.data(|d| d.get_temp::<u64>(egui::Id::new("decklink-device-generation"))).unwrap_or(0);
+    let modes_key = ui.id().with((id, device, generation));
     let modes = ui.data(|d| d.get_temp::<Vec<decklink::Mode>>(modes_key)).unwrap_or_else(|| {
         let modes = decklink::display_modes(device, playback);
         ui.data_mut(|d| d.insert_temp(modes_key, modes.clone()));
@@ -279,56 +280,112 @@ pub(crate) fn decklink_mode_picker(ui: &mut egui::Ui, id: &str, device: usize, p
     });
 }
 
-pub(crate) fn decklink_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
-    ui.strong("DeckLink output");
-    let key = ui.id().with("decklink-output-channel");
+pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
+    let key = ui.id().with("external-output-channel");
     let mut channel = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(OUTPUT_COUNT - 1);
     ui.horizontal(|ui| {
+        let width = ((ui.available_width() - ui.spacing().item_spacing.x * 3.0) / OUTPUT_COUNT as f32).max(1.0);
         for index in 0..OUTPUT_COUNT {
-            ui.selectable_value(&mut channel, index, format!("Output {}", index + 1));
+            let label = if index == 0 { "External".to_owned() } else { format!("External {}", index + 1) };
+            if ui.add_sized([width, 34.0], egui::Button::new(label).selected(index == channel)).clicked() {
+                channel = index;
+            }
         }
     });
     ui.data_mut(|d| d.insert_temp(key, channel));
-    if ui.button("Refresh DeckLink devices").clicked() {
-        let devices = decklink::refresh_devices();
-        for device in devices {
-            let modes = ui.id().with(("decklink-output-mode", device.index));
-            ui.data_mut(|d| d.remove::<Vec<decklink::Mode>>(modes));
-        }
-    }
+    ui.separator();
     let devices = decklink::devices_cached();
+    let choices = src_choices(s, true);
+    let source_name = src_name(s, s.cfg.outputs[channel].source);
+    let (width, height) = s.cfg.out_dims();
+    let fps = s.cfg.frame_rate();
+    let window_open = s.external[channel].open;
+    let renderer_active = s.decklink_active[channel];
     let route = &mut s.cfg.decklink_outputs[channel];
     let before = route.device;
     let name = before.map_or_else(|| "None".into(), |index| {
         devices.iter().find(|d| d.index == index).map(|d| d.name.clone()).unwrap_or_else(|| format!("Device {} unavailable", index + 1))
     });
-    egui::ComboBox::from_id_salt("decklink-output-device").selected_text(name).show_ui(ui, |ui| {
-        ui.selectable_value(&mut route.device, None, tr(ui, "None"));
-        for device in devices.iter().filter(|device| device.playback) {
-            ui.selectable_value(&mut route.device, Some(device.index), &device.name);
-        }
+    let mut toggle_window = false;
+    let mut toggle_renderer = false;
+    ui.push_id(channel, |ui| {
+        egui::Grid::new("external-form").num_columns(3).spacing([16.0, 8.0]).show(ui, |ui| {
+            ui.label("Destination");
+            ui.strong("Local window");
+            ui.strong("External Renderer");
+            ui.end_row();
+            ui.label("Status");
+            toggle_window = ui.button(if window_open { "Close" } else { "Open" }).clicked();
+            toggle_renderer = ui.add_enabled(route.device.is_some(),
+                egui::Button::new(if renderer_active { "Stop" } else { "Start" })).clicked();
+            ui.end_row();
+            ui.label("Frame Rate");
+            ui.label(format!("{fps:.2} fps · project"));
+            ui.add_enabled_ui(route.device.is_some(), |ui| {
+                if let Some(device) = route.device {
+                    decklink_mode_picker(ui, "decklink-output-mode", device, true, &mut route.mode);
+                } else {
+                    ui.label("Select a device");
+                }
+            });
+            ui.end_row();
+            ui.label("Output Size");
+            egui::ComboBox::from_id_salt("ext-size").selected_text(EXT_SIZES[s.cfg.ext_size.min(2) as usize].0).show_ui(ui, |ui| {
+                for (index, (label, _)) in EXT_SIZES.iter().enumerate() {
+                    ui.selectable_value(&mut s.cfg.ext_size, index as u8, *label);
+                }
+            });
+            ui.label(if route.mode == 0 { format!("{width} × {height} · project") } else { "From selected mode".into() });
+            ui.end_row();
+            ui.label("Source");
+            egui::ComboBox::from_id_salt("external-source").selected_text(source_name).show_ui(ui, |ui| {
+                for (value, label) in choices {
+                    ui.selectable_value(&mut s.cfg.outputs[channel].source, value, label);
+                }
+            });
+            ui.end_row();
+            ui.label("Device");
+            egui::ComboBox::from_id_salt("decklink-output-device").width(190.0).selected_text(name).show_ui(ui, |ui| {
+                ui.selectable_value(&mut route.device, None, tr(ui, "None"));
+                for device in devices.iter().filter(|device| device.playback) {
+                    ui.selectable_value(&mut route.device, Some(device.index), &device.name);
+                }
+            });
+            ui.end_row();
+            ui.label("Port");
+            if cfg!(windows) {
+                ui.add_enabled_ui(route.device.is_some(), |ui| decklink_connector(ui, "decklink-output-port", &mut route.port));
+            } else {
+                ui.label("Desktop Video Setup");
+            }
+            ui.end_row();
+            ui.label("Audio Channels");
+            let buses = ["Master", "A", "B"];
+            egui::ComboBox::from_id_salt("external-audio-bus").selected_text(buses[usize::from(route.audio_bus.min(2))]).show_ui(ui, |ui| {
+                for (index, name) in buses.into_iter().enumerate() {
+                    ui.selectable_value(&mut route.audio_bus, index as u8, name);
+                }
+            });
+            ui.end_row();
+            ui.label("Audio Delay");
+            ui.add_enabled(!route.key_fill, egui::DragValue::new(&mut route.audio_delay_ms).range(0..=1000).suffix(" ms"));
+            ui.end_row();
+            ui.label("Alpha Channel");
+            setting_toggle(ui, &mut route.key_fill, "Key + Fill (Graphics Only)")
+                .on_hover_text("Send active Program overlays over transparent video. Requires DeckLink external keying.");
+            ui.end_row();
+        });
     });
-    if before != route.device {
+    let device_changed = before != route.device;
+    if device_changed {
         route.mode = 0;
         route.port = 0;
         s.decklink_active[channel] = false;
         s.decklink_status[channel].clear();
     }
-    if let Some(device) = route.device {
-        ui.horizontal(|ui| {
-            if cfg!(windows) {
-                ui.label(tr(ui, "Connector"));
-                decklink_connector(ui, "decklink-output-port", &mut route.port);
-            }
-            ui.label(tr(ui, "Mode"));
-            decklink_mode_picker(ui, "decklink-output-mode", device, true, &mut route.mode);
-        });
-        if cfg!(target_os = "macos") {
-            ui.label("Set the playback connector in Blackmagic Desktop Video Setup.");
-        }
-        if ui.button(if s.decklink_active[channel] { "Stop DeckLink output" } else { "Start DeckLink output" }).clicked() {
-            s.toggle_external_route(channel);
-        }
+    if toggle_window { s.toggle_external(channel); }
+    if toggle_renderer && !device_changed { s.toggle_external_route(channel); }
+    if s.cfg.decklink_outputs[channel].device.is_some() {
         ui.label(&s.decklink_status[channel]);
     } else if !devices.iter().any(|device| device.playback) {
         ui.label(tr(ui, "No DeckLink playback device detected."));
@@ -336,6 +393,11 @@ pub(crate) fn decklink_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
             ui.label("Install Desktop Video and use a DeckLink-enabled FFmpeg build, then refresh.");
         }
     }
+    ui.collapsing("Advanced Settings", |ui| {
+        setting_toggle(ui, &mut s.cfg.ext_on_top, "On Top");
+        setting_toggle(ui, &mut s.cfg.ext_hide_cursor, "Hide Cursor");
+        if ui.button("Configure Outputs / NDI / OMT / SRT…").clicked() { s.cfg.page = 1; }
+    });
 }
 
 /// MultiView 1 / 2 (frmSettings cmdMultiView1/2, lblMultiViewLayout "MultiView Layout",
@@ -597,7 +659,6 @@ pub(crate) fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapte
                 ui.end_row();
             });
             ui.add_space(4.0);
-            setting_toggle(ui, &mut s.ftb_audio, "Fade To Black includes Audio");
             setting_toggle(ui, &mut s.pause_preview, "Automatically Pause Preview Input after Transition");
             setting_toggle(ui, &mut s.play_active, "Automatically Play Output Input with Transition");
             setting_toggle(ui, &mut s.restart_active, "Automatically Restart Output Input with Transition");
@@ -719,29 +780,11 @@ pub(crate) fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapte
             ui.label(RichText::new("NDI, OMT and SRT use the selected video route.").size(11.0).color(TEXT_DIM));
         }
         6 => {
-            decklink_output_settings(ui, s);
-            ui.separator();
-            ui.strong("Local External windows");
-            ui.label("Drag a window to a second screen and double-click to enter fullscreen. Press Esc to leave fullscreen.");
-            ui.add_space(6.0);
-            egui::Grid::new("set-ext").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                ui.label("Window Size:");
-                egui::ComboBox::from_id_salt("ext-size").selected_text(EXT_SIZES[s.cfg.ext_size.min(2) as usize].0).show_ui(ui, |ui| {
-                    for (k, (name, _)) in EXT_SIZES.iter().enumerate() {
-                        ui.selectable_value(&mut s.cfg.ext_size, k as u8, *name);
-                    }
-                });
-                ui.end_row();
-            });
-            ui.add_space(4.0);
-            setting_toggle(ui, &mut s.cfg.ext_on_top, "On Top");
-            setting_toggle(ui, &mut s.cfg.ext_hide_cursor, "Hide Cursor");
-            if ui.button("Configure Output 1–4…").clicked() {
-                s.cfg.page = 1;
-            }
+            external_output_settings(ui, s);
         }
         7 => {
             // Audio
+            setting_toggle(ui, &mut s.ftb_audio, "Fade To Black includes Audio");
             setting_toggle(ui, &mut s.cfg.master_meter, "Show Master Audio Meter in Main Window");
             setting_toggle(ui, &mut s.cfg.input_meter, "Show Audio Meter next to Inputs");
             setting_toggle(ui, &mut s.cfg.default_auto_mix, "Automatically mix new inputs");
@@ -805,6 +848,7 @@ pub(crate) fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapte
             ui.label(format!("Inputs: {}", s.inputs.len()));
             let backend = if cfg!(windows) { "Media Foundation" } else { "AVFoundation" };
             ui.label(format!("Video devices: {backend} · Blackmagic driver {}", if media::blackmagic_driver_installed() { "available" } else { "not found" }));
+            ui.label(format!("FFmpeg: {}", crate::stream::ffmpeg_location()));
         }
         16 => {
             if ui.button("Open RTMP streaming setup").clicked() { s.stream_setup = true; }
