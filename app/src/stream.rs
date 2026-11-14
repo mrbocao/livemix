@@ -105,22 +105,72 @@ pub(crate) fn publish_url(dest: &Destination) -> Result<String, String> {
     Ok(if key.is_empty() { url.into() } else { format!("{}/{}", url.trim_end_matches('/'), key) })
 }
 
-pub(crate) fn command() -> Command {
+fn ffmpeg_path() -> PathBuf {
     let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let ffmpeg = std::env::var_os("LIVEMIX_FFMPEG").map(PathBuf::from)
+    std::env::var_os("LIVEMIX_FFMPEG").map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok().map(|p| p.with_file_name(exe)).filter(|p| p.is_file()))
         .or_else(|| ["LOCALAPPDATA", "HOME"].into_iter().filter_map(std::env::var_os)
             .map(PathBuf::from).flat_map(|p| [p.join("LiveMix/dependencies/ffmpeg"), p.join("Library/Application Support/LiveMix/bin")])
             .map(|p| p.join(exe)).find(|p| p.is_file()))
         .or_else(|| ["/opt/homebrew/bin", "/usr/local/bin"].into_iter().filter(|_| cfg!(target_os = "macos"))
             .map(|p| PathBuf::from(p).join(exe)).find(|p| p.is_file()))
-        .unwrap_or_else(|| PathBuf::from(exe));
-    let mut command = Command::new(ffmpeg);
+        .or_else(|| std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path)
+            .map(|dir| dir.join(exe)).find(|path| path.is_file())))
+        .unwrap_or_else(|| PathBuf::from(exe))
+}
+
+pub(crate) fn command() -> Command {
+    let mut command = Command::new(ffmpeg_path());
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     #[cfg(target_os = "macos")]
     command.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default()));
     command
+}
+
+pub(crate) fn ffmpeg_location() -> String {
+    let path = ffmpeg_path();
+    if path.is_file() { path.display().to_string() } else {
+        format!("{} (not found on configured paths)", path.display())
+    }
+}
+
+pub(crate) fn hardware_encoder(hevc: bool, [width, height]: [u32; 2], (n, d): (u32, u32),
+    options: &[&str], cancelled: impl Fn() -> bool) -> Option<&'static str>
+{
+    let candidates: &[&str] = match (cfg!(windows), hevc) {
+        (true, false) => &["h264_nvenc", "h264_qsv", "h264_amf"],
+        (true, true) => &["hevc_nvenc", "hevc_qsv", "hevc_amf"],
+        (false, false) => &["h264_videotoolbox"],
+        (false, true) => &["hevc_videotoolbox"],
+    };
+    candidates.iter().copied().take_while(|_| !cancelled()).find(|encoder| {
+        let mut cmd = command();
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i",
+            &format!("color=size={width}x{height}:rate={n}/{d}"),
+            "-frames:v", "1", "-c:v", encoder, "-pix_fmt", "yuv420p"]);
+        hardware_only(&mut cmd, encoder);
+        let Ok(mut child) = cmd.args(options).args(["-f", "null", "-"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if !cancelled() && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    })
+}
+
+pub(crate) fn hardware_only(cmd: &mut Command, encoder: &str) {
+    if encoder.ends_with("_videotoolbox") { cmd.args(["-allow_sw", "0"]); }
 }
 
 impl Output {
@@ -216,28 +266,20 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<(NetworkFrame, crate::
     let (n, d) = crate::media::rate_fraction(fps as f32);
     let srt = encoding.muxer == "mpegts";
     if srt { crate::srt::check_ffmpeg()?; }
-    let (gpu, cpu) = match (cfg!(target_os = "macos"), encoding.hevc) {
-        (true, true) => ("hevc_videotoolbox", "libx265"),
-        (true, false) => ("h264_videotoolbox", "libx264"),
-        (false, true) => ("hevc_nvenc", "libx265"),
-        (false, false) => ("h264_nvenc", "libx264"),
-    };
-    let amd = if encoding.hevc { "hevc_amf" } else { "h264_amf" };
-    let intel = if encoding.hevc { "hevc_qsv" } else { "h264_qsv" };
-    let encoder = if !encoding.hardware {
-        cpu
-    } else if hardware_encoder_available(gpu) {
-        gpu
-    } else if cfg!(windows) && hardware_encoder_available(amd) {
-        amd
-    } else if cfg!(windows) && hardware_encoder_available(intel) {
-        intel
-    } else {
-        cpu
-    };
+    let cpu = if encoding.hevc { "libx265" } else { "libx264" };
     let bitrate = format!("{}k", encoding.kbps.clamp(100, 100_000));
+    let gop = (fps * f64::from(encoding.gop_seconds.clamp(1, 10))).round().to_string();
+    let video_options = ["-b:v", &bitrate, "-maxrate", &bitrate, "-bufsize", &bitrate,
+        "-g", &gop, "-bf", "0"];
+    let encoder = if encoding.hardware {
+        hardware_encoder(encoding.hevc, encoding.resolution.unwrap_or([w, h]), (n, d), &video_options,
+            || state.lock().unwrap().stop).unwrap_or(cpu)
+    } else { cpu };
     let mut state_lock = state.lock().unwrap();
     if state_lock.stop { return Ok(()); }
+    if encoding.hardware && encoder == cpu {
+        state_lock.log(format!("No hardware encoder passed the output format test. Using {cpu}."));
+    }
     let mut cmd = command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-nostdin"])
         .args(["-probesize", "32", "-analyzeduration", "1", "-f", "matroska", "-i", "pipe:0"])
@@ -245,13 +287,13 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<(NetworkFrame, crate::
     if encoder == cpu {
         cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
     }
+    hardware_only(&mut cmd, encoder);
     if let Some([width, height]) = encoding.resolution {
         cmd.args(["-vf", &format!("scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")]);
     }
     if encoding.muxer == "tee" { cmd.args(["-flags", "+global_header", "-use_fifo", "1"]); }
-    cmd.args(["-pix_fmt", "yuv420p", "-b:v", &bitrate, "-maxrate", &bitrate, "-bufsize", &bitrate,
-        "-g", &(fps * f64::from(encoding.gop_seconds.clamp(1, 10))).round().to_string(), "-bf", "0",
-        "-c:a", "aac", "-ac", "2", "-ar", &encoding.audio_rate.to_string(), "-b:a", &format!("{}k", encoding.audio_kbps.clamp(32, 384)),
+    cmd.args(["-pix_fmt", "yuv420p"]).args(video_options)
+        .args(["-c:a", "aac", "-ac", "2", "-ar", &encoding.audio_rate.to_string(), "-b:a", &format!("{}k", encoding.audio_kbps.clamp(32, 384)),
         "-rw_timeout", "5000000", "-flush_packets", "1", "-f", encoding.muxer, &encoding.url]);
     state_lock.log(format!("Starting {encoder}, {bitrate} video, AAC stereo at {} Hz and {} kbps",
         encoding.audio_rate, encoding.audio_kbps));
@@ -309,13 +351,15 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<(NetworkFrame, crate::
         match receive.recv_timeout(Duration::from_millis(100)) {
             Ok((frame, audio, at)) if frame.width == w as usize && frame.height == h as usize => {
                 let slot = (at.saturating_duration_since(*start.get_or_insert(at)).as_secs_f64() * fps).round() as u64;
+                // A late frame's audio also covers the repeated pictures written before it.
+                input.queue_audio(&audio);
                 if slot < next { continue; }
                 if let Some(previous) = &previous {
                     for _ in 0..(slot - next).min(fps.ceil() as u64) {
                         input.frame(&previous.pixels, &[]).map_err(|_| failure)?;
                     }
                 }
-                input.frame(&frame.pixels, &audio).map_err(|_| failure)?;
+                input.frame(&frame.pixels, &[]).map_err(|_| failure)?;
                 peak = crate::audio::stereo_peaks(&audio).into_iter().fold(peak, f32::max);
                 audio_samples += audio.len();
                 if audio_interval.elapsed() >= Duration::from_secs(5) {
@@ -338,13 +382,6 @@ fn run(state: &Arc<Mutex<State>>, receive: mpsc::Receiver<(NetworkFrame, crate::
             }
         }
     }
-}
-
-fn hardware_encoder_available(encoder: &str) -> bool {
-    command().args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=size=128x128:rate=30",
-        "-frames:v", "1", "-c:v", encoder, "-f", "null", "-"])
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .status().is_ok_and(|status| status.success())
 }
 
 #[test]

@@ -171,27 +171,34 @@ fn receive(shared: &Shared, address: &str, thumbnail: bool) -> Result<(), String
         *shared.status.lock().unwrap() = "Waiting for OMT video…".into();
         let mut last_frame = None;
         let mut audio_phase = 0;
+        let mut clock = crate::audio::NetworkClock::default();
         while !shared.stop.load(Relaxed) {
-            let media = (api.recv)(receiver, media_types, 100);
+            let media = (api.recv)(receiver, media_types, 5);
+            let now = Instant::now();
             if let Some(audio) = media.as_ref().filter(|frame| frame.frame_type == AUDIO && frame.codec == FPA1) {
                 let frames = audio.samples.max(0) as usize;
                 let channels = audio.channels.max(0) as usize;
                 let stride = frames * 4;
                 if stride.saturating_mul(channels) <= audio.data_length.max(0) as usize {
                     crate::audio::capture_planar(shared, audio.data, frames, stride, channels,
-                        audio.sample_rate as usize, 32768.0, &mut audio_phase);
+                        audio.sample_rate as usize, 32768.0, &mut audio_phase, clock.stamp(audio.timestamp, now));
                 }
-            } else if let Some(frame) = media.as_ref().filter(|frame| frame.frame_type == VIDEO).and_then(|video| unpack(video)) {
+            } else if let Some((video, frame)) = media.as_ref().filter(|frame| frame.frame_type == VIDEO)
+                .and_then(|video| unpack(video).map(|frame| (video, frame)))
+            {
                 if last_frame.is_none() { *shared.status.lock().unwrap() = "Receiving OMT video".into(); }
-                last_frame = Some(Instant::now());
-                *shared.size.lock().unwrap() = (frame.w, frame.h);
-                *shared.frame.lock().unwrap() = Some(frame);
-                shared.seq.fetch_add(1, Relaxed);
+                last_frame = Some(now);
+                let stamp = if thumbnail { now } else {
+                    clock.stamp(video.timestamp, now).unwrap_or(now)
+                };
+                clock.queue_video(frame, stamp);
+                clock.present(shared, now);
                 if thumbnail { break; }
             } else if last_frame.is_some_and(|t: Instant| t.elapsed() >= Duration::from_secs(3)) {
                 last_frame = None;
                 *shared.status.lock().unwrap() = "Waiting for OMT signal…".into();
             }
+            clock.present(shared, now);
         }
         (api.recv_destroy)(receiver);
     }
@@ -261,7 +268,6 @@ fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<(NetworkFrame,
         *status.lock().unwrap() = ("Waiting for OMT receivers…".into(), false);
         let start = Instant::now();
         let mut last_check = start - Duration::from_millis(250);
-        let mut slot = 0;
         while !stop.load(Relaxed) {
             if last_check.elapsed() >= Duration::from_millis(250) {
                 last_check = Instant::now();
@@ -290,7 +296,8 @@ fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<(NetworkFrame,
             video.data_length = frame.pixels.len() as i32;
             (api.send)(sender, &mut video);
             if !packet.is_empty() {
-                let count = packet.len().min(crate::audio::frames_for_slot(slot, n, d));
+                // The mixer windows are contiguous, so each packet is sent whole.
+                let count = packet.len();
                 let planar = crate::audio::planar(&packet[..count], 1.0 / 32768.0);
                 let mut audio: MediaFrame = std::mem::zeroed();
                 audio.frame_type = AUDIO;
@@ -303,7 +310,6 @@ fn send(name: &str, fps: f64, quality: u8, frames: mpsc::Receiver<(NetworkFrame,
                 audio.data_length = (planar.len() * 4) as i32;
                 (api.send)(sender, &mut audio);
             }
-            slot += 1;
         }
         subscribed.store(false, Relaxed);
         (api.send_destroy)(sender);

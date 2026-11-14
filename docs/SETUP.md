@@ -33,7 +33,7 @@ Successful macOS CI runs offer `LiveMix-macOS-arm64.zip` in their artifacts. It 
 | FFmpeg hardware streaming | Use a build with the encoder you need and a compatible driver. Windows tries NVENC, AMF and Quick Sync where available. Mac can use VideoToolbox. LiveMix checks whether the encoder can actually initialize. |
 | NDI | Install the platform's native NDI runtime. Windows also checks `NDI_RUNTIME_DIR_V6` and `NDI_RUNTIME_DIR_V5`. Mac can use `LIVEMIX_NDI_DIR` for the directory containing `libndi.dylib`. |
 | OMT | Supply matching native `libomt.dll` and `libvmx.dll` on Windows, or `libomt.dylib` and `libvmx.dylib` on macOS. Place both beside the executable or set `LIVEMIX_OMT_DIR` to their directory. [OMT releases](https://github.com/openmediatransport/libomtnet/releases) |
-| DeckLink | Install Blackmagic Desktop Video. Windows uses its installed interfaces. On Mac, set `LIVEMIX_DECKLINK_FFMPEG` to an FFmpeg build compiled with DeckLink support and configure the playback connector in Desktop Video Setup. [FFmpeg DeckLink devices](https://ffmpeg.org/ffmpeg-devices.html#decklink) |
+| DeckLink | Install Blackmagic Desktop Video. Windows uses its installed interfaces. On Mac, set `LIVEMIX_DECKLINK_FFMPEG` to a DeckLink-enabled FFmpeg build for discovery, modes and ordinary capture/playback. Graphics Only uses the installed DeckLink framework directly for playback. Configure connectors in Desktop Video Setup. [Blackmagic keying documentation](https://sdk-doc.blackmagicdesign.com/decklink-sdk/HighLevel/keying.html) |
 | PTZ | A VISCA-over-IP camera reachable by UDP, normally on port 52381. |
 
 
@@ -51,6 +51,10 @@ LIVEMIX_DECKLINK_FFMPEG=/path/to/decklink-ffmpeg /Applications/LiveMix.app/Conte
 ## Hybrid GPUs on Windows
 
 Set the executable's graphics preference in Windows if you want OpenGL on the dedicated GPU. In **Settings → Performance**, choose **Automatic** to let LiveMix match the OpenGL renderer to a DXGI adapter when it can identify it. An explicit D3D11 choice applies on restart. The GPU texture path requires matching adapters and driver support for OpenGL/D3D11 interoperability. Check **D3D11 input** in recording diagnostics and compare the Program readback counter before and during a recording. See the [roadmap](ROADMAP.md) for the tested scope.
+
+## Web Browser inputs
+
+Install Chrome or Edge in a standard installation location. On macOS, Chromium in the Applications folder also works. LiveMix opens a separate headless browser profile for its page inputs. You can use Web Browser inputs without signing into the browser.
 
 ## Presentation inputs
 

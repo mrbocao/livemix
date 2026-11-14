@@ -38,6 +38,7 @@ pub(crate) struct Bridge {
     lock: Access,
     unlock: Access,
     effects: Option<(glow::Program, glow::VertexArray)>,
+    luts: Vec<(std::sync::Weak<crate::colour_fx::Lut>, glow::Texture)>,
 }
 
 // The render callback uses the bridge only while its WGL context is current.
@@ -71,7 +72,7 @@ impl Bridge {
         }
         let interop = open(device.as_raw());
         if interop.is_null() { return Err("The selected D3D11 device could not be opened by OpenGL".into()); }
-        Ok(Self { device, interop, close, register, unregister, lock, unlock, effects: None })
+        Ok(Self { device, interop, close, register, unregister, lock, unlock, effects: None, luts: Vec::new() })
     }
 
     pub(crate) unsafe fn copy(&self, gl: &glow::Context, source: glow::Framebuffer, [width, height]: [u32; 2])
@@ -132,7 +133,39 @@ impl Bridge {
             gl.delete_program(shader);
             gl.delete_vertex_array(vao);
         }
+        for (_, texture) in &self.luts { gl.delete_texture(*texture); }
         self.close();
+    }
+
+    unsafe fn lut_texture(&mut self, gl: &glow::Context, lut: &std::sync::Arc<crate::colour_fx::Lut>)
+        -> Result<glow::Texture, String>
+    {
+        let weak = std::sync::Arc::downgrade(lut);
+        self.luts.retain(|(key, texture)| {
+            let alive = key.strong_count() > 0;
+            if !alive { gl.delete_texture(*texture); }
+            alive
+        });
+        if let Some((_, texture)) = self.luts.iter().find(|(key, _)| key.ptr_eq(&weak)) {
+            return Ok(*texture);
+        }
+        let texture = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_3D, Some(texture));
+        for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+            gl.tex_parameter_i32(glow::TEXTURE_3D, parameter, glow::LINEAR as i32);
+        }
+        for parameter in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T, glow::TEXTURE_WRAP_R] {
+            gl.tex_parameter_i32(glow::TEXTURE_3D, parameter, glow::CLAMP_TO_EDGE as i32);
+        }
+        let size = lut.size as i32;
+        gl.tex_image_3d(glow::TEXTURE_3D, 0, glow::RGB32F as i32, size, size, size, 0, glow::RGB,
+            glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&lut.cells))));
+        if gl.get_error() != glow::NO_ERROR {
+            gl.delete_texture(texture);
+            return Err("OpenGL could not upload the 3D LUT".into());
+        }
+        self.luts.push((weak, texture));
+        Ok(texture)
     }
 
     pub(crate) unsafe fn import(&mut self, gl: &glow::Context, picture: &Picture, target: glow::Texture,
@@ -154,6 +187,12 @@ impl Bridge {
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
         let previous_active = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
+        gl.active_texture(glow::TEXTURE1);
+        let previous_lut = gl.get_parameter_texture(glow::TEXTURE_BINDING_3D);
+        let lut = effects.extra.lut.as_ref().map(|lut| self.lut_texture(gl, lut)).transpose();
+        gl.bind_texture(glow::TEXTURE_3D, previous_lut);
+        gl.active_texture(previous_active as u32);
+        let lut = lut?;
         let previous_program = gl.get_parameter_program(glow::CURRENT_PROGRAM);
         let previous_vao = gl.get_parameter_vertex_array(glow::VERTEX_ARRAY_BINDING);
         let mut viewport = [0; 4];
@@ -193,8 +232,12 @@ impl Bridge {
                     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
                     gl.uniform_1_i32(gl.get_uniform_location(shader, "picture").as_ref(), 0);
+                    gl.active_texture(glow::TEXTURE1);
+                    gl.bind_texture(glow::TEXTURE_3D, lut);
                     effects.bind(gl, shader);
                     gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                    gl.bind_texture(glow::TEXTURE_3D, previous_lut);
+                    gl.active_texture(glow::TEXTURE0);
                     copied = gl.get_error() == glow::NO_ERROR;
                 }
                 gl.bind_texture(glow::TEXTURE_2D, None);
@@ -222,11 +265,21 @@ impl Bridge {
 pub(crate) struct Effects {
     pub key: u64,
     pub colour: crate::model::ColourAdjust,
+    pub extra: crate::colour_fx::Effects,
 }
 
 impl Effects {
     unsafe fn bind(&self, gl: &glow::Context, program: glow::Program) {
         let uniform = |name| gl.get_uniform_location(program, name);
+        let key = self.extra.luma;
+        gl.uniform_4_f32(uniform("luma_key").as_ref(), f32::from(key.threshold), f32::from(key.softness),
+            if key.invert { -1.0 } else { 1.0 }, f32::from(key.enabled));
+        gl.uniform_1_i32(uniform("lut").as_ref(), 1);
+        gl.uniform_1_f32(uniform("lut_size").as_ref(), self.extra.lut.as_ref().map_or(0.0, |lut| lut.size as f32));
+        if let Some(lut) = &self.extra.lut {
+            gl.uniform_3_f32_slice(uniform("lut_min").as_ref(), &lut.min);
+            gl.uniform_3_f32_slice(uniform("lut_max").as_ref(), &lut.max);
+        }
         let c = self.colour;
         let normal = |value: f32| value.clamp(-1.0, 1.0);
         gl.uniform_4_f32(uniform("chroma_key").as_ref(), (self.key >> 16) as u8 as f32,
@@ -244,6 +297,11 @@ const INPUT_EFFECTS: &str = r#"
 #version 330 core
 uniform sampler2D picture;
 uniform vec4 chroma_key;
+uniform vec4 luma_key;
+uniform sampler3D lut;
+uniform float lut_size;
+uniform vec3 lut_min;
+uniform vec3 lut_max;
 uniform vec4 adjust;
 uniform vec3 gain;
 uniform vec2 levels;
@@ -256,10 +314,20 @@ void main() {
         alpha = floor(alpha * 255.0) / 255.0;
     }
     float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (luma_key.w > 0.0) {
+        float distance_to_key = (luma * 255.0 - luma_key.x) * luma_key.z;
+        float matte = luma_key.y == 0.0 ? step(0.0, distance_to_key) : clamp(distance_to_key / luma_key.y, 0.0, 1.0);
+        alpha = floor(alpha * matte * 255.0 + 0.5) / 255.0;
+    }
     rgb = vec3(luma) + (rgb - luma) * adjust.z;
     rgb = (rgb - 0.5) * adjust.y + 0.5 + adjust.x;
     rgb = clamp((rgb * gain - levels.x) / levels.y, 0.0, 1.0);
     rgb = floor(rgb * 255.0 + 0.5) / 255.0;
+    if (lut_size > 0.0) {
+        vec3 p = clamp((rgb - lut_min) / (lut_max - lut_min), 0.0, 1.0);
+        rgb = texture(lut, (0.5 + p * (lut_size - 1.0)) / lut_size).rgb;
+        rgb = floor(clamp(rgb, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+    }
     alpha = floor(clamp(alpha * adjust.w, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
     vec3 linear = mix(pow((rgb + 0.055) / 1.055, vec3(2.4)), rgb / 12.92,
                       lessThanEqual(rgb, vec3(0.04045))) * alpha;

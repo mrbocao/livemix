@@ -223,17 +223,19 @@ fn receive(shared: &Shared, name: &str, thumbnail: bool) -> Result<(), String> {
         let mut last_frame = Instant::now();
         let mut receiving = false;
         let mut audio_phase = 0;
+        let mut clock = crate::audio::NetworkClock::default();
         *shared.status.lock().unwrap() = "Waiting for NDI video…".into();
         while !shared.stop.load(Relaxed) {
             let mut video: Video = std::mem::zeroed();
             let mut audio: Audio = std::mem::zeroed();
-            let kind = (api.recv_capture)(recv, &mut video, &mut audio, null_mut(), 100);
+            let kind = (api.recv_capture)(recv, &mut video, &mut audio, null_mut(), 5);
+            let now = Instant::now();
             if kind == 1 {
                 if let Some(frame) = unpack(&video) {
-                    *shared.size.lock().unwrap() = (frame.w, frame.h);
-                    *shared.frame.lock().unwrap() = Some(frame);
-                    shared.seq.fetch_add(1, Relaxed);
-                    last_frame = Instant::now();
+                    let stamp = if thumbnail { now } else { clock.stamp(video.timestamp, now).unwrap_or(now) };
+                    clock.queue_video(frame, stamp);
+                    clock.present(shared, now);
+                    last_frame = now;
                     if !receiving {
                         *shared.status.lock().unwrap() = "Receiving NDI video".into();
                         receiving = true;
@@ -244,10 +246,12 @@ fn receive(shared: &Shared, name: &str, thumbnail: bool) -> Result<(), String> {
             } else if kind == 2 {
                 if !thumbnail && audio.fourcc == FLTP {
                     crate::audio::capture_planar(shared, audio.data, audio.samples as usize, audio.stride as usize,
-                        audio.channels as usize, audio.rate as usize, NDI_PCM_SCALE, &mut audio_phase);
+                        audio.channels as usize, audio.rate as usize, NDI_PCM_SCALE, &mut audio_phase,
+                        clock.stamp(audio.timestamp, now));
                 }
                 (api.recv_free_audio)(recv, &audio);
             }
+            clock.present(shared, now);
             if receiving && last_frame.elapsed() >= Duration::from_secs(3) {
                 *shared.status.lock().unwrap() = "Waiting for NDI signal…".into();
                 receiving = false;
@@ -333,7 +337,6 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool, crate:
         *status.lock().unwrap() = ("Waiting for NDI receivers…".into(), false);
         let mut last_check = Instant::now() - Duration::from_millis(250);
         let mut outstanding = None;
-        let mut slot = 0;
         while !stop.load(Relaxed) {
             if last_check.elapsed() >= Duration::from_millis(250) {
                 last_check = Instant::now();
@@ -362,7 +365,8 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool, crate:
             };
             (api.send_video)(sender, &video);
             if !packet.is_empty() {
-                let count = packet.len().min(crate::audio::frames_for_slot(slot, rate_n, rate_d));
+                // The mixer windows are contiguous, so each packet is sent whole.
+                let count = packet.len();
                 let planar = crate::audio::planar(&packet[..count], 1.0 / NDI_PCM_SCALE);
                 (api.send_audio)(sender, &Audio {
                     rate: crate::audio::RATE as i32, channels: 2, samples: count as i32,
@@ -370,7 +374,6 @@ fn send(name: &str, fps: f64, frames: mpsc::Receiver<(NetworkFrame, bool, crate:
                     stride: (count * 4) as i32, metadata: null(), timestamp: 0,
                 });
             }
-            slot += 1;
             // NDI may read the previous frame until this submission returns.
             drop(outstanding.replace(frame));
         }

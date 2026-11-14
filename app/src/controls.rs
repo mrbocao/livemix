@@ -272,9 +272,16 @@ impl Controls {
             }
             if ui.button(tr(ui, "Default Keyboard")).clicked() { s.cfg.shortcuts = model::default_shortcuts(); self.learn = None; }
             if ui.button(tr(ui, "Import template XML")).clicked() { self.import = Some(String::new()); self.learn = None; }
+            if ui.button("Add Teleprompter keys").on_hover_text("Space play/pause, arrows scroll and change speed, Home to the top; keys already in use are skipped")
+                .clicked()
+            {
+                let added = model::add_teleprompter_shortcuts(&mut s.cfg.shortcuts);
+                self.status = format!("Added {added} Teleprompter shortcut(s)");
+                self.learn = None;
+            }
         });
         if let Some(xml) = &mut self.import {
-            ui.add(egui::TextEdit::multiline(xml).desired_rows(3).hint_text(tr(ui, "Paste a vMix shortcut template")));
+            ui.add(egui::TextEdit::multiline(xml).desired_rows(3).hint_text(tr(ui, "Paste a shortcut template XML")));
             if ui.button(tr(ui, "Import")).clicked() {
                 match import_xml(xml, s) {
                     Ok((rows, skipped)) => {
@@ -291,7 +298,7 @@ impl Controls {
             ui.label(crate::shortcut_ops::EXAMPLES);
             ui.label(tr(ui, "For MIDI CC, use {value} for 0–100 or {delta} for a relative encoder."));
         });
-        ui.collapsing(tr(ui, "vMix function reference"), |ui| {
+        ui.collapsing(tr(ui, "Shortcut function reference"), |ui| {
             ui.label(tr(ui, "Reference names include functions that LiveMix does not execute yet."));
             ui.add(egui::TextEdit::singleline(&mut self.function_filter).hint_text(tr(ui, "Search functions")));
             let query = self.function_filter.trim().to_ascii_lowercase();

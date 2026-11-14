@@ -7,59 +7,131 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-fn ffprobe() -> Command {
-    crate::audio::ffprobe_command()
+#[cfg(windows)]
+const GPU_DECODER: (&str, &str, &str) = ("d3d11va", "d3d11", "D3D11VA");
+#[cfg(target_os = "macos")]
+const GPU_DECODER: (&str, &str, &str) = ("videotoolbox", "videotoolbox_vld", "VideoToolbox");
+
+#[derive(Clone, Copy)]
+struct VideoMetadata {
+    fps: f64,
+    duration_ms: u64,
+    download: Option<&'static str>,
 }
 
-fn video_metadata(path: &str) -> (f64, u64) {
-    let data = ffprobe().args(["-v", "error", "-select_streams", "v:0", "-show_entries",
-        "stream=avg_frame_rate:format=duration", "-of", "json", path]).output().ok()
-        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
-    let Some(data) = data else { return (30.0, 0) };
-    let rate = data["streams"][0]["avg_frame_rate"].as_str().and_then(|s| {
+fn video_metadata(path: &str) -> Option<VideoMetadata> {
+    let mut probe = crate::audio::ffprobe_command().args(["-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,width,height,pix_fmt,avg_frame_rate:format=duration",
+        "-of", "json", "-i", path])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match probe.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(15)),
+            _ => { let _ = probe.kill(); let _ = probe.wait(); return None; }
+        }
+    }
+    let output = probe.wait_with_output().ok()?;
+    parse_video_metadata(&output.stdout)
+}
+
+fn parse_video_metadata(bytes: &[u8]) -> Option<VideoMetadata> {
+    let data: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let stream = &data["streams"][0];
+    let fps = stream["avg_frame_rate"].as_str().and_then(|s| {
         let (n, d) = s.split_once('/')?;
         let fps = n.parse::<f64>().ok()? / d.parse::<f64>().ok()?;
-        (fps.is_finite() && fps > 0.0).then_some(fps)
+        (fps.is_finite() && (1.0..=240.0).contains(&fps)).then_some(fps)
     }).unwrap_or(30.0);
-    let duration = data["format"]["duration"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    (rate, (duration * 1000.0) as u64)
+    let duration_ms = (data["format"]["duration"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * 1000.0) as u64;
+    let pixels = stream["width"].as_u64().unwrap_or(0).saturating_mul(stream["height"].as_u64().unwrap_or(0));
+    let heavy = pixels > 1920 * 1080 || pixels as f64 * fps > f64::from(1920 * 1080 * 60);
+    let supported = matches!(stream["codec_name"].as_str(), Some("h264" | "hevc" | "av1" | "vp9" | "mpeg2video" | "vc1"));
+    let download = if heavy && supported {
+        match stream["pix_fmt"].as_str() {
+            Some("yuv420p" | "yuvj420p" | "nv12") => Some("nv12"),
+            Some("yuv420p10le" | "p010le") => Some("p010le"),
+            _ => None,
+        }
+    } else { None };
+    Some(VideoMetadata { fps, duration_ms, download })
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn play(shared: &Shared, path: &str, deinterlace: u8) {
-    play_with_reason(shared, path, deinterlace, None);
+    play_configured(shared, path, deinterlace, false, None);
 }
 
-pub(crate) fn play_with_reason(shared: &Shared, path: &str, deinterlace: u8, fallback: Option<&str>) {
-    let (fps, duration) = video_metadata(path);
-    shared.dur_ms.store(duration, Relaxed);
+pub(crate) fn play_configured(shared: &Shared, path: &str, deinterlace: u8, hardware: bool, fallback: Option<&str>) {
+    let (meta_tx, meta_rx) = std::sync::mpsc::sync_channel(1);
+    let probe_path = path.to_owned();
+    std::thread::spawn(move || { let _ = meta_tx.send(video_metadata(&probe_path)); });
+    let (hwaccel, hw_format, hw_name) = GPU_DECODER;
+    let mut metadata = None;
+    let mut gpu_failed = false;
     let mut position = 0;
     while !shared.stop.load(Relaxed) {
+        if let Ok(Some(info)) = meta_rx.try_recv() {
+            shared.dur_ms.store(info.duration_ms, Relaxed);
+            metadata = Some(info);
+        }
+        let gpu = metadata.and_then(|info| info.download).filter(|_| hardware && !gpu_failed);
         crate::audio::reset_position(shared);
         let mut cmd = crate::stream::command();
-        cmd.args(["-re", "-ss", &format!("{:.3}", position as f64 / 1000.0), "-i", path]);
-        if deinterlace != 0 {
-            cmd.args(["-vf", if deinterlace == 1 { "bwdif=mode=send_frame:deint=interlaced" } else { "yadif=mode=send_frame:deint=interlaced" }]);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        if gpu.is_some() {
+            cmd.args(["-xerror", "-hwaccel", hwaccel, "-hwaccel_output_format", hw_format]);
         }
-        let mut count = 0_u64;
-        let read = read_video(shared, cmd, |frame| {
-            while count > 0 && shared.paused.load(Relaxed)
-                && !shared.stop.load(Relaxed) && !shared.restart.load(Relaxed) && shared.seek_ms.load(Relaxed) == 0
-            {
+        cmd.args(["-re", "-ss", &format!("{:.3}", position as f64 / 1000.0), "-i", path]);
+        let mut filters = Vec::new();
+        if let Some(format) = gpu {
+            filters.push("hwdownload");
+            filters.push(if format == "p010le" { "format=p010le" } else { "format=nv12" });
+        }
+        match deinterlace {
+            1 => filters.push("bwdif=mode=send_frame:deint=interlaced"),
+            2 => filters.push("yadif=mode=send_frame:deint=interlaced"),
+            _ => {}
+        }
+        if !filters.is_empty() { cmd.args(["-vf", &filters.join(",")]); }
+        let mut count = 0;
+        let mut next_position = position as f64;
+        let mut upgrade = false;
+        let report = read_video_attempt(shared, cmd, gpu.is_some(), |frame| {
+            loop {
+                if let Ok(Some(info)) = meta_rx.try_recv() {
+                    shared.dur_ms.store(info.duration_ms, Relaxed);
+                    metadata = Some(info);
+                }
+                if shared.stop.load(Relaxed) || shared.restart.load(Relaxed) || shared.seek_ms.load(Relaxed) != 0 {
+                    return false;
+                }
+                if count > 0 && gpu.is_none() && hardware && !gpu_failed
+                    && metadata.is_some_and(|info| info.download.is_some())
+                {
+                    upgrade = true;
+                    return false;
+                }
+                if count == 0 || !shared.paused.load(Relaxed) { break; }
                 std::thread::sleep(Duration::from_millis(15));
-            }
-            if shared.stop.load(Relaxed) || shared.restart.load(Relaxed) || shared.seek_ms.load(Relaxed) != 0 {
-                return false;
             }
             if count == 0 {
                 let method = match deinterlace { 1 => " · BWDIF", 2 => " · YADIF", _ => "" };
-                let mut decoder = format!("FFmpeg · software{method}");
+                let mut decoder = if gpu.is_some() {
+                    format!("FFmpeg · {hw_name} · system-memory output{method}")
+                } else {
+                    format!("FFmpeg · software{method}")
+                };
+                if gpu_failed { decoder.push_str(&format!(" · {hw_name} fallback")); }
                 if let Some(reason) = fallback { decoder.push_str(&format!(" · fallback: {reason}")); }
                 *shared.decoder.lock().unwrap() = decoder;
             }
-            publish(shared, frame);
-            let ms = position + (count as f64 * 1000.0 / fps) as u64;
+            let ms = next_position as u64;
             shared.pos_ms.store(ms, Relaxed);
-            crate::audio::mark_position(shared, ms);
+            crate::audio::mark_position(shared, next_position);
+            publish(shared, frame);
+            next_position += 1000.0 / metadata.map_or(30.0, |info| info.fps);
             count += 1;
             true
         });
@@ -71,7 +143,19 @@ pub(crate) fn play_with_reason(shared: &Shared, path: &str, deinterlace: u8, fal
             position = seek.saturating_sub(1);
             continue;
         }
-        if !read {
+        let resume = || if shared.paused.load(Relaxed) { shared.pos_ms.load(Relaxed) } else { next_position as u64 };
+        if upgrade {
+            position = resume();
+            continue;
+        }
+        let duration = shared.dur_ms.load(Relaxed);
+        let near_end = count > 0 && duration > 0 && next_position as u64 + 120 >= duration;
+        if gpu.is_some() && (count == 0 || (!report.completed && !near_end)) {
+            gpu_failed = true;
+            position = if count > 0 { resume() } else { position };
+            continue;
+        }
+        if count == 0 || (!report.completed && !near_end) {
             let reason = fallback.map_or_else(String::new, |reason| format!("{reason}. "));
             shared.set_status(format!("{reason}FFmpeg could not decode this video. Check the file and FFmpeg installation."));
             break;
@@ -90,40 +174,67 @@ pub(crate) fn play_with_reason(shared: &Shared, path: &str, deinterlace: u8, fal
     }
 }
 
-pub(crate) fn read_video(shared: &Shared, mut cmd: Command, mut consume: impl FnMut(Frame) -> bool) -> bool {
+struct ReadResult {
+    completed: bool,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn read_video(shared: &Shared, cmd: Command) -> bool {
+    let mut shown = false;
+    read_video_attempt(shared, cmd, false, |frame| {
+        publish(shared, frame);
+        shown = true;
+        true
+    });
+    shown
+}
+
+fn read_video_attempt(shared: &Shared, mut cmd: Command, watchdog: bool, mut consume: impl FnMut(Frame) -> bool) -> ReadResult {
+    use std::sync::atomic::AtomicU64;
     let is_file = cmd.get_args().any(|arg| arg == "-re");
     let Ok(mut child) = cmd.args(["-map", "0:v:0", "-an", "-threads", "1", "-c:v", "bmp", "-pix_fmt", "bgra",
         "-f", "image2pipe", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-        else { return false };
+        else { return ReadResult { completed: false }; };
     let mut pipe = BufReader::new(child.stdout.take().unwrap());
-    let child = Mutex::new(child);
+    let epoch = std::time::Instant::now();
+    let activity = AtomicU64::new(0);
+    let interrupted = AtomicBool::new(false);
     let done = AtomicBool::new(false);
-    let mut read = false;
+    let completed = AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            while !done.load(Relaxed) && !shared.stop.load(Relaxed)
-                && !(is_file && (shared.restart.load(Relaxed) || shared.seek_ms.load(Relaxed) != 0)) {
-                std::thread::sleep(Duration::from_millis(30));
+            loop {
+                if let Ok(Some(status)) = child.try_wait() {
+                    completed.store(status.success(), Relaxed);
+                    return;
+                }
+                let now = epoch.elapsed().as_millis() as u64;
+                let last = activity.load(Relaxed);
+                let transport_changed = is_file && (shared.restart.load(Relaxed) || shared.seek_ms.load(Relaxed) != 0);
+                let stalled = watchdog && (last == 0 || !shared.paused.load(Relaxed)) && now.saturating_sub(last) >= 5_000;
+                let eof_stall = done.load(Relaxed) && now.saturating_sub(last) >= 500;
+                if shared.stop.load(Relaxed) || interrupted.load(Relaxed) || transport_changed || stalled || eof_stall {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(15));
             }
-            let mut child = child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
         });
         while !shared.stop.load(Relaxed) {
             let Some(frame) = crate::srt::read_frame(&mut pipe) else { break };
-            if !read { shared.set_status(""); }
-            if is_file {
-                if !consume(frame) { break; }
-            } else {
-                publish(shared, frame);
+            if activity.load(Relaxed) == 0 { shared.set_status(""); }
+            activity.store(1 + epoch.elapsed().as_millis() as u64, Relaxed);
+            if !consume(frame) {
+                interrupted.store(true, Relaxed);
+                break;
             }
-            read = true;
         }
+        activity.store(1 + epoch.elapsed().as_millis() as u64, Relaxed);
         done.store(true, Relaxed);
     });
-    read
+    ReadResult { completed: completed.load(Relaxed) }
 }
-
 pub(crate) fn publish(shared: &Shared, mut frame: Frame) {
     let key = shared.key.load(Relaxed);
     if key != 0 {
@@ -143,19 +254,24 @@ pub(crate) fn publish(shared: &Shared, mut frame: Frame) {
 
 pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecOpts, index: Option<&crate::media_common::ReplayIndex>) -> Result<(), String> {
     let Ok(first) = rx.recv() else { return Ok(()) };
-    let profile = opts.format.ffmpeg_profile(opts.hw);
-    let encoder = profile.video;
+    let profile = opts.format.ffmpeg_profile();
     let (n, d) = rate_fraction(opts.fps);
     let size = opts.size.unwrap_or((first.w as u32, first.h as u32));
+    let bitrate = format!("{}M", opts.mbps.clamp(1, 100));
+    let hardware_requested = opts.hw && matches!(profile.video, "libx264" | "libx265");
+    let encoder = if hardware_requested {
+        crate::stream::hardware_encoder(profile.video == "libx265", [size.0, size.1], (n, d),
+            &["-b:v", &bitrate], || false).unwrap_or(profile.video)
+    } else { profile.video };
     let mut cmd = crate::stream::command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "matroska", "-i", "pipe:0",
         "-map", "0:v:0", "-vf", &format!("scale={}:{}", size.0, size.1), "-pix_fmt", profile.pixel, "-c:v", encoder]);
-    if profile.bitrate { cmd.args(["-b:v", &format!("{}M", opts.mbps.clamp(1, 100))]); }
+    if profile.bitrate { cmd.args(["-b:v", &bitrate]); }
     if opts.audio {
         cmd.args(["-map", "0:a:0", "-c:a", profile.audio]);
         if !profile.audio.starts_with("pcm") { cmd.args(["-b:a", "192k"]); }
     } else { cmd.arg("-an"); }
-    if encoder.ends_with("_videotoolbox") { cmd.args(["-allow_sw", "1"]); }
+    crate::stream::hardware_only(&mut cmd, encoder);
     cmd.args(profile.extra);
     let mut child = cmd.args(["-f", profile.container]).arg(path)
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
@@ -165,7 +281,9 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
         BufReader::new(stderr).lines().map_while(Result::ok)
             .filter(|line| !line.trim().is_empty()).last().unwrap_or_default()
     });
-    *status.lock().unwrap() = format!("FFmpeg · {encoder}");
+    *status.lock().unwrap() = if hardware_requested && encoder == profile.video {
+        format!("FFmpeg · {encoder} · hardware unavailable for this format")
+    } else { format!("FFmpeg · {encoder}") };
     let write_result = (|| {
         let start = first.timeline_origin.unwrap_or(first.captured_at);
         let dimensions = (first.w, first.h, first.bgra);
@@ -177,6 +295,8 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
             if (frame.w, frame.h, frame.bgra) != dimensions { continue; }
             let slot = (frame.captured_at.saturating_duration_since(start).as_secs_f64()
                 * f64::from(n) / f64::from(d)).round() as u64;
+            // A late frame's audio also covers the repeated pictures written before it.
+            pipe.queue_audio(&frame.audio);
             if slot < next { continue; }
             let mut pixels = frame.pixels;
             if !frame.bgra {
@@ -189,7 +309,7 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
                     written += 1;
                 }
             }
-            pipe.frame(&pixels, &frame.audio)?;
+            pipe.frame(&pixels, &[])?;
             if let Some(index) = index {
                 index.lock().unwrap().push((frame.captured_at, written * 1000 * u64::from(d) / u64::from(n)));
             }
@@ -251,7 +371,7 @@ fn recording_profiles_mux_video_and_stereo_audio() {
         #[cfg(not(windows))]
         record(path.to_str().unwrap(), rx, &Mutex::new(String::new()), opts)
             .unwrap_or_else(|error| panic!("{format:?}: {error}"));
-        let probe = ffprobe().args(["-v", "error", "-show_entries", "stream=codec_type",
+        let probe = crate::audio::ffprobe_command().args(["-v", "error", "-show_entries", "stream=codec_type",
             "-of", "csv=p=0"]).arg(&path).output().unwrap();
         assert!(probe.status.success(), "{format:?}: {:?}", probe.stderr);
         let types = String::from_utf8(probe.stdout).unwrap();
@@ -260,7 +380,7 @@ fn recording_profiles_mux_video_and_stereo_audio() {
         if with_audio { crate::audio::assert_audio_file(&path); }
         if format == RecordFormat::H264 {
             let source = crate::media::start_with_pause(
-                crate::media::Source::FfmpegFile(path.to_str().unwrap().to_owned(), 1), true);
+                crate::media::Source::FfmpegFile(path.to_str().unwrap().to_owned(), 1, false), true);
             let deadline = Instant::now() + Duration::from_secs(5);
             while source.seq.load(Relaxed) == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -285,4 +405,53 @@ fn recording_profiles_mux_video_and_stereo_audio() {
         write(format, true);
     }
     write(RecordFormat::H264Mkv, false);
+}
+
+
+#[test]
+fn high_resolution_decode_requires_a_supported_codec_and_pixel_format() {
+    for (codec, width, height, pixel, expected) in [
+        ("h264", 1920, 1080, "yuv420p", None),
+        ("hevc", 3840, 2160, "yuv420p10le", Some("p010le")),
+        ("h264", 2560, 1440, "yuv420p", Some("nv12")),
+        ("h264", 2560, 1440, "yuv444p", None),
+        ("prores", 3840, 2160, "yuv420p", None),
+    ] {
+        let probe = serde_json::json!({ "streams": [{
+            "codec_name": codec, "width": width, "height": height, "pix_fmt": pixel,
+            "avg_frame_rate": "60000/1001"
+        }], "format": { "duration": "2.000" } });
+        let info = parse_video_metadata(probe.to_string().as_bytes()).unwrap();
+        assert_eq!(info.download, expected);
+        assert_eq!(info.duration_ms, 2000);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires FFmpeg, FFprobe and a D3D11VA decoder"]
+fn high_resolution_ffmpeg_plays_and_seeks_with_d3d11va() {
+    let path = std::env::temp_dir().join(format!("livemix-d3d11va-{}.mp4", std::process::id()));
+    let created = crate::stream::command().args(["-y", "-v", "error", "-f", "lavfi", "-i",
+        "color=blue:size=2560x1440:rate=25", "-t", "3", "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p"]).arg(&path).output().unwrap();
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let shared = crate::media::start_for_gl(crate::media::Source::FfmpegFile(path.to_string_lossy().into_owned(), 0, true), true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline && !shared.decoder.lock().unwrap().starts_with("FFmpeg · D3D11VA") {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let decoder = shared.decoder.lock().unwrap().clone();
+    if decoder.starts_with("FFmpeg · D3D11VA") {
+        shared.seek_ms.store(1001, Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while shared.pos_ms.load(Relaxed) != 1000 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+    shared.stop.store(true, Relaxed);
+    std::thread::sleep(Duration::from_millis(150));
+    let _ = std::fs::remove_file(path);
+    assert!(decoder.starts_with("FFmpeg · D3D11VA"), "{decoder} / {}", shared.status.lock().unwrap());
+    assert_eq!(shared.pos_ms.load(Relaxed), 1000);
 }

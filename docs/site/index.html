@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LiveMix: open-source live video switcher and streaming studio</title>
+<meta name="description" content="LiveMix is a free, open-source live video production switcher written in Rust for Windows and Apple Silicon. Switch cameras, clips and network video, mix stereo audio, record, stream, run instant replay and a teleprompter.">
+<meta name="keywords" content="live video switcher, video mixer, live streaming software, production switcher, instant replay, teleprompter, NDI, SRT, RTMP, DeckLink, open source, Rust">
+<link rel="canonical" href="https://mrbocao.github.io/livemix/">
+<link rel="icon" type="image/png" href="icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="LiveMix: open-source live video switcher and streaming studio">
+<meta property="og:description" content="Switch cameras, clips and network video, mix stereo audio, record, stream and run instant replay and a teleprompter. Windows and Apple Silicon.">
+<meta property="og:url" content="https://mrbocao.github.io/livemix/">
+<meta property="og:image" content="https://mrbocao.github.io/livemix/screenshots/switcher.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="LiveMix: open-source live video switcher">
+<meta name="twitter:description" content="Preview and Program switching, stereo audio, recording, streaming, instant replay and a teleprompter.">
+<meta name="twitter:image" content="https://mrbocao.github.io/livemix/screenshots/switcher.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "LiveMix",
+  "applicationCategory": "MultimediaApplication",
+  "operatingSystem": "Windows, macOS (Apple Silicon)",
+  "description": "Open-source live video production switcher with Preview and Program, stereo audio mixing, recording, streaming, instant replay and a teleprompter.",
+  "url": "https://mrbocao.github.io/livemix/",
+  "downloadUrl": "https://github.com/mrbocao/livemix/releases",
+  "codeRepository": "https://github.com/mrbocao/livemix",
+  "programmingLanguage": "Rust",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Which systems does LiveMix run on?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Windows x64 and Apple Silicon Macs. The two platforms have separate media backends." } },
+    { "@type": "Question", "name": "Does LiveMix need special hardware?",
+      "acceptedAnswer": { "@type": "Answer", "text": "No. A webcam or the built-in test sources are enough to try it. DeckLink, NDI and OMT need their own drivers or runtimes." } },
+    { "@type": "Question", "name": "Is LiveMix ready for a live show?",
+      "acceptedAnswer": { "@type": "Answer", "text": "LiveMix is alpha software. Rehearse first and check the roadmap for hardware combinations that still need testing." } }
+  ]
+}
+</script>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #151a21; --dim: #566170; --line: #dfe3e8;
+  --accent: #1f6feb; --accent-text: #ffffff; --program: #1b9e4b; --preview: #d9822b; --shot: #0b0f14;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0f14; --panel: #131a22; --text: #e8edf2; --dim: #9aa6b4; --line: #26303b;
+    --accent: #4c8dff; --accent-text: #08111f; --shot: #000;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); }
+.wrap { width: min(1080px, 100% - 32px); margin: 0 auto; }
+header { border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+header .wrap { display: flex; align-items: center; gap: 24px; min-height: 56px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text); text-decoration: none; }
+.brand img { width: 28px; height: 28px; border-radius: 6px; }
+nav { display: flex; gap: 18px; margin-left: auto; flex-wrap: wrap; font-size: 15px; }
+nav a { color: var(--dim); text-decoration: none; }
+nav a:hover { color: var(--text); }
+.hero { padding: 56px 0 24px; }
+.hero h1 { font-size: clamp(30px, 5vw, 48px); line-height: 1.15; margin: 0 0 16px; max-width: 18ch; }
+.hero p.lead { font-size: 19px; color: var(--dim); max-width: 60ch; margin: 0 0 24px; }
+.tags { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 24px; padding: 0; list-style: none; }
+.tags li { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 2px 12px; font-size: 14px; color: var(--dim); }
+.cta { display: flex; gap: 12px; flex-wrap: wrap; }
+.btn { display: inline-block; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; border: 1px solid var(--line); color: var(--text); background: var(--panel); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.shot { margin: 32px 0 0; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); background: var(--shot); }
+.shot img { display: block; width: 100%; height: auto; }
+.shot figcaption { padding: 8px 14px; font-size: 14px; color: var(--dim); background: var(--panel); border-top: 1px solid var(--line); }
+section { padding: 48px 0 8px; }
+h2 { font-size: 28px; margin: 0 0 8px; }
+.sub { color: var(--dim); margin: 0 0 24px; max-width: 64ch; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 20px; }
+.card h3 { margin: 0 0 6px; font-size: 18px; }
+.card p { margin: 0; color: var(--dim); font-size: 15px; }
+.bar { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; background: var(--program); }
+.card:nth-child(2n) .bar { background: var(--preview); }
+.card:nth-child(3n) .bar { background: var(--accent); }
+.gallery { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.gallery .shot { margin: 0; }
+ul.plain { padding-left: 20px; color: var(--dim); }
+ul.plain li { margin: 4px 0; }
+details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 18px; margin: 10px 0; }
+summary { cursor: pointer; font-weight: 600; }
+details p { color: var(--dim); margin: 8px 0 0; }
+footer { margin-top: 56px; border-top: 1px solid var(--line); padding: 24px 0 40px; color: var(--dim); font-size: 14px; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 560px) { nav { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="icon.png" alt="" width="28" height="28">LiveMix</a>
+    <nav aria-label="Main">
+      <a href="#features">Features</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#docs">Docs</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/mrbocao/livemix">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+<div class="wrap">
+  <div class="hero">
+    <h1>Open-source live video switcher and streaming studio</h1>
+    <p class="lead">Switch cameras, clips, graphics and network video in a Preview and Program workflow. Mix stereo audio, record, stream, replay the last play and read a script on a teleprompter, all from one desktop app written in Rust.</p>
+    <ul class="tags" aria-label="Supported platforms and protocols">
+      <li>Windows x64</li><li>Apple Silicon</li><li>NDI</li><li>OMT</li><li>SRT</li><li>RTMP</li><li>DeckLink</li><li>VISCA</li><li>MIDI</li>
+    </ul>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/mrbocao/livemix/releases">Download a test build</a>
+      <a class="btn" href="https://github.com/mrbocao/livemix">View on GitHub</a>
+      <a class="btn" href="https://github.com/mrbocao/livemix/blob/main/docs/SETUP.md">Setup guide</a>
+    </div>
+    <figure class="shot">
+      <img src="screenshots/switcher.png" alt="LiveMix with Preview and Program monitors, transition buttons and a row of input cards" width="1600" height="900">
+      <figcaption>The switching desk with demo inputs.</figcaption>
+    </figure>
+  </div>
+</div>
+
+<div class="wrap" id="features">
+  <section>
+    <h2>What LiveMix does</h2>
+    <p class="sub">Alpha software for operators who want to run a multi-camera production from a single machine.</p>
+    <div class="grid">
+      <div class="card"><h3><span class="bar"></span>Switch and compose</h3><p>Cut, timed transitions, T-bar, stingers, eight overlay channels, layers, crop, chroma and luma key, 3D LUTs, and waveform, parade and vectorscope scopes.</p></div>
+      <div class="card"><h3><span class="bar"></span>Mix stereo audio</h3><p>48 kHz capture and monitoring, Master, A and B buses, and per-input EQ, gate, compression, gain and delay.</p></div>
+      <div class="card"><h3><span class="bar"></span>Record and distribute</h3><p>Four independently routed outputs to windows, DeckLink, NDI, OMT or SRT. Two recordings plus MultiCorder, and shared encoders for RTMP destinations.</p></div>
+      <div class="card"><h3><span class="bar"></span>Instant Replay</h3><p>Mark events across up to eight camera angles, cue A/B players, build playlists and export clips.</p></div>
+      <div class="card"><h3><span class="bar"></span>Capture hardware</h3><p>Webcams, capture cards, DeckLink, NDI and OMT. Pick the resolution, frame rate and video format the device reports, and attach the card's audio.</p></div>
+      <div class="card"><h3><span class="bar"></span>Teleprompter</h3><p>A scrolling script with a reading line, mirror and flip for a prompter glass, text file import, and keyboard, MIDI and automation control.</p></div>
+      <div class="card"><h3><span class="bar"></span>Studio scenes</h3><p>Web pages and presentations as inputs, and a Virtual Set with backdrop, presenter and foreground layers.</p></div>
+      <div class="card"><h3><span class="bar"></span>Control the show</h3><p>Telestrator, keyboard and MIDI shortcuts, a local web switcher, scripts and VISCA PTZ over UDP.</p></div>
+      <div class="card"><h3><span class="bar"></span>Your language</h3><p>Choose the interface language in Settings. English and Brazilian Portuguese are included, and the catalogs are plain JSON.</p></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap" id="screenshots">
+  <section>
+    <h2>Screenshots</h2>
+    <p class="sub">Windows interface with demo sources.</p>
+    <div class="gallery">
+      <figure class="shot"><img loading="lazy" src="screenshots/video-scopes.png" alt="Waveform and vectorscope shown in Preview" width="1600" height="900"><figcaption>Video scopes</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="screenshots/replay.png" alt="Replay camera monitors with event controls" width="1600" height="900"><figcaption>Instant Replay</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="screenshots/studio.png" alt="Virtual Set in Preview and a presentation in Program" width="1600" height="900"><figcaption>Virtual Set and presentation</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="screenshots/input-layers.png" alt="Input Settings showing layers" width="1600" height="900"><figcaption>Input layers</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="screenshots/network-outputs.png" alt="Network output settings" width="1600" height="900"><figcaption>Network outputs</figcaption></figure>
+    </div>
+  </section>
+</div>
+
+<div class="wrap" id="docs">
+  <section>
+    <h2>Get started</h2>
+    <p class="sub">Download a test build, install FFmpeg for the features that use it, add an input, put it in Preview and press Cut.</p>
+    <div class="grid">
+      <div class="card"><h3><a href="https://github.com/mrbocao/livemix/blob/main/docs/SETUP.md">Setup and dependencies</a></h3><p>Windows and Mac builds, FFmpeg, NDI, OMT, DeckLink, permissions and GPU setup.</p></div>
+      <div class="card"><h3><a href="https://github.com/mrbocao/livemix/blob/main/docs/OPERATOR.md">Operator guide</a></h3><p>Switching, audio, recording, streaming, Replay, Telestrator, Teleprompter and automation.</p></div>
+      <div class="card"><h3><a href="https://github.com/mrbocao/livemix/blob/main/docs/ROADMAP.md">Roadmap</a></h3><p>Open work and the hardware tests that would help most.</p></div>
+      <div class="card"><h3><a href="https://github.com/mrbocao/livemix/blob/main/CHANGELOG.md">Changelog</a></h3><p>What changed and when it applies.</p></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap">
+  <section>
+    <h2>Help test it</h2>
+    <p class="sub">LiveMix needs operators with real hardware as much as it needs developers.</p>
+    <ul class="plain">
+      <li>Run a 30-minute rehearsal and report audio and video drift.</li>
+      <li>Test DeckLink, NDI, OMT or SRT on another machine, with the driver and signal you use.</li>
+      <li>Film a flash with two cameras to check Replay sync.</li>
+      <li>Translate the interface into your language.</li>
+    </ul>
+    <p><a class="btn primary" href="https://github.com/mrbocao/livemix/issues/new/choose">Report a result or a bug</a> <a class="btn" href="https://github.com/mrbocao/livemix/blob/main/CONTRIBUTING.md">Contributing guide</a></p>
+  </section>
+</div>
+
+<div class="wrap" id="faq">
+  <section>
+    <h2>Frequently asked questions</h2>
+    <details><summary>Which systems does LiveMix run on?</summary><p>Windows x64 and Apple Silicon Macs. The two platforms have separate media backends; the setup guide lists what each one supports.</p></details>
+    <details><summary>Does it need special hardware?</summary><p>No. A webcam or the built-in test sources are enough to try it. DeckLink, NDI and OMT need their own drivers or runtimes.</p></details>
+    <details><summary>Can I open presets from other switchers?</summary><p>Partly. The import report lists missing media and unsupported input types.</p></details>
+    <details><summary>Is it ready for a live show?</summary><p>It is alpha software. Rehearse first, and check the roadmap for combinations that still need hardware testing.</p></details>
+  </section>
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>LiveMix is in alpha.</span>
+    <a href="https://github.com/mrbocao/livemix">Source on GitHub</a>
+    <a href="https://github.com/mrbocao/livemix/issues">Issues</a>
+    <a href="https://github.com/mrbocao/livemix/releases">Releases</a>
+  </div>
+</footer>
+</body>
+</html>

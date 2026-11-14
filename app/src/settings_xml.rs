@@ -1,6 +1,8 @@
-//! Interchange for the .NET userSettings section exported by vMix 28.
+//! Interchange for the .NET userSettings interchange for legacy settings files.
 use crate::model::{Settings, FRAME_RATES, OUTPUT_SIZES};
 use eframe::egui::Color32;
+
+const SETTINGS_SECTION: &str = "LiveMix.Settings";
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -64,14 +66,21 @@ fn decoder(value: &str) -> String {
 }
 
 pub fn import(text: &str, current: &Settings) -> Result<Report, String> {
-    let doc = roxmltree::Document::parse(text).map_err(|error| format!("Invalid vMix XML: {error}"))?;
+    let doc = roxmltree::Document::parse(text).map_err(|error| format!("Invalid settings XML: {error}"))?;
     fn child<'a, 'input>(parent: roxmltree::Node<'a, 'input>, name: &str) -> Option<roxmltree::Node<'a, 'input>> {
         parent.children().find(|node| node.has_tag_name(name))
     }
     let root = doc.root_element();
     let section = root.has_tag_name("configuration").then(|| child(root, "userSettings")).flatten()
-        .and_then(|node| child(node, "vMix.My.MySettings"))
-        .ok_or("Expected a vMix settings .config file")?;
+        .and_then(|node| {
+            child(node, SETTINGS_SECTION).or_else(|| {
+                let mut sections = node.children().filter(|section| section.is_element()
+                    && section.children().any(|entry| entry.has_tag_name("setting")));
+                let section = sections.next()?;
+                sections.next().is_none().then_some(section)
+            })
+        })
+        .ok_or("Expected a supported legacy settings .config file")?;
     let mut report = Report { settings: current.clone(), imported: 0, skipped: 0 };
     let mut seen = std::collections::HashSet::new();
     let mut format = (None, None);
@@ -80,8 +89,8 @@ pub fn import(text: &str, current: &Settings) -> Result<Report, String> {
         ($field:ident, $value:expr) => { boolean($value).map(|value| settings.$field = value).is_some() };
     }
     for entry in section.children().filter(|node| node.has_tag_name("setting")) {
-        let name = entry.attribute("name").ok_or("Missing vMix setting name")?;
-        if !seen.insert(name) { return Err(format!("Duplicate vMix setting: {name}")); }
+        let name = entry.attribute("name").ok_or("Missing legacy setting name")?;
+        if !seen.insert(name) { return Err(format!("Duplicate legacy setting: {name}")); }
         let Some(node) = child(entry, "value") else { report.skipped += 1; continue; };
         let value = node.text().unwrap_or_default().trim();
         let array = || child(node, "ArrayOfString").map(|array| array.children()
@@ -138,12 +147,12 @@ pub fn import(text: &str, current: &Settings) -> Result<Report, String> {
             report.skipped += usize::from(seen.contains("FrameRate")) + usize::from(seen.contains("Interlaced"));
         }
     }
-    if report.imported == 0 { return Err("The vMix config contains no supported settings".into()); }
+    if report.imported == 0 { return Err("The settings XML contains no supported settings".into()); }
     Ok(report)
 }
 
 pub fn export(settings: &Settings) -> String {
-    let mut result = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <userSettings>\n    <vMix.My.MySettings>\n");
+    let mut result = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <userSettings>\n    <{SETTINGS_SECTION}>\n");
     let (width, height) = settings.out_dims();
     let rgb = |c: Color32| format!("{}, {}, {}", c.r(), c.g(), c.b());
     let mut scalar = |name: &str, value: &str| write_setting(&mut result, name, "String", &escape(value));
@@ -176,7 +185,7 @@ pub fn export(settings: &Settings) -> String {
         array.push_str("</ArrayOfString>");
         write_setting(&mut result, name, "Xml", &array);
     }
-    result.push_str("    </vMix.My.MySettings>\n  </userSettings>\n</configuration>\n");
+    result.push_str(&format!("    </{SETTINGS_SECTION}>\n  </userSettings>\n</configuration>\n"));
     result
 }
 
@@ -192,9 +201,9 @@ fn write_setting(xml: &mut String, name: &str, kind: &str, value: &str) {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "requires a vMix 28 settings export"]
-    fn reads_a_real_v28_export() {
-        let path = std::env::var_os("LIVEMIX_VMIX_SETTINGS_FIXTURE").expect("Set LIVEMIX_VMIX_SETTINGS_FIXTURE");
+    #[ignore = "requires a legacy XML settings export"]
+    fn reads_a_real_legacy_export() {
+        let path = std::env::var_os("LIVEMIX_LEGACY_SETTINGS_FIXTURE").expect("Set LIVEMIX_LEGACY_SETTINGS_FIXTURE");
         let xml = std::fs::read_to_string(path).unwrap();
         let report = import(xml.trim_start_matches('\u{feff}'), &Settings::default()).unwrap();
         assert!(report.imported >= 12 && report.skipped > 0);
@@ -206,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn v28_settings_round_trip_preserves_current_unmapped_fields() {
+    fn legacy_settings_round_trip_preserves_current_unmapped_fields() {
         let mut original = Settings::default();
         original.out_rate = 6;
         original.interlaced = true;
@@ -224,5 +233,7 @@ mod tests {
         assert_eq!(result.settings.preview_skip, 3);
         assert_eq!(result.settings.directshow.blocked, original.directshow.blocked);
         assert_eq!(result.settings.rec_folder, existing.rec_folder);
+        let older_xml = xml.replace(SETTINGS_SECTION, "Old.Product.Settings");
+        assert_eq!(import(&older_xml, &existing).unwrap().settings.out_rate, original.out_rate);
     }
 }

@@ -36,13 +36,22 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         .collect()
 }
 
+/// The FFmpeg AVFoundation capture does not list a camera's modes up front: the dialog offers Auto only.
+pub fn camera_modes(_link: &str) -> Vec<CamMode> {
+    Vec::new()
+}
+
 pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
     let shared = Arc::new(Shared::default());
     shared.paused.store(paused, Relaxed);
     shared.set_status("Starting…");
-    if let Source::File(path) | Source::FfmpegFile(path, _) = &src {
+    if let Source::File(path) | Source::FfmpegFile(path, _, _) = &src {
         let (source, path) = (shared.clone(), path.clone());
         std::thread::spawn(move || crate::audio::play_file(source, path));
+    }
+    if let Source::Device(_, _, Some(audio)) = &src {
+        let (source, audio) = (shared.clone(), audio.clone());
+        std::thread::spawn(move || crate::audio::capture_device(source, &audio));
     }
     let worker = shared.clone();
     std::thread::spawn(move || match src {
@@ -53,6 +62,7 @@ pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
         Source::AudioDevice(device) => crate::audio::capture_device(worker, &device),
         Source::AudioFile(path) => crate::audio::play_audio_input(worker, path),
         Source::Presentation(path) => crate::slides::run(worker, path),
+        Source::Web(url, transparent) => crate::web_input::run(worker, url, transparent),
         Source::Sequence(folder, fps) => run_pictures(worker, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(worker, folder, false, 0.0, secs),
         Source::Desktop => {
@@ -62,12 +72,12 @@ pub fn start_with_pause(src: Source, paused: bool) -> Arc<Shared> {
                 worker.set_status("No AVFoundation screen found. Check FFmpeg and Screen Recording permissions.");
             }
         }
-        Source::Device(link, mode) => match link.strip_prefix("avfoundation:") {
+        Source::Device(link, mode, _) => match link.strip_prefix("avfoundation:") {
             Some(index) if index.parse::<usize>().is_ok() => capture(&worker, index, mode),
             _ => worker.set_status("Select a camera available on this Mac"),
         },
         Source::File(path) => crate::ffmpeg_media::play(&worker, &path, 0),
-        Source::FfmpegFile(path, deinterlace) => crate::ffmpeg_media::play(&worker, &path, deinterlace),
+        Source::FfmpegFile(path, deinterlace, hardware) => crate::ffmpeg_media::play_configured(&worker, &path, deinterlace, hardware, None),
     });
     shared
 }
@@ -86,7 +96,7 @@ fn capture(shared: &Shared, index: &str, mode: Option<CamMode>) {
     cmd.args(["-i", &format!("{index}:none")]);
     let max_height = AUTO_CAM_MAX_H.load(Relaxed).max(240);
     cmd.args(["-vf", &format!("scale=-2:'min(ih,{max_height})'")]);
-    if !read_video(shared, cmd, |_| true) && !shared.stop.load(Relaxed) {
+    if !read_video(shared, cmd) && !shared.stop.load(Relaxed) {
         shared.set_status("Could not open AVFoundation video. Check the device, FFmpeg and macOS permissions.");
     }
 }
@@ -123,8 +133,8 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
             PickKind::SettingsSave => select_file(SAVE, Some("LiveMix-settings.json")).map(|p| {
                 if p.to_ascii_lowercase().ends_with(".json") || p.to_ascii_lowercase().ends_with(".config") { p } else { format!("{p}.json") }
             }),
-            PickKind::PresetSave => select_file(SAVE, Some("Untitled.vmix")).map(|p| {
-                if p.to_ascii_lowercase().ends_with(".vmix") { p } else { format!("{p}.vmix") }
+            PickKind::PresetSave => select_file(SAVE, Some("Untitled.livemix")).map(|p| {
+                if p.to_ascii_lowercase().ends_with(".livemix") { p } else { format!("{p}.livemix") }
             }),
             PickKind::VideoMany => select_file(
                 "set files to choose file with multiple selections allowed\nset paths to {}\nrepeat with f in files\nset end of paths to POSIX path of f\nend repeat\nset AppleScript's text item delimiters to linefeed\nreturn paths as text", None),

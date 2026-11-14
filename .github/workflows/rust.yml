@@ -52,8 +52,9 @@ jobs:
         cargo test --locked --release ffmpeg_pipe_decodes -- --ignored
     - name: Package LiveMix.app
       run: |
-        mkdir -p dist/LiveMix.app/Contents/MacOS
+        mkdir -p dist/LiveMix.app/Contents/{MacOS,Resources}
         cp packaging/macos/Info.plist dist/LiveMix.app/Contents/Info.plist
+        cp assets/livemix.icns dist/LiveMix.app/Contents/Resources/
         install -m 755 target/release/livemix dist/LiveMix.app/Contents/MacOS/livemix
         plutil -lint dist/LiveMix.app/Contents/Info.plist
         lipo dist/LiveMix.app/Contents/MacOS/livemix -verify_arch arm64

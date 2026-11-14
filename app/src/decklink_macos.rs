@@ -203,6 +203,7 @@ fn stop_child(child: &mut Child) {
 #[derive(Clone, Copy, PartialEq)]
 pub struct OutputConfig {
     pub device: usize,
+    pub key_fill: bool,
     pub port: u32,
     pub mode: u32,
     pub size: (u32, u32),
@@ -263,6 +264,24 @@ fn output(state: &Playback, config: OutputConfig, rx: mpsc::Receiver<OutputFrame
                 && (mode.fields != "progressive") == config.interlaced
         })
     }).ok_or("Select a supported DeckLink output format or match the project format to the device.")?;
+    if config.key_fill {
+        let keyer = crate::decklink_keyer_macos::Keyer::open(&device.name, &device.address, mode.mode, mode.w, mode.h)?;
+        let mut latest: Option<OutputFrame> = None;
+        while !state.stop.load(Relaxed) {
+            if latest.is_none() {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(frame) => latest = Some(frame),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            while let Ok(frame) = rx.try_recv() { latest = Some(frame); }
+            let frame = latest.as_ref().unwrap();
+            keyer.display(&frame.pixels, frame.w, frame.h)?;
+            state.frames.fetch_add(1, Relaxed);
+        }
+        return Ok(());
+    }
     let (n, d) = media::rate_fraction(config.fps);
     let mut cmd = command();
     cmd.args(["-loglevel", "error", "-probesize", "32", "-analyzeduration", "1", "-f", "matroska", "-i", "pipe:0",

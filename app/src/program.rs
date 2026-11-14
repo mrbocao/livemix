@@ -39,9 +39,10 @@ struct Readback {
 
 #[derive(Clone, Default)]
 pub struct Destinations {
+    pub key_fill: bool,
     pub audio: crate::audio::Packet,
     pub recorders: Vec<Arc<crate::media::Recorder>>,
-    pub decklinks: Vec<crate::decklink::OutputSink>,
+    pub decklinks: Vec<(usize, crate::decklink::OutputSink, crate::audio::Packet)>,
     pub streams: Vec<crate::stream::Output>,
     pub ndi: Vec<crate::ndi::Sender>,
     pub omt: Vec<crate::omt::Sender>,
@@ -306,8 +307,8 @@ impl Target {
             }
             let pixels = self.copy_readback(std::slice::from_raw_parts(data, len));
             gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
-            for sink in &frame.destinations.decklinks {
-                sink.submit(Arc::clone(&pixels), w, h, frame.destinations.audio.clone());
+            for (_, sink, audio) in &frame.destinations.decklinks {
+                sink.submit(Arc::clone(&pixels), w, h, audio.clone());
             }
             let network_frame = NetworkFrame { pixels: Arc::clone(&pixels), width: w, height: h };
             for sink in &frame.destinations.streams {
@@ -377,7 +378,7 @@ impl Target {
         }
         gl.viewport(0, 0, width, height);
         gl.disable(glow::SCISSOR_TEST);
-        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        gl.clear_color(0.0, 0.0, 0.0, if destinations.key_fill { 0.0 } else { 1.0 });
         gl.clear(glow::COLOR_BUFFER_BIT);
         gl.enable(glow::SCISSOR_TEST);
         gl.use_program(Some(self.shader));

@@ -13,7 +13,7 @@ Este plano cobre a cópia de trabalho atual. Cada etapa termina com um resultado
 | 4 | Otimizações CPU/GPU guiadas pelas medições | 6–12 dias |
 | 5 | Compatibilidade GT e Web Controller em incrementos | 8–15 dias |
 
-A ordem coloca estabilidade de áudio antes de alterações profundas no pipeline. As medições da etapa 0 guiam a etapa 4. A etapa 2 estabelece o formato de configurações usado pelas preferências de decoder e pelo Web Controller. Estimativa total de **6–11 semanas úteis**. A paridade com todos os recursos do vMix, um backend DirectShow completo e o LiveLAN ficam fora dessa estimativa.
+A ordem coloca estabilidade de áudio antes de alterações profundas no pipeline. As medições da etapa 0 guiam a etapa 4. A etapa 2 estabelece o formato de configurações usado pelas preferências de decoder e pelo Web Controller. Estimativa total de **6–11 semanas úteis**. A paridade completa, um backend DirectShow completo e a prévia remota ficam fora dessa estimativa.
 
 ## 0. Inventário e teste de referência
 
@@ -35,9 +35,9 @@ A ordem coloca estabilidade de áudio antes de alterações profundas no pipelin
 
 ## 2. Modais e configurações portáveis
 
-- Colocar **Importar**, **Exportar** e **Padrão** no rodapé de Settings. O vMix expõe os três nessa janela. No LiveMix, a leitura e a escrita atuais usam `settings.txt`. Reusar a mesma representação de configurações com uma versão de esquema e aplicar a importação somente após validar o arquivo inteiro.
-- Exportar as preferências de forma portátil. O arquivo padrão omite chaves de stream e segredos. Na importação, listar dispositivos, monitores e caminhos indisponíveis e manter uma cópia recuperável das preferências anteriores. **Padrão** aplica os defaults do LiveMix. Mudanças que exigem reinício ou reabertura de fontes ficam visíveis. [Referência de Import/Export/Default](https://docs.vmix.com/help27/ImportExport.html)
-- Validar separadamente a importação de um arquivo de configuração exportado pelo vMix, com amostra fornecida pelo operador. Mapear campos comprovados e listar os ignorados. Compatibilidade com o preset `.vmix` não garante compatibilidade com o formato de exportação de configurações.
+- Colocar **Importar**, **Exportar** e **Padrão** no rodapé de Settings. No LiveMix, a leitura e a escrita atuais usam `settings.txt`. Reusar a mesma representação de configurações com uma versão de esquema e aplicar a importação somente após validar o arquivo inteiro.
+- Exportar as preferências de forma portátil. O arquivo padrão omite chaves de stream e segredos. Na importação, listar dispositivos, monitores e caminhos indisponíveis e manter uma cópia recuperável das preferências anteriores. **Padrão** aplica os defaults do LiveMix. Mudanças que exigem reinício ou reabertura de fontes ficam visíveis.
+- Validar separadamente a importação de um arquivo de configuração exportado pelo aplicativo de origem, com amostra fornecida pelo operador. Mapear campos comprovados e listar os ignorados. Compatibilidade com presets existentes não garante compatibilidade com o formato de exportação de configurações.
 - Aplicar as correções da matriz, começando por Add Input, Input Settings, Recording/MultiCorder e External. Preservar nomes e ordem reconhecíveis, agrupar controles relacionados e dar suporte à rolagem nas janelas compactas.
 
 **Aceite** — exportar, alterar, importar e confirmar recuperação das preferências; arquivo inválido não deixa estado parcial; **Padrão** retorna aos valores de instalação; presets, projetos e gravações continuam acessíveis. Cada controle corrigido tem teste funcional, além da captura visual quando aplicável.
@@ -71,8 +71,8 @@ A ordem coloca estabilidade de áudio antes de alterações profundas no pipelin
 ## 5B. Web Controller
 
 - Hoje há comandos e Telestrator por loopback. Implementar primeiro leitura de estado, tally e um switcher com Preview/Program/overlays, reutilizando o executor de ações. Depois adicionar editor de campos GT e roteamento por input no Telestrator.
-- Para uso em LAN, adicionar configuração explícita de interface/porta, autenticação, permissões por função, proteção das rotas de mutação e testes de acesso. Manter loopback como padrão. Descrever a API compatível com vMix por endpoint e comando, com respostas claras para funções ainda indisponíveis.
-- Avaliar LiveLAN só depois de estabilizar o controle. Preview de vídeo e áudio via navegador precisa de transporte, limites de CPU e autenticação próprios. [Referência do Web Controller](https://hwww.vmix.com/help28/WebController.html)
+- Para uso em LAN, adicionar configuração explícita de interface/porta, autenticação, permissões por função, proteção das rotas de mutação e testes de acesso. Manter loopback como padrão. Descrever a API de compatibilidade por endpoint e comando, com respostas claras para funções ainda indisponíveis.
+- Avaliar a prévia pela rede só depois de estabilizar o controle. Preview de vídeo e áudio via navegador precisa de transporte, limites de CPU e autenticação próprios.
 
 **Aceite** — teclado/MIDI/web acionam o mesmo comportamento; dois clientes recebem mudanças de tally e estado; comandos inválidos ou sem permissão não alteram a produção; teste em uma segunda máquina antes de liberar LAN.
 
@@ -88,7 +88,7 @@ A ordem coloca estabilidade de áudio antes de alterações profundas no pipelin
 | GT | Os cinco templates instalados abriram sem recursos marcados como incompatíveis. Campos identificados: Spinner 180 (0), Stinger Blue (0), Lineup 12 (27), The Extreme (7), Kimono (3). O editor exibe o diagnóstico quando houver limitações. | Comparar frames, alpha, animações e relógios com o original. |
 | Web Controller | Painel local lê Program, Preview, REC, streaming e overlays e usa o executor de ações do switcher para os comandos de produção. | Validar dois navegadores, edição GT, Telestrator por input e autenticação para LAN. |
 
-A [auditoria de modais e configurações](AUDITORIA-MODAIS.md) detalha a comparação estática, os testes da exportação do vMix 28 e o caminho opcional DirectShow.
+A [auditoria de modais e configurações](AUDITORIA-MODAIS.md) detalha a comparação estática, os testes de troca de configurações XML e o caminho opcional DirectShow.
 
 ## Próximo incremento
 
