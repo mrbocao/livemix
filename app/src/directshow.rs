@@ -1,6 +1,6 @@
 //! Optional Windows DirectShow file decoder. The graph stays on its worker.
 use crate::media_common::{Frame, Shared};
-use crate::vmix_settings::DirectShow;
+use crate::settings_xml::DirectShow;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 use windows::core::{w, GUID, HRESULT, HSTRING, Interface, PCWSTR, PWSTR};

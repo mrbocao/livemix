@@ -147,7 +147,7 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
     sh.gpu_playback.store(gpu_playback, Ordering::Relaxed);
     sh.paused.store(paused, Ordering::Relaxed);
     sh.set_status("Starting…");
-    if let Source::File(path) | Source::AutoFile(path, _) | Source::FfmpegFile(path, _) | Source::DirectShowFile(path, _, _) = &src {
+    if let Source::File(path) | Source::AutoFile(path, _, _) | Source::FfmpegFile(path, _, _) | Source::DirectShowFile(path, _, _, _) = &src {
         let (source, path) = (sh.clone(), path.clone());
         std::thread::spawn(move || crate::audio::play_file(source, path));
     }
@@ -160,21 +160,22 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
         Source::AudioDevice(device) => crate::audio::capture_device(s2, &device),
         Source::AudioFile(path) => crate::audio::play_audio_input(s2, path),
         Source::Presentation(path) => crate::slides::run(s2, path),
-        Source::FfmpegFile(path, deinterlace) => crate::ffmpeg_media::play(&s2, &path, deinterlace),
+        Source::Web(url, transparent) => crate::web_input::run(s2, url, transparent),
+        Source::FfmpegFile(path, deinterlace, hardware) => crate::ffmpeg_media::play_configured(&s2, &path, deinterlace, hardware, None),
         Source::Desktop => run_desktop(s2),
         Source::Sequence(folder, fps) => run_pictures(s2, folder, true, fps, 0.0),
         Source::Photos(folder, secs) => run_pictures(s2, folder, false, 0.0, secs),
-        Source::DirectShowFile(path, config, deinterlace) => {
+        Source::DirectShowFile(path, config, deinterlace, hardware) => {
             if let Err(error) = crate::directshow::play(&s2, &path, &config) {
                 if s2.seq.load(Ordering::Relaxed) == 0 && !s2.stop.load(Ordering::Relaxed) {
                     let reason = format!("DirectShow: {error}");
-                    crate::ffmpeg_media::play_with_reason(&s2, &path, deinterlace, Some(&reason));
+                    crate::ffmpeg_media::play_configured(&s2, &path, deinterlace, hardware, Some(&reason));
                 } else {
                     s2.set_status(format!("DirectShow: {error}"));
                 }
             }
         }
-        Source::AutoFile(path, deinterlace) => run(s2, Source::File(path), Some(deinterlace)),
+        Source::AutoFile(path, deinterlace, hardware) => run(s2, Source::File(path), Some((deinterlace, hardware))),
         other => run(s2, other, None),
     });
     sh
@@ -521,11 +522,11 @@ unsafe fn copy_sample(s: &IMFSample, d: &Dims, key: u64) -> Res<Vec<u8>> {
     Ok(out)
 }
 
-fn run(sh: Arc<Shared>, src: Source, fallback: Option<u8>) {
+fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
     let try_fallback = |reason: &str| {
-        if let (Source::File(path), Some(deinterlace)) = (&src, fallback) {
+        if let (Source::File(path), Some((deinterlace, hardware))) = (&src, fallback) {
             if !sh.stop.load(Ordering::Relaxed) && sh.seq.load(Ordering::Relaxed) == 0 {
-                crate::ffmpeg_media::play_with_reason(&sh, path, deinterlace, Some(reason));
+                crate::ffmpeg_media::play_configured(&sh, path, deinterlace, hardware, Some(reason));
                 return true;
             }
         }
@@ -1058,17 +1059,17 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
                 CoTaskMemFree(Some(p.0 as *const _));
                 Ok(s)
             };
-            let preset = COMDLG_FILTERSPEC { pszName: windows::core::w!("Project preset (*.vmix)"), pszSpec: windows::core::w!("*.vmix") };
+            let preset = COMDLG_FILTERSPEC { pszName: windows::core::w!("Project preset"), pszSpec: windows::core::w!("*.livemix") };
             let config = COMDLG_FILTERSPEC { pszName: windows::core::w!("LiveMix settings (*.json)"), pszSpec: windows::core::w!("*.json") };
-            let vmix_config = COMDLG_FILTERSPEC { pszName: windows::core::w!("vMix settings (*.config)"), pszSpec: windows::core::w!("*.config") };
+            let legacy_config = COMDLG_FILTERSPEC { pszName: windows::core::w!("Legacy XML settings (*.config)"), pszSpec: windows::core::w!("*.config") };
             if matches!(kind, PickKind::PresetSave | PickKind::SettingsSave) {
                 let d: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
                 if kind == PickKind::SettingsSave {
-                    d.SetFileTypes(&[config, vmix_config])?;
+                    d.SetFileTypes(&[config, legacy_config])?;
                     d.SetFileName(windows::core::w!("LiveMix-settings"))?;
                 } else {
                     d.SetFileTypes(&[preset])?;
-                    d.SetDefaultExtension(windows::core::w!("vmix"))?;
+                    d.SetDefaultExtension(windows::core::w!("livemix"))?;
                 }
                 d.Show(HWND::default())?;
                 let path = name_of(&d.GetResult()?)?;
@@ -1093,9 +1094,12 @@ pub fn browse(kind: PickKind) -> Receiver<Option<String>> {
             let all = COMDLG_FILTERSPEC { pszName: windows::core::w!("All files"), pszSpec: windows::core::w!("*.*") };
             match kind {
                 PickKind::PresetOpen => d.SetFileTypes(&[preset, all])?,
-                PickKind::SettingsOpen => d.SetFileTypes(&[config, vmix_config, all])?,
+                PickKind::SettingsOpen => d.SetFileTypes(&[config, legacy_config, all])?,
                 PickKind::PresetSave | PickKind::SettingsSave => unreachable!(),
                 PickKind::Video => d.SetFileTypes(&[video, all])?,
+                PickKind::Lut(_) => d.SetFileTypes(&[
+                    COMDLG_FILTERSPEC { pszName: windows::core::w!("3D LUT files"), pszSpec: windows::core::w!("*.cube;*.png") }, all
+                ])?,
                 PickKind::Presentation => d.SetFileTypes(&[
                     COMDLG_FILTERSPEC { pszName: windows::core::w!("Presentations"), pszSpec: windows::core::w!("*.ppt;*.pptx;*.pps;*.ppsx;*.odp") }, all
                 ])?,
@@ -1380,7 +1384,7 @@ mod tests {
         let output = crate::stream::command().args(["-y", "-f", "lavfi", "-i", "color=size=64x48:rate=25",
             "-t", "1", "-c:v", "ffv1"]).arg(&path).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let reader = start_for_gl(Source::AutoFile(path.to_string_lossy().into_owned(), 0), true);
+        let reader = start_for_gl(Source::AutoFile(path.to_string_lossy().into_owned(), 0, false), true);
         let deadline = Instant::now() + Duration::from_secs(5);
         while reader.seq.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));

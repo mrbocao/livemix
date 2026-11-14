@@ -52,6 +52,10 @@ LIVEMIX_DECKLINK_FFMPEG=/path/to/decklink-ffmpeg /Applications/LiveMix.app/Conte
 
 Set the executable's graphics preference in Windows if you want OpenGL on the dedicated GPU. In **Settings → Performance**, choose **Automatic** to let LiveMix match the OpenGL renderer to a DXGI adapter when it can identify it. An explicit D3D11 choice applies on restart. The GPU texture path requires matching adapters and driver support for OpenGL/D3D11 interoperability. Check **D3D11 input** in recording diagnostics and compare the Program readback counter before and during a recording. See the [roadmap](ROADMAP.md) for the tested scope.
 
+## Web Browser inputs
+
+Install Chrome or Edge in a standard installation location. On macOS, Chromium in the Applications folder also works. LiveMix opens a separate headless browser profile for its page inputs. You can use Web Browser inputs without signing into the browser.
+
 ## Presentation inputs
 
 Windows uses installed Microsoft PowerPoint when it can open the deck. The fallback uses LibreOffice Impress and Poppler's `pdftoppm`, with `pdftoppm` available on `PATH`. On macOS, install LibreOffice and Poppler. LiveMix detects the standard LibreOffice app location or `soffice` on `PATH`. Decks are converted on a worker, and presets keep the original presentation path.

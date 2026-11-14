@@ -1,4 +1,4 @@
-// Adapted from LiveCraft (4a1eca7), MIT. See docs/LICENSE-LiveCraft-MIT.txt.
+// Third-party portions are covered by the MIT notice in docs/THIRD-PARTY-MIT.txt.
 /// Camera moves sent over VISCA, the common PTZ protocol on IP.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ptz {

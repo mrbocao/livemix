@@ -1,4 +1,4 @@
-//! Commands that use the vMix function names and LiveMix's existing inputs and routes.
+//! Commands that use legacy function names and LiveMix's existing inputs and routes.
 use crate::model::{Input, Kind, Layer, Switcher, LAYERS, MV_AUTO, OUTPUT_COUNT, mv_layout_boxes,
     SRC_MV1, SRC_MV2, SRC_OUTPUT, SRC_PREVIEW};
 use crate::replay::Action;
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_and_replay_use_vmix_names() {
+    fn routing_and_replay_accept_legacy_names() {
         let mut switcher = Switcher::demo();
         switcher.perform_action("SetOutput3 Preview", 1.0).unwrap();
         assert_eq!(switcher.cfg.outputs[2].source, SRC_PREVIEW);
@@ -396,6 +396,7 @@ mod tests {
         for id in [4, 9] {
             switcher.replay_events.push(crate::replay::Event {
                 id, start: 0, end: 100, description: String::new(), speed: 100, angles: [true; 8],
+                ..Default::default()
             });
         }
         switcher.perform_action("ReplayPlayEventToOutput 0", 1.0).unwrap();

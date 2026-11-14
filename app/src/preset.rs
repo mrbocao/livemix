@@ -91,6 +91,7 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
             Kind::ImageFile { path } => (1, path.as_str(), None, false),
             Kind::Photos { folder } => (2, folder.as_str(), None, false),
             Kind::Presentation { path } => (5004, path.as_str(), None, false),
+            Kind::Web { url, .. } => (5006, url.as_str(), None, false),
             Kind::VirtualSet { .. } => (5005, "", None, false),
             Kind::ImageSequence { folder } => (21, folder.as_str(), None, false),
             Kind::GtTitle { path, .. } => (9000, path.as_str(), None, false),
@@ -105,6 +106,11 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         };
         out.push_str("  <Input");
         attr(&mut out, "Type", kind);
+        if let Kind::Web { transparent: true, .. } = i.kind { attr(&mut out, "LiveMixWebAlpha", "True"); }
+        if !i.colour_fx.lut_path.is_empty() { attr(&mut out, "LiveMixLut", &i.colour_fx.lut_path); }
+        if i.colour_fx.luma != Default::default() {
+            if let Ok(luma) = serde_json::to_string(&i.colour_fx.luma) { attr(&mut out, "LiveMixLumaKey", luma); }
+        }
         if let Kind::VirtualSet { camera, .. } = i.kind { attr(&mut out, "LiveMixSetCamera", camera); }
         if let Kind::Replay { channel, .. } = i.kind { attr(&mut out, "LiveMixReplayChannel", channel); }
         attr(&mut out, "Key", guid()?);
@@ -285,7 +291,7 @@ impl ImportReport {
                 Kind::VideoList { paths, .. } => paths,
                 _ => &[],
             };
-            for asset in paths {
+            for asset in paths.iter().chain(Some(&input.colour_fx.lut_path).filter(|path| !path.is_empty())) {
                 if !Path::new(asset).exists() {
                     missing.push((input.title.clone(), asset.clone()));
                 }
@@ -355,6 +361,7 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
                 "1" => Kind::ImageFile { path: resolve(file) },
                 "2" => Kind::Photos { folder: resolve(file) },
                 "5004" => Kind::Presentation { path: resolve(file) },
+                "5006" => Kind::Web { url: file.to_owned(), transparent: bool_value(node.attribute("LiveMixWebAlpha")) },
                 "5005" => {
                     let camera = node.attribute("LiveMixSetCamera").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0).min(2);
                     Kind::VirtualSet { camera, previous: camera, changed_at: 0.0 }
@@ -456,6 +463,14 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             let c: Vec<u8> = v.split(',').filter_map(|x| x.parse().ok()).collect();
             (c.len() == 3).then(|| [c[0], c[1], c[2]])
         });
+        input.colour_fx.luma = node.attribute("LiveMixLumaKey").and_then(|value| serde_json::from_str(value).ok()).unwrap_or_default();
+        if let Some(path) = node.attribute("LiveMixLut").filter(|path| !path.is_empty()) {
+            let path = resolve(path);
+            if let Err(error) = input.colour_fx.load(Path::new(&path)) {
+                input.colour_fx.lut_path = path;
+                warnings.push(format!("Input {} LUT: {error}", input.title));
+            }
+        }
         input.colour_adjust = node.attribute("LiveMixColourAdjust")
             .and_then(|value| serde_json::from_str(value).ok()).unwrap_or_default();
         if let Some(effects) = node.attribute("LiveMixAudioEffects")
@@ -581,6 +596,27 @@ fn title_texts(input: Node<'_, '_>) -> std::collections::BTreeMap<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_input_and_picture_effects_round_trip() {
+        let folder = std::env::temp_dir().join(format!("livemix-picture-fx-{}", guid().unwrap()));
+        fs::create_dir(&folder).unwrap();
+        let lut = folder.join("identity.cube");
+        fs::write(&lut, "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1").unwrap();
+        let mut s = Switcher::empty();
+        let mut input = Input::new(0, "Browser", Kind::Web { url: "https://example.test/a?x=1&y=2".into(), transparent: true });
+        input.colour_fx.load(&lut).unwrap();
+        input.colour_fx.luma = crate::colour_fx::LumaKey { enabled: true, threshold: 10, softness: 33, invert: true };
+        s.add(input);
+        let preset = folder.join("test-project.xml");
+        let mut restored = Switcher::empty();
+        decode(&mut restored, &preset, &encode(&s).unwrap()).unwrap();
+        let input = &restored.inputs[0];
+        assert!(matches!(&input.kind, Kind::Web { url, transparent: true } if url.ends_with("?x=1&y=2")));
+        assert_eq!(input.colour_fx.luma, s.inputs[0].colour_fx.luma);
+        assert_eq!(input.colour_fx.lut.as_ref().unwrap().size, 2);
+        fs::remove_dir_all(folder).unwrap();
+    }
     use std::path::PathBuf;
 
     #[test]
@@ -655,14 +691,14 @@ mod tests {
         }
         println!("DeckLink SDK sees {} device(s)", crate::decklink::refresh_devices().len());
         s.preview = Some(s.add(title));
-        write_file(&dir.join("livemix-export-test.vmix"), encode(&s).unwrap().as_bytes()).unwrap();
+        write_file(&dir.join("livemix-export-test.livemix"), encode(&s).unwrap().as_bytes()).unwrap();
     }
 
     #[test]
     fn native_preset_and_live_mix_round_trip() {
         let mut s = Switcher::empty();
         let folder = std::env::temp_dir();
-        let preset = folder.join("test.vmix");
+        let preset = folder.join("test.livemix");
         let path = preset.as_path();
         let xml = r#"<XML><Version>9</Version>
           <Input Type="100" OriginalTitle="Blank" />
@@ -730,7 +766,7 @@ mod tests {
     #[test]
     fn write_replaces_previous_preset() {
         let mut path = PathBuf::from(std::env::temp_dir());
-        path.push(format!("livemix-{}.vmix", guid().unwrap()));
+        path.push(format!("livemix-{}.livemix", guid().unwrap()));
         write_file(&path, b"first").unwrap();
         write_file(&path, b"second").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");

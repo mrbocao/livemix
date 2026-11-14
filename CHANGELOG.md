@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Replaced the Replay panel with a Replay controller: A/B players beside the camera grid, four Events lists, eight playlists, per-angle Selected and Favourite marks, comments and 56 tags, Shift In/Out, quick marks for the last 5 to 20 seconds, Play Selected, Preview Mode with Take, and an undocked window.
+- Playlists keep their own In/Out points, speed and mix per clip, mix between Replay A and B on Program, and are stored with the Events lists and tags in the session manifest.
+- Settings and Input Settings use the available screen height and a wider page before scrolling, with compact navigation. Display shows the project format beside the Fullscreen outputs. Each option now appears once: audio meter toggles on Audio, Fade To Black audio and Start External Output on Options, automatic audio mixing on the input's Audio page, and effect switches on the Effects rows.
+- Split `main.rs` into `app`, `outputs`, `desk`, `sources`, `mixer`, `settings`, `ui` and `replay` submodules without behavior changes.
+
+- New project presets and automatic recovery use the .livemix extension. Older XML presets open by content, and XML settings exports use a LiveMix section.
+
+- Added per-input 3D LUTs from .cube or tiled PNG files and a luma key with threshold, softness and inversion. D3D11 inputs apply both effects in the OpenGL shader.
+- Added Web Browser inputs with an isolated, shared Chromium process and optional transparent backgrounds.
+
+- Added optional D3D11VA decoding for high-resolution FFmpeg file playback on Windows, with background format detection and software recovery.
+- Added optional VideoToolbox decoding for high-resolution FFmpeg file playback on macOS with the same software recovery.
+- Standardized product-facing labels and documentation, retaining legacy file compatibility and the third-party MIT notice.
+
 - Index Replay frames per angle using capture time and the encoder's file position, including when frames are dropped.
 - Added static PowerPoint and LibreOffice presentation inputs with manual slide navigation.
 - Added Virtual Set inputs with configurable scene layers and animated wide, left and right views.
@@ -10,7 +24,7 @@
 - Kept D3D11 video textures on the GPU while applying chroma key and colour adjustments, with the existing CPU path as fallback.
 - Rendered the waveform, RGB parade and vectorscope on the GPU when available. Matched the reference scope texture dimensions and retained the CPU fallback.
 
-- Added vMix 28 XML settings import and export for mapped preferences alongside native JSON backups.
+- Added Legacy XML settings import and export for mapped preferences alongside native JSON backups.
 - Added an optional DirectShow video decoder on Windows with MPEG-2 and H.264 selection, a filter blocklist and FFmpeg fallback.
 
 - Added Settings import, export and confirmed reset with a backup of the previous preferences. Exports omit RTMP destinations and keys and SRT secrets.
@@ -27,7 +41,7 @@
 
 - Added Master/source audio selection per stream, a YouTube stereo AAC profile at 44.1 kHz, and copyable RTMP/RTMPS and SRT diagnostics.
 - Added live camera previews in the Replay controller and improved recovery and reporting for the Last preset button.
-- Expanded vMix shortcut commands for layers, routing, title text, audio and Replay event management.
+- Expanded Legacy shortcut commands for layers, routing, title text, audio and Replay event management.
 
 - Added session-level Replay monitor options and an optional advanced view with camera assignment and independent Replay B cue, jog and take controls.
 - Changed Last to load a separate automatic project recovery preset, refreshed every minute and before New or normal shutdown.
@@ -51,7 +65,7 @@
 - Redesigned the docked Audio Mixer with collapsible output and input groups, stereo dBFS meters, compact faders, an Audio Engine statistics window, independent headphone volume, and dedicated Master and per-input audio settings. Added headphone Solo with a pre-fader option and made automatic input mixing follow Program transitions.
 
 - Added persistent multicamera replay sessions, rolling capture, shared event time ranges, Replay A/B inputs, per-channel speed, event selection, and MP4 export.
-- Added direct playback of finalized replay segments, frame stepping, seek-based reverse, and read-only import of native vMix replay metadata and supported media.
+- Added direct playback of finalized replay segments, frame stepping, seek-based reverse, and read-only import of legacy replay metadata and supported media.
 - Added stereo meters to audio-capable inputs and configurable Program and input meters to both MultiViews.
 - Stabilized the headphone monitor callback clock and kept resampling phase across blocks to reduce discontinuities from callback jitter. Buffered system audio capture so a mixer read can no longer discard a device callback.
 - Added a Telestrator input with a freehand editor and local browser drawing. Added a Video Delay input with a configurable buffer.
@@ -68,4 +82,4 @@
 
 ### Documentation
 
-- Expanded the project overview and documented setup, optional runtimes, operator workflows, contributor and agent guidance, and remaining work. Added the MIT notice for adapted LiveCraft components.
+- Expanded the project overview and documented setup, optional runtimes, operator workflows, contributor and agent guidance, and remaining work. Added the MIT notice for third-party components.

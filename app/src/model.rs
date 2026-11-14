@@ -130,11 +130,12 @@ pub enum Kind {
     /// "Photos": a slideshow of the pictures in a folder.
     Photos { folder: String },
     Presentation { path: String },
+    Web { url: String, transparent: bool },
     VirtualSet { camera: u8, previous: u8, changed_at: f64 },
-    /// "Video Delay" (vMix.VideoType 10): a delayed copy of another input. The original
+    /// "Video Delay" (legacy type 10): a delayed copy of another input. The original
     /// buffers the source at the chosen resolution for `seconds` (frmInput tVideoDelay).
     VideoDelay { source: Option<u32>, seconds: f32, resolution: [u32; 2] },
-    /// "Telestrator" (vMix.VideoType 5001): a transparent drawing layer over the program.
+    /// "Telestrator" (preset type 5001): a transparent drawing layer over the program.
     Telestrator { strokes: Vec<Telestroke> },
 }
 
@@ -183,6 +184,15 @@ impl Kind {
         }
     }
 
+    pub fn supports_picture_fx(&self) -> bool {
+        self.streamed() && self.has_video_picture() || matches!(self, Kind::ImageFile { .. })
+    }
+
+    fn has_video_picture(&self) -> bool {
+        !matches!(self, Kind::AudioFile { .. })
+            && !matches!(self, Kind::Device { link, .. } if link.starts_with("audio:"))
+    }
+
     pub fn gt_seconds(&self, exiting: bool) -> Option<f32> {
         match self {
             Self::GtTitle { document: Some(doc), .. } => doc.seconds(exiting),
@@ -195,7 +205,7 @@ impl Kind {
             Kind::Replay { path, .. } => !path.is_empty(),
             _ => matches!(
                 self,
-                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. }
+                Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. } | Kind::Web { .. }
             ),
         }
     }
@@ -299,7 +309,7 @@ pub const LAYERS: usize = 10;
 
 #[test]
 fn last_preset_entry_handles_windows_text_markers() {
-    let path = "C:\\Projetos\\Transmissão ao vivo.vmix";
+    let path = "C:\\Projetos\\Transmissão ao vivo.livemix";
     assert_eq!(last_preset_entry(&format!("\u{feff}{path}\r\n")), Some(path.into()));
     assert_eq!(last_preset_entry(" \r\n"), None);
 }
@@ -381,6 +391,7 @@ pub struct Input {
     pub ptz_address: String,
     pub on_program: String,
     pub colour_adjust: ColourAdjust,
+    pub colour_fx: crate::colour_fx::Effects,
     /// Input Settings > General (frmInputSettings chkMirror/chkSharpen/chkDeinterlace).
     pub mirror: bool,
     pub sharpen: bool,
@@ -461,6 +472,7 @@ impl Input {
             ptz_address: String::new(),
             on_program: String::new(),
             colour_adjust: Default::default(),
+            colour_fx: Default::default(),
             mirror: false,
             sharpen: false,
             deinterlace: false,
@@ -880,7 +892,6 @@ impl AddKind {
         !matches!(
             self,
             AddKind::Dvd
-                | AddKind::WebBrowser
                 | AddKind::VideoCall
                 | AddKind::Zoom
         )
@@ -909,7 +920,7 @@ impl AddKind {
             AddKind::AudioFile => "An audio file such as WAV, MP3, FLAC or AAC. Requires FFmpeg and FFprobe.",
             AddKind::AudioInput => "A microphone, USB audio interface or line input.",
             AddKind::VirtualSet => "Compose a backdrop, two presenter layers and a foreground with animated camera presets.",
-            AddKind::WebBrowser => "A web page as an input — not available in this version.",
+            AddKind::WebBrowser => "Capture a web page using installed Chrome or Edge.",
             AddKind::VideoCall => "Remote guests by video call — not available in this version.",
             AddKind::Zoom => "Zoom meeting participants — not available in this version.",
             AddKind::Telestrator => "Draw over the program from a web browser. Enable the Web Controller and open /telestrator/ on your tablet or phone.",
@@ -1075,6 +1086,7 @@ pub struct Switcher {
     pub replay_cameras: [usize; 2],
     pub replay_timeline: Option<(u64, u64, u64)>,
     pub replay_speed: [u8; 2],
+    pub replay_ui: crate::replay::UiState,
     /// "Stop Recording?" / "Stop MultiCorder?" question (frmmain::ConfirmRecording @0x250d10).
     pub confirm_stop: Option<&'static str>,
     /// Position copied in Input Settings (Copy / Paste buttons of the original).
@@ -1225,7 +1237,7 @@ pub fn mv_title_height(layout: u8) -> f32 {
     mv_sizes(rows, cols).1 as f32 / MV_H as f32
 }
 
-/// One row of Settings > Shortcuts. The original's `vMix.Shortcut` carries either a
+/// One row of Settings > Shortcuts. A shortcut binding carries either a
 /// keyboard key (`m_Key`) or MIDI data (`m_MIDIChannel`, `m_MIDINote`, `m_MIDIValue`)
 /// and one action (`m_Function` + input/duration); this keeps both in the same row.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1319,8 +1331,9 @@ pub struct Settings {
     pub low_latency_capture: bool,
     pub ffmpeg_extensions: String,
     pub ffmpeg_all_files: bool,
+    pub ffmpeg_hardware: bool,
     pub decoder_deinterlace: u8,
-    pub directshow: crate::vmix_settings::DirectShow,
+    pub directshow: crate::settings_xml::DirectShow,
     pub record_audio: [bool; 3],
     pub production_clock: bool,
     pub default_audio_bus: usize,
@@ -1454,6 +1467,7 @@ impl Default for Settings {
             low_latency_capture: false,
             ffmpeg_extensions: String::new(),
             ffmpeg_all_files: false,
+            ffmpeg_hardware: true,
             decoder_deinterlace: 0,
             directshow: Default::default(),
             record_audio: [true; 3],
@@ -1624,7 +1638,7 @@ impl Switcher {
 
     pub fn export_settings_to(&self, path: &std::path::Path) -> Result<(), String> {
         let text = if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("config")) {
-            crate::vmix_settings::export(&self.cfg)
+            crate::settings_xml::export(&self.cfg)
         } else {
             self.portable_settings()?
         };
@@ -1639,11 +1653,11 @@ impl Switcher {
             .map_err(|error| error.to_string())?;
         if text.len() as u64 > MAX_SETTINGS_BYTES { return Err("Settings file is too large".into()); }
         if text.trim_start_matches('\u{feff}').trim_start().starts_with('<') {
-            let report = crate::vmix_settings::import(text.trim_start_matches('\u{feff}'), &self.cfg)?;
+            let report = crate::settings_xml::import(text.trim_start_matches('\u{feff}'), &self.cfg)?;
             let mut candidate = Self::empty();
             candidate.cfg = report.settings;
             self.replace_settings(candidate)?;
-            Ok(format!("vMix settings imported: {} applied, {} skipped", report.imported, report.skipped))
+            Ok(format!("Legacy settings imported: {} applied, {} skipped", report.imported, report.skipped))
         } else {
             self.replace_settings(Self::parse_portable_settings(&text)?)?;
             Ok("LiveMix settings imported".into())
@@ -1696,6 +1710,7 @@ impl Switcher {
             format!("low_latency_capture={}", b(c.low_latency_capture)),
             format!("ffmpeg_extensions={}", serde_json::to_string(&c.ffmpeg_extensions).unwrap_or_default()),
             format!("ffmpeg_all_files={}", b(c.ffmpeg_all_files)),
+            format!("ffmpeg_hardware={}", b(c.ffmpeg_hardware)),
             format!("decoder_deinterlace={}", c.decoder_deinterlace),
             format!("directshow={}", serde_json::to_string(&c.directshow).unwrap_or_default()),
             format!("record_audio={}", c.record_audio.map(b).join(",")),
@@ -1824,6 +1839,7 @@ impl Switcher {
                 "low_latency_capture" => c.low_latency_capture = on,
                 "ffmpeg_extensions" => c.ffmpeg_extensions = serde_json::from_str(v).unwrap_or_default(),
                 "ffmpeg_all_files" => c.ffmpeg_all_files = on,
+                "ffmpeg_hardware" => c.ffmpeg_hardware = on,
                 "decoder_deinterlace" => c.decoder_deinterlace = v.parse::<u8>().unwrap_or(0).min(2),
                 "record_audio" => {
                     for (enabled, flag) in c.record_audio.iter_mut().zip(v.split(',')) {
@@ -2139,6 +2155,7 @@ impl Switcher {
             replay_cameras: [0, 0],
             replay_timeline: None,
             replay_speed: [100, 100],
+            replay_ui: Default::default(),
             confirm_stop: None,
             position_clipboard: None,
             cfg: Settings::default(),
@@ -3042,6 +3059,11 @@ impl Switcher {
                 self.add_dialog.name.clear();
                 return Ok(());
             }
+            AddKind::WebBrowser => {
+                let url = d.path.trim();
+                if !crate::web_input::valid_url(url) { return Err("Enter an HTTP or HTTPS page URL.".into()); }
+                (Kind::Web { url: url.into(), transparent: false }, "Web Browser".into())
+            }
             AddKind::PowerPoint => {
                 let path = std::path::Path::new(d.path.trim());
                 if !path.is_file() || !crate::slides::accepted(path) {
@@ -3142,7 +3164,7 @@ impl Switcher {
     }
 
     pub fn recovery_preset_path() -> std::path::PathBuf {
-        crate::media::storage_folder().join("last.vmix")
+        crate::media::storage_folder().join("last.livemix")
     }
 
     fn last_preset_path() -> std::path::PathBuf {
@@ -3158,7 +3180,7 @@ impl Switcher {
     }
 
     pub fn save_preset(&mut self) -> bool {
-        match self.preset_file.clone().filter(|path| path.extension().is_some_and(|v| v.eq_ignore_ascii_case("vmix"))) {
+        match self.preset_file.clone().filter(|path| path.extension().is_some_and(|v| v.eq_ignore_ascii_case("livemix"))) {
             Some(path) => self.save_preset_to(&path),
             None => {
                 self.browse_req = Some(crate::media::PickKind::PresetSave);
@@ -3168,8 +3190,8 @@ impl Switcher {
     }
 
     pub fn save_preset_to(&mut self, path: &std::path::Path) -> bool {
-        if !path.extension().is_some_and(|v| v.eq_ignore_ascii_case("vmix")) {
-            self.notify("Save the project with the .vmix extension.");
+        if !path.extension().is_some_and(|v| v.eq_ignore_ascii_case("livemix")) {
+            self.notify("Use Save As to choose the supported project preset format.");
             return false;
         }
         match crate::preset::encode(self).and_then(|xml| crate::preset::write_file(path, xml.as_bytes())) {
@@ -3283,6 +3305,7 @@ impl Switcher {
                 Kind::ImageSequence { folder } => ("imagesequence", folder.clone(), String::new()),
                 Kind::Photos { folder } => ("photos", folder.clone(), String::new()),
                 Kind::Presentation { path } => ("presentation", path.clone(), String::new()),
+                Kind::Web { url, transparent } => ("web", url.clone(), (*transparent as u8).to_string()),
                 Kind::VirtualSet { camera, .. } => ("virtualset", camera.to_string(), String::new()),
                 Kind::VideoDelay { source, seconds, resolution } => ("videodelay",
                     self.number_of(source.unwrap_or(0)).to_string(),
@@ -3424,7 +3447,7 @@ impl Switcher {
         });
         match result {
             Ok(warnings) => {
-                if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("vmix")) {
+                if !recovery {
                     self.import_report = Some(crate::preset::ImportReport::collect(path, &self.inputs, warnings.clone()));
                 }
                 self.now = now;
@@ -3483,6 +3506,7 @@ impl Switcher {
                         "imagesequence" => Kind::ImageSequence { folder: f[3].into() },
                         "photos" => Kind::Photos { folder: f[3].into() },
                         "presentation" => Kind::Presentation { path: f[3].into() },
+                        "web" => Kind::Web { url: f[3].into(), transparent: f[4] == "1" },
                         "virtualset" => {
                             let camera = f[3].parse::<u8>().unwrap_or(0).min(2);
                             Kind::VirtualSet { camera, previous: camera, changed_at: 0.0 }

@@ -294,8 +294,9 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
             }
             p.text(r.center(), Align2::CENTER_CENTER, &inp.title, FontId::proportional((h * 0.11).max(6.0)), fade(Color32::from_white_alpha(230), a));
         }
-        Kind::AudioFile { .. } | Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. } | Kind::VideoDelay { .. } => {
-            let keyed = inp.key.on || matches!(inp.kind, Kind::ImageFile { .. } | Kind::ImageSequence { .. });
+        Kind::AudioFile { .. } | Kind::Device { .. } | Kind::VideoFile { .. } | Kind::Replay { .. } | Kind::ImageFile { .. } | Kind::VideoList { .. } | Kind::Desktop | Kind::ImageSequence { .. } | Kind::Photos { .. } | Kind::Presentation { .. } | Kind::Web { .. } | Kind::VideoDelay { .. } => {
+            let keyed = inp.key.on || inp.colour_fx.luma.enabled
+                || matches!(inp.kind, Kind::ImageFile { .. } | Kind::ImageSequence { .. } | Kind::Web { transparent: true, .. });
             match inp.tex {
                 Some((tex, [tw, th])) if tw > 0 && th > 0 => {
                     // Letterbox a picture into the frame.

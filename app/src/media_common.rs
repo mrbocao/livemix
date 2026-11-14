@@ -18,6 +18,7 @@ pub struct Shared {
     #[cfg(windows)]
     pub(crate) cpu_frames_required: AtomicBool,
     pub video_adapter: Mutex<Option<String>>,
+    pub browser_fps: AtomicU64,
     pub decoder: Mutex<String>,
     pub audio: Mutex<crate::audio::Buffer>,
     /// Smoothed mapping between the system clock and the file's media position.
@@ -111,12 +112,13 @@ pub enum Source {
     Srt(crate::srt::Connection),
     File(String),
     #[cfg(windows)]
-    AutoFile(String, u8),
+    AutoFile(String, u8, bool),
     #[cfg(windows)]
-    DirectShowFile(String, crate::vmix_settings::DirectShow, u8),
-    FfmpegFile(String, u8),
+    DirectShowFile(String, crate::settings_xml::DirectShow, u8, bool),
+    FfmpegFile(String, u8, bool),
     AudioFile(String),
     Presentation(String),
+    Web(String, bool),
     AudioDevice(String),
     Desktop,
     /// Folder of pictures: Image Sequence (frames at `fps`).
@@ -394,6 +396,7 @@ pub enum PickKind {
     Video,
     Audio,
     Presentation,
+    Lut(u32),
     Image,
     Title,
     PresetOpen,

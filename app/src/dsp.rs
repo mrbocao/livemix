@@ -1,4 +1,4 @@
-// Adapted from LiveCraft (4a1eca7), MIT. See docs/LICENSE-LiveCraft-MIT.txt.
+// Third-party portions are covered by the MIT notice in docs/THIRD-PARTY-MIT.txt.
 //! Per-input sound treatment: channel select, noise gate, compressor,
 //! graphic equaliser, gain and delay. Works on interleaved stereo blocks.
 

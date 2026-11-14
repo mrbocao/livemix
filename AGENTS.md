@@ -6,11 +6,16 @@ The repository root contains documentation and CI. The Rust crate is in `app/`. 
 
 | Area | Files under `app/src/` |
 | --- | --- |
-| UI, update loop, feature lifecycle | `main.rs`, `model.rs` |
-| Native presets, vMix import and export | `preset.rs` |
+| Entry point, shared application types, update loop, feature lifecycle | `main.rs`, `app.rs`, `model.rs` |
+| Switching desk, monitors, MultiView and output windows | `desk.rs` |
+| Input tiles and input settings | `sources.rs` |
+| Settings window, dialogs and shared widgets | `settings.rs`, `ui.rs` |
+| Replay session, engine, setup and controller | `replay.rs`, `replay/engine.rs`, `replay/ui.rs`, `replay/controller.rs` |
+| Recording, scopes and output scheduling | `outputs.rs` |
+| Project presets and legacy import/export | `preset.rs` |
 | Media backends and shared frame types | `media.rs` (Windows), `media_macos.rs`, `media_common.rs` |
 | Program composition, scopes and GPU transfers | `program.rs`, `render.rs`, `scopes.rs`, `performance.rs`, `dx_interop.rs` |
-| Mixing, capture, monitoring and per-input processing | `audio.rs`, `dsp.rs` |
+| Mixing, capture, monitoring and per-input processing | `audio.rs`, `dsp.rs`, `mixer.rs` |
 | Physical and network I/O | `decklink.rs`, `decklink_macos.rs`, `ndi.rs`, `omt.rs`, `srt.rs`, `stream.rs` |
 | Presentation conversion and output integration tests | `slides.rs`, `livecheck.rs` |
 | Titles and operator controls | `gt.rs`, `automation.rs`, `midi.rs`, `ptz.rs` |
