@@ -103,6 +103,14 @@ impl<W: Write + Seek> Mux<W> {
         self.output.write_all(bytes)
     }
 
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        let end = self.output.stream_position()?;
+        self.output.seek(SeekFrom::Start(self.duration_offset))?;
+        self.output.write_all(&(self.duration_ms as f64).to_be_bytes())?;
+        self.output.seek(SeekFrom::Start(end))?;
+        self.output.flush()
+    }
+
     pub fn finish(mut self) -> io::Result<()> {
         self.output.seek(SeekFrom::Start(self.duration_offset))?;
         self.output.write_all(&(self.duration_ms as f64).to_be_bytes())?;

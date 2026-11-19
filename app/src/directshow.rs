@@ -76,6 +76,39 @@ pub fn filter_names() -> Vec<String> {
     registered().into_iter().map(|(name, _)| name).collect()
 }
 
+fn blend_fields(rgba: &mut [u8], width: usize) {
+    for pair in rgba.chunks_exact_mut(width * 8) {
+        let (first, second) = pair.split_at_mut(width * 4);
+        for (a, b) in first.iter_mut().zip(second) {
+            let blended = (u16::from(*a) + u16::from(*b)).div_ceil(2) as u8;
+            *a = blended;
+            *b = blended;
+        }
+    }
+}
+
+pub fn filter_properties(name: String) -> Result<(), String> {
+    use windows::Win32::System::Ole::{ISpecifyPropertyPages, OleCreatePropertyFrame};
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().map_err(|error| error.to_string())?;
+        let _com = Com;
+        let id = registered().into_iter().find(|(label, _)| label.eq_ignore_ascii_case(&name))
+            .map(|(_, id)| id).ok_or("Selected DirectShow filter is unavailable")?;
+        let filter: IBaseFilter = CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER).map_err(|error| error.to_string())?;
+        let pages: ISpecifyPropertyPages = filter.cast().map_err(|_| "This filter has no property pages")?;
+        let pages = pages.GetPages().map_err(|error| error.to_string())?;
+        let result = if pages.cElems == 0 || pages.pElems.is_null() {
+            Err("This filter has no property pages".into())
+        } else {
+            let object = filter.cast::<windows::core::IUnknown>().ok();
+            OleCreatePropertyFrame(windows::Win32::Foundation::HWND::default(), 0, 0, &HSTRING::from(name),
+                1, &object, pages.cElems, pages.pElems, 0, 0, None).map_err(|error| error.to_string())
+        };
+        CoTaskMemFree(Some(pages.pElems.cast()));
+        result
+    }
+}
+
 struct Com;
 
 impl Com {
@@ -228,6 +261,7 @@ unsafe fn play_graph(shared: &Shared, path: &str, config: &DirectShow, blocked: 
     let events: IMediaEvent = graph.cast().map_err(err)?;
     let control = Running(graph.cast().map_err(err)?);
     control.0.Pause().map_err(err)?;
+    let _ = control.0.GetState(500);
     let mut pixels = vec![0i32; format.width * format.height];
     let mut frame_at = None;
     let mut running = false;
@@ -246,6 +280,7 @@ unsafe fn play_graph(shared: &Shared, path: &str, config: &DirectShow, blocked: 
             (grabber.vtable().set_buffer_samples)(grabber.as_raw(), 1).ok().map_err(err)?;
             seeking.SetPositions(Some(&mut position), AM_SEEKING_AbsolutePositioning.0 as u32, None, 0).map_err(err)?;
             control.0.Pause().map_err(err)?;
+            let _ = control.0.GetState(500);
             target_position = position;
             running = false;
             frame_at = None;
@@ -292,6 +327,7 @@ unsafe fn play_graph(shared: &Shared, path: &str, config: &DirectShow, blocked: 
                         rgba.extend_from_slice(&[r, g, b, 255]);
                     }
                 }
+                if shared.deinterlace_blend.load(Relaxed) { blend_fields(&mut rgba, format.width); }
                 if shared.seq.load(Relaxed) == 0 {
                     *shared.decoder.lock().unwrap() = format!("DirectShow · system memory · {path_description}");
                     shared.set_status("");

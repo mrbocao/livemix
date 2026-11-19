@@ -128,9 +128,16 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         attr(&mut out, "OriginalTitle", &i.title);
         attr(&mut out, "Title", &i.title);
         attr(&mut out, "Loop", tf(i.loop_on));
-        attr(&mut out, "VolumeF", i.volume / 100.0);
+        // The original saves the input gain (mz::get_Volume), not the fader position.
+        attr(&mut out, "VolumeF", crate::audio::fader_gain(i.volume));
         if !i.ptz_address.is_empty() { attr(&mut out, "LiveMixPtzAddress", &i.ptz_address); }
+        if !i.hyperdeck_address.is_empty() { attr(&mut out, "LiveMixHyperDeckAddress", &i.hyperdeck_address); }
+        if let Some(id) = &i.sony_camera { attr(&mut out, "LiveMixSonyCamera", id); }
+        if !i.hyperdeck_playlist.is_empty() { attr(&mut out, "LiveMixHyperDeckPlaylist", &i.hyperdeck_playlist); }
         if !i.on_program.is_empty() { attr(&mut out, "LiveMixOnProgram", &i.on_program); }
+        if let Some(json) = i.timing.as_ref().and_then(|source| serde_json::to_string(source).ok()) {
+            attr(&mut out, "LiveMixTiming", &json);
+        }
         // Input Settings > General / Colour Correction / Tally Lights / Advanced.
         let flags: [(&str, bool); 10] = [
             ("LiveMixMirror", i.mirror), ("LiveMixSharpen", i.sharpen),
@@ -200,6 +207,9 @@ pub fn encode(s: &Switcher) -> Result<String, String> {
         if let Kind::Teleprompter(prompter) = &i.kind {
             if let Ok(value) = serde_json::to_string(prompter) {
                 attr(&mut out, "LiveMixTeleprompter", value);
+            }
+            if let Some(id) = prompter.audio_source {
+                attr(&mut out, "LiveMixPrompterAudio", s.number_of(id));
             }
         }
         if i.place != Position::default() {
@@ -439,7 +449,8 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
             input.bus_m = node.attribute("BusMaster").map_or(true, |v| bool_value(Some(v)));
             input.collapsed = bool_value(node.attribute("Collapsed"));
             input.volume = node.attribute("VolumeF").and_then(|v| v.parse::<f32>().ok())
-                .filter(|v| v.is_finite()).map_or(80.0, |v| (v * 100.0).clamp(0.0, 100.0));
+                // sr::ze @IL_1752: missing VolumeF reads as gain 1 (full volume).
+                .filter(|v| v.is_finite()).map_or(100.0, |v| crate::audio::fader_position(v).clamp(0.0, 100.0));
             input.category = node.attribute("Category").and_then(|v| v.parse::<u8>().ok())
                 .and_then(|v| v.checked_sub(1)).filter(|&v| (v as usize) < CATEGORIES.len());
             if let Some(pos) = node.attribute("Positions").and_then(|xml| roxmltree::Document::parse(xml).ok()) {
@@ -474,8 +485,18 @@ pub fn decode(s: &mut Switcher, path: &Path, text: &str) -> Result<Vec<String>, 
                 .and_then(|value| value.parse::<usize>().ok()).and_then(|number| number.checked_sub(1))
                 .and_then(|index| input_ids.get(index).copied()).filter(|id| *id != input.id);
         }
+        if let Kind::Teleprompter(cfg) = &mut input.kind {
+            if let Some(number) = node.attribute("LiveMixPrompterAudio").and_then(|value| value.parse::<usize>().ok()) {
+                cfg.audio_source = Some(number.checked_sub(1).and_then(|n| input_ids.get(n)).copied().unwrap_or(0));
+            }
+        }
         input.ptz_address = node.attribute("LiveMixPtzAddress").unwrap_or_default().into();
+        input.hyperdeck_address = node.attribute("LiveMixHyperDeckAddress").unwrap_or_default().into();
+        input.sony_camera = node.attribute("LiveMixSonyCamera").map(str::to_owned);
+        input.hyperdeck_playlist = node.attribute("LiveMixHyperDeckPlaylist").unwrap_or_default().into();
         input.on_program = node.attribute("LiveMixOnProgram").unwrap_or_default().into();
+        input.timing = node.attribute("LiveMixTiming").and_then(|json| serde_json::from_str::<crate::timing::Source>(json).ok())
+            .map(crate::timing::Source::normalized);
         input.mirror = bool_value(node.attribute("LiveMixMirror"));
         input.sharpen = bool_value(node.attribute("LiveMixSharpen"));
         input.deinterlace = bool_value(node.attribute("LiveMixDeinterlace"));
@@ -647,6 +668,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sony_srt_listener_and_camera_binding_round_trip() {
+        let mut source = Switcher::empty();
+        source.add_dialog.kind = crate::AddKind::SonySrt;
+        source.add_dialog.sony_srt.port = 9012;
+        source.add_from_dialog().unwrap();
+        assert_eq!(source.add_dialog.sony_srt.port, 9013);
+        source.inputs[0].sony_camera = Some("D10F60149B0C".into());
+        let preset = encode(&source).unwrap();
+        let mut reopened = Switcher::empty();
+        decode(&mut reopened, Path::new("sony-fixture.livemix"), &preset).unwrap();
+        assert_eq!(reopened.inputs[0].sony_camera.as_deref(), Some("D10F60149B0C"));
+        let Kind::Device { link, .. } = &reopened.inputs[0].kind else { panic!("expected SRT input") };
+        let connection: crate::srt::Connection = serde_json::from_str(link.strip_prefix("srt:").unwrap()).unwrap();
+        assert!(connection.listen);
+        assert_eq!(connection.port, 9012);
+        source.add_dialog.sony_srt.port = 9012;
+        assert!(source.add_from_dialog().unwrap_err().contains("already belongs"));
+    }
+
+    #[test]
     fn web_input_and_picture_effects_round_trip() {
         let folder = std::env::temp_dir().join(format!("livemix-picture-fx-{}", guid().unwrap()));
         fs::create_dir(&folder).unwrap();
@@ -749,6 +790,19 @@ mod tests {
         println!("DeckLink SDK sees {} device(s)", crate::decklink::refresh_devices().len());
         s.preview = Some(s.add(title));
         write_file(&dir.join("livemix-export-test.livemix"), encode(&s).unwrap().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn vmix_volume_is_a_gain_through_the_fader_curve() {
+        let mut s = Switcher::empty();
+        let xml = r#"<XML><Version>9</Version>
+          <Input Type="100" Title="Half" VolumeF="0.0625" />
+          <Input Type="100" Title="Default" />
+        </XML>"#;
+        decode(&mut s, Path::new("volume.livemix"), xml).unwrap();
+        assert!((s.inputs[0].volume - 50.0).abs() < 0.01);
+        assert_eq!(s.inputs[1].volume, 100.0);
+        assert!(encode(&s).unwrap().contains("VolumeF=\"0.06"));
     }
 
     #[test]

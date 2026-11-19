@@ -156,7 +156,12 @@ impl App {
                 key_fill: route.key_fill,
                 ten_bit: route.ten_bit && !route.key_fill,
                 audio_channels: if route.multichannel_audio && !route.key_fill { 16 } else { 2 },
-                size: self.s.cfg.out_dims(), fps: self.s.cfg.frame_rate(), interlaced: self.s.cfg.interlaced,
+                size: self.s.cfg.out_dims(), fps: self.s.cfg.frame_rate(),
+                target_size: route.format_size.and_then(|index| OUTPUT_SIZES.get(usize::from(index))).copied()
+                    .unwrap_or_else(|| self.s.cfg.out_dims()),
+                target_fps: route.format_rate.and_then(|index| FRAME_RATES.get(usize::from(index)))
+                    .map_or_else(|| self.s.cfg.frame_rate(), |(_, fps)| *fps),
+                interlaced: route.format_rate.map_or(self.s.cfg.interlaced, |_| route.format_interlaced),
             });
             let slot = &mut self.decklink_outputs[channel];
             if slot.as_ref().map(|(cfg, _)| *cfg) != wanted {

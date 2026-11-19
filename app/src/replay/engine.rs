@@ -11,6 +11,15 @@ fn replay_omt_source(s: &Switcher, source: u32) -> Option<&str> {
     }
 }
 
+/// Input whose capture thread records this replay angle (Replay setup: Record cameras from
+/// capture). Program and inputs other than cameras are composed and read back.
+fn replay_capture_input(s: &Switcher, source: u32, failed: &std::collections::HashSet<u32>) -> Option<u32> {
+    if !s.replay_setup.direct_capture || matches!(source, SRC_OUTPUT | MV_AUTO) { return None; }
+    let id = source.checked_sub(1)?;
+    let input = s.input(id)?;
+    (matches!(&input.kind, Kind::Device { link, .. } if !link.starts_with("audio:")) && !failed.contains(&id)).then_some(id)
+}
+
 impl App {
     pub(crate) fn indexed_command(&mut self, action: replay::Action) {
         if self.replay.folder.is_none() { return; }
@@ -210,6 +219,30 @@ impl App {
         }
     }
 
+    /// Cues a quick mark on its In Point as soon as the recording it needs is readable.
+    /// While recording live the newest segment is still open, so this waits for it to close.
+    fn cue_pending_mark(&mut self, now: f64) {
+        let Some((channel, id, since)) = self.replay.pending_cue else { return };
+        let Some(event) = self.replay.session.find(id) else {
+            self.replay.pending_cue = None;
+            return;
+        };
+        let ready_until = self.replay.session.segments.last().map_or(0, |segment| segment.end);
+        if event.end <= ready_until {
+            self.replay.pending_cue = None;
+            // The player's camera may not exist in this event: use the first one that does.
+            if !event.angles[self.s.replay_cameras[channel]] {
+                if let Some(angle) = event.angles.iter().position(|&available| available) {
+                    self.s.replay_cameras[channel] = angle;
+                }
+            }
+            self.indexed_command(replay::Action::Cue(channel, id));
+            self.s.replay_live = false;
+        } else if now - since > 15.0 || (self.replay.current.is_empty() && self.replay.finalizing.is_empty()) {
+            self.replay.pending_cue = None;
+        }
+    }
+
     /// Starts the next queued highlight once the queue's channel is idle.
     fn step_replay_queue(&mut self, now: f64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -382,16 +415,22 @@ impl App {
         let options_changed = !replay.session.native
             && ((options.show_live_sources, options.advanced, options.play_to_program)
                 != (configured.show_live_sources, configured.advanced, configured.play_to_program)
-                || options.camera_folders != configured.camera_folders || options.compressed_omt != configured.compressed_omt);
+                || options.camera_folders != configured.camera_folders || options.compressed_omt != configured.compressed_omt
+                || options.fragmented_mp4 != configured.fragmented_mp4 || options.resume_on_speed != configured.resume_on_speed
+                || options.hardware_encoding != configured.hardware_encoding);
         if options_changed {
             options.show_live_sources = configured.show_live_sources;
             options.advanced = configured.advanced;
             options.play_to_program = configured.play_to_program;
             options.camera_folders.clone_from(&configured.camera_folders);
             options.compressed_omt = configured.compressed_omt;
+            options.fragmented_mp4 = configured.fragmented_mp4;
+            options.hardware_encoding = configured.hardware_encoding;
+            options.resume_on_speed = configured.resume_on_speed;
         }
         if replay.finalizing.first().is_some_and(|segment| segment.tracks.iter().all(|track| track.worker.is_finished())) {
             let segment = replay.finalizing.remove(0);
+            let mut retry_in_software = false;
             let mut files = std::array::from_fn(|_| None);
             let mut frames = std::array::from_fn(|_| Vec::new());
             let mut storage = std::array::from_fn(|_| None);
@@ -410,6 +449,7 @@ impl App {
                 } else {
                     let _ = std::fs::remove_file(file);
                     let error = track.error.lock().unwrap();
+                    retry_in_software |= segment.hardware_encoding && track.encoded && !error.is_empty();
                     self.s.replay_status = if error.is_empty() { format!("Camera {} failed to record", track.angle + 1) }
                         else { format!("Camera {}: {error}", track.angle + 1) };
                 }
@@ -418,8 +458,12 @@ impl App {
                 replay.session.segments.push(replay::Segment { start: segment.start, end: segment.end, files, frames, storage });
                 replay.session.segments.sort_by_key(|segment| segment.start);
                 changed = true;
-            } else {
+            } else if !retry_in_software {
                 self.s.replay_arm = false;
+            }
+            if retry_in_software && self.s.replay_arm && !replay.software_fallback {
+                replay.software_fallback = true;
+                self.s.replay_status.push_str(" · Replay switching to software encoding");
             }
         }
 
@@ -449,6 +493,10 @@ impl App {
                             let id = replay.mark_event(start, end, position);
                             self.s.replay_event = Some(id);
                             self.s.replay_status = format!("Event {id} marked");
+                            if matches!(command, replay::Action::MarkLast(_)) {
+                                // Quick replay: park the selected player on the new In Point.
+                                replay.pending_cue = Some((self.s.replay_channel.min(1), id, now));
+                            }
                             self.s.replay_events.clone_from(&replay.session.events);
                             changed |= !replay.provisional.contains(&id);
                         }
@@ -553,6 +601,7 @@ impl App {
                     };
                     for (index, cursor) in replay.indexed.iter_mut().enumerate() {
                         if selected(index) {
+                            replay.paused_by_speed[index] = false;
                             if let Some(cursor) = cursor { cursor.paused = !resume; }
                         }
                     }
@@ -591,7 +640,13 @@ impl App {
                 segment.start <= event.start && event.start < segment.end
                     && segment.direct_path(&folder, request.angle).is_some()
             });
-            if request.speed == 100 && !replay.sync_playback && !replay.session.native && opening.is_some() {
+            let active_segment = replay.active_readable_segment(request.angle, range.1).is_some();
+            let waiting_for_active = replay.current.iter().any(|track| track.angle == request.angle && track.readable_while_recording()
+                && replay.position(track.started) < range.1
+                && track.error.try_lock().is_ok_and(|error| error.is_empty()));
+            if request.speed == 100 && !replay.sync_playback && !replay.session.native && opening.is_some()
+                && (range.1 <= ready_until || !waiting_for_active)
+            {
                 self.s.ensure_replay_inputs();
                 replay.indexed[channel] = Some(IndexedReplay {
                     angle: request.angle, event: Some(request.event), position: range.0 as f64,
@@ -602,7 +657,7 @@ impl App {
                 replay.requested[channel] = None;
                 rotate_for_play |= range.1 > ready_until && replay.current.first()
                     .is_some_and(|track| replay.position(track.started) < range.1);
-            } else if range.1 <= ready_until {
+            } else if range.1 <= ready_until || active_segment {
                 replay.requested[channel] = None;
                 match replay.job(request.event, request.angle, request.speed, false, None) {
                     Ok(job) => {
@@ -612,6 +667,8 @@ impl App {
                     }
                     Err(error) => self.s.replay_status = error,
                 }
+            } else if waiting_for_active {
+                self.s.replay_status = "Waiting for recorded frames after the Out Point…".into();
             } else if !replay.current.is_empty() || !replay.finalizing.is_empty() {
                 rotate_for_play |= replay.current.first().is_some_and(|track| replay.position(track.started) < range.1);
                 self.s.replay_status = "Opening the recorded camera segment…".into();
@@ -675,16 +732,20 @@ impl App {
         }
         if !replay.current.is_empty() && (!self.s.replay_arm || (
             replay.finalizing.len() < 2
-                && (rotate_for_play || now - replay.current[0].started >= replay::SEGMENT_MS as f64 / 1000.0)))
+                && (rotate_for_play || (replay.current_uses_hardware && replay.software_fallback)
+                    || (replay.current_uses_hardware && replay.current.iter().any(|track|
+                        track.recording.is_some() && track.worker.is_finished()))
+                    || now - replay.current[0].started >= replay::SEGMENT_MS as f64 / 1000.0)))
         {
             let start = replay.position(replay.current[0].started);
             let origin = replay.current[0].origin;
             let tracks = replay.current.drain(..).map(|track| {
                 drop(track.direct);
-                FinalizingTrack { angle: track.angle, file: track.file, storage: track.storage,
+                FinalizingTrack { angle: track.angle, encoded: track.recording.is_some(), file: track.file, storage: track.storage,
                     error: track.error, index: track.index, worker: track.worker }
             }).collect();
-            replay.finalizing.push(FinalizingReplay { origin, start, end: position, tracks });
+            replay.finalizing.push(FinalizingReplay { origin, start, end: position, tracks,
+                hardware_encoding: replay.current_uses_hardware });
         }
 
         if self.s.replay_arm && replay.clock.is_none() {
@@ -717,8 +778,9 @@ impl App {
             let setup = &self.s.replay_setup;
             let [w, h] = setup.size.unwrap_or(self.record_format.0);
             let fps = setup.fps.unwrap_or(self.record_format.1 as f32);
+            replay.current_uses_hardware = setup.hardware_encoding && !replay.software_fallback;
             let options = media::RecOpts { mbps: setup.mbps.clamp(1, 100), size: Some((w, h)),
-                fps, hw: self.s.cfg.hw_encoder, format: media::RecordFormat::parse(&setup.codec), audio: true };
+                fps, hw: replay.current_uses_hardware, format: media::RecordFormat::parse(&setup.codec), audio: true };
             let origin = Instant::now();
             let mut seen = std::collections::HashSet::new();
             let mut unavailable = Vec::new();
@@ -726,7 +788,9 @@ impl App {
                 if source == MV_AUTO || !seen.insert(source) { continue; }
                 if source != SRC_OUTPUT && !self.s.input(source - 1).is_some_and(|input| !matches!(input.kind, Kind::Replay { .. })) { continue; }
                 let omt_source = replay_omt_source(&self.s, source);
-                let extension = if omt_source.is_some() { "mkv" } else { "mp4" };
+                let extension = if omt_source.is_some() { "mkv" }
+                    else if setup.fragmented_mp4 && matches!(options.format, media::RecordFormat::H264 | media::RecordFormat::Hevc) { "fmp4.mp4" }
+                    else { "mp4" };
                 let file = format!("camera-{}-{stamp}.{extension}", angle + 1);
                 let storage = replay::camera_storage(&setup.camera_folders[angle]).unwrap_or_else(|error| {
                     unavailable.push(format!("{} ({error})", angle + 1));
@@ -747,7 +811,7 @@ impl App {
                         0 => None,
                         1 => Some(SRC_OUTPUT),
                         n => self.s.replay_angles.get(usize::from(n - 2)).copied().filter(|&source| source != MV_AUTO),
-                    }, started: now };
+                    }, capture: replay_capture_input(&self.s, source, &replay.capture_failed), started: now };
                 let error = recording.recorder.error.clone();
                 let index = recording.recorder.replay_index.clone();
                 replay.current.push(ReplayTrack { recording: Some(recording), direct: None, started: now,
@@ -762,7 +826,25 @@ impl App {
                 self.s.replay_status = format!("Recording {} camera(s)", replay.current.len());
             }
         }
+        // Cameras recorded from their capture threads: follow the input's current reader (a
+        // camera that reopens gets a new one) and compose an angle whose source sends nothing.
+        for track in &mut replay.current {
+            let Some(recording) = &mut track.recording else { continue };
+            let Some(input) = recording.capture else { continue };
+            let shared = self.media.get(&input).and_then(|feed| feed.shared.as_ref());
+            let receiving = track.index.as_ref().is_some_and(|index| !index.lock().unwrap().is_empty());
+            if !receiving && now - track.started > 2.0 {
+                if let Some(shared) = shared { shared.remove_replay_tap(&recording.recorder); }
+                recording.capture = None;
+                replay.capture_failed.insert(input);
+                self.s.replay_status = format!("Camera {} is recorded from the Program renderer: its source sent no pictures",
+                    track.angle + 1);
+                continue;
+            }
+            if let Some(shared) = shared { shared.add_replay_tap(&recording.recorder); }
+        }
         if !self.s.replay_arm {
+            if replay.current.is_empty() { replay.capture_failed.clear(); }
             if let Some(start) = self.s.replay_live.then(|| replay.mark_in.take()).flatten().filter(|start| *start < position) {
                 if !replay.session.native {
                     let id = replay.mark_event(start, position, position);
@@ -800,9 +882,26 @@ impl App {
         }
         self.s.replay_marking = replay.mark_in.is_some();
         for channel in 0..2 {
-            if self.s.replay_speed[channel] != 0 { continue; }
+            if self.s.replay_speed[channel] != 0 {
+                if std::mem::take(&mut replay.paused_by_speed[channel]) && self.s.replay_setup.resume_on_speed {
+                    if let Some(cursor) = &mut replay.indexed[channel] {
+                        if cursor.direction != ReplayMotion::Still && cursor.take.is_none() {
+                            cursor.paused = false;
+                            for input in &mut self.s.inputs {
+                                if matches!(input.kind, Kind::Replay { channel: target, .. } if target == channel) {
+                                    input.playing = cursor.direction == ReplayMotion::Forward && cursor.seek.is_none();
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(cursor) = &mut replay.indexed[channel] {
-                if cursor.direction != ReplayMotion::Still && cursor.take.is_none() { cursor.paused = true; }
+                if cursor.direction != ReplayMotion::Still && cursor.take.is_none() && !cursor.paused {
+                    cursor.paused = true;
+                    replay.paused_by_speed[channel] = true;
+                }
             }
             for input in &mut self.s.inputs {
                 if matches!(input.kind, Kind::Replay { channel: target, .. } if target == channel) {
@@ -810,6 +909,7 @@ impl App {
                 }
             }
         }
+        self.cue_pending_mark(now);
         self.update_indexed_replay(now);
         self.publish_replay_state(now);
         let channel = usize::from(self.s.replay_channel == 1);
@@ -821,6 +921,101 @@ impl App {
                 .map_or(end, |cursor| cursor.position as u64).clamp(first.start, end);
             (first.start, end, position)
         });
+    }
+}
+
+#[test]
+fn replay_keeps_recording_after_hardware_segment_fails() {
+    let mut app = App::new(None);
+    let folder = std::env::temp_dir().join(format!("livemix-replay-recovery-{}", replay_stamp()));
+    app.s.replay_setup.folder = folder.to_string_lossy().into_owned();
+    app.s.replay_setup.hardware_encoding = true;
+    app.s.replay_load = Some(true);
+    app.update_replay(0.0);
+    app.s.replay_arm = true;
+    let worker = std::thread::spawn(|| {});
+    while !worker.is_finished() {
+        std::thread::yield_now();
+    }
+    app.replay.finalizing.push(FinalizingReplay {
+        origin: Instant::now(), start: 0, end: 100, hardware_encoding: true,
+        tracks: vec![FinalizingTrack {
+            angle: 0, encoded: true, file: "failed.mp4".into(), storage: None,
+            error: Arc::new(Mutex::new("Recording GPU failure (0x887A0005)".into())),
+            index: None, worker,
+        }],
+    });
+    app.update_replay(0.1);
+    assert!(app.s.replay_arm);
+    assert!(app.replay.software_fallback);
+    assert!(!app.replay.current_uses_hardware);
+    assert_eq!(app.replay.current.len(), 1);
+    assert!(app.s.replay_status.contains("switching to software"));
+    drop(app);
+    let _ = std::fs::remove_dir_all(folder);
+}
+
+#[test]
+#[ignore = "requires FFmpeg/FFprobe with libx264 and libx265"]
+fn replay_reads_fragmented_mp4_while_writer_is_open() {
+    for codec in ["h264", "hevc"] {
+        let mut app = App::new(None);
+        app.s.cfg = Settings::default();
+        app.s.cfg.hw_encoder = false;
+        app.s.replay_setup.fragmented_mp4 = true;
+        app.s.replay_setup.codec = codec.into();
+        let folder = std::env::temp_dir().join(format!("livemix-active-mp4-test-{}", replay_stamp()));
+        app.s.replay_setup.folder = folder.to_string_lossy().into_owned();
+        app.s.replay_load = Some(true);
+        app.record_format = ([320, 180], 25.0);
+        app.update_replay(0.0);
+        app.s.replay_arm = true;
+        app.update_replay(0.0);
+        assert_eq!(app.replay.current.len(), 1);
+        let track = &app.replay.current[0];
+        let name = track.file.clone();
+        let index = track.index.clone().unwrap();
+        let origin = track.origin;
+        let rec = track.recording.as_ref().unwrap().recorder.clone();
+        assert!(replay::fragmented_mp4(&name));
+        for frame in 0..40 {
+            rec.push_audio([100, 25, 230, 255].repeat(320 * 180), 320, 180,
+                origin + std::time::Duration::from_millis(frame * 40), audio::test_tone(1920));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(rec);
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while index.lock().unwrap().last().is_none_or(|entry| entry.1 < 1200) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let event = app.replay.mark_event(200, 880, 1560);
+        app.s.replay_command = Some(replay::Action::Play { event, program: false });
+        let deadline = Instant::now() + std::time::Duration::from_secs(8);
+        while Instant::now() < deadline {
+            app.update_replay(1.56);
+            if app.s.inputs.iter().any(|input| matches!(&input.kind, Kind::Replay { path, .. } if path.ends_with(".mp4") && !path.ends_with(&name))) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert!(app.s.inputs.iter().any(|input| matches!(&input.kind, Kind::Replay { path, .. } if path.ends_with(".mp4") && !path.ends_with(&name))),
+            "{codec}: {}", app.s.replay_status);
+        assert_eq!(app.replay.current[0].file, name, "Play rotated the live segment");
+        assert!(!app.replay.current[0].worker.is_finished());
+        let output = app.s.inputs.iter().find_map(|input| match &input.kind {
+            Kind::Replay { path, .. } if path.ends_with(".mp4") => Some(path),
+            _ => None,
+        }).unwrap();
+        let decoded = crate::stream::command().args(["-v", "error", "-xerror", "-i", output, "-map", "0:v:0",
+            "-map", "0:a:0", "-f", "null", "-"]).output().unwrap();
+        assert!(decoded.status.success(), "{}", String::from_utf8_lossy(&decoded.stderr));
+        app.s.replay_arm = false;
+        app.update_replay(2.0);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !app.replay.finalizing.is_empty() && Instant::now() < deadline {
+            app.update_replay(2.0);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.replay.finalizing.is_empty());
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }
 
@@ -935,6 +1130,61 @@ fn replay_marks_without_rotating_records_and_reopens_both_channels() {
     app.s.replay_command = Some(replay::Action::Reverse);
     app.update_replay(0.82);
     assert!(matches!(app.replay.indexed[0].as_ref().unwrap().direction, ReplayMotion::Reverse));
+    // A quick mark parks the selected player on its In Point once its recording is readable.
+    let marked = app.s.replay_events[0].clone();
+    app.s.replay_cameras[0] = 5; // an angle this event does not have
+    app.replay.pending_cue = Some((0, marked.id, 0.82));
+    app.update_replay(0.83);
+    assert!(app.replay.pending_cue.is_none(), "{}", app.s.replay_status);
+    let cursor = app.replay.indexed[0].as_ref().unwrap();
+    assert_eq!(cursor.event, Some(marked.id));
+    assert!(cursor.direction == ReplayMotion::Still, "the cue must be parked, not playing");
+    assert_eq!(cursor.position, marked.start as f64);
+    assert!(marked.angles[app.s.replay_cameras[0]], "the player must move to an angle the event has");
+    // A mark whose event disappeared, or that never becomes readable, stops waiting.
+    app.replay.pending_cue = Some((0, u64::MAX, 0.83));
+    app.update_replay(0.84);
+    assert!(app.replay.pending_cue.is_none());
     std::fs::remove_dir_all(folder).unwrap();
     std::fs::remove_dir_all(second_disk).unwrap();
+}
+
+#[test]
+fn replay_camera_from_capture_falls_back_to_the_renderer_without_pictures() {
+    let mut app = App::new(None);
+    app.s.cfg = Settings::default();
+    app.s.cfg.hw_encoder = false;
+    let folder = std::env::temp_dir().join(format!("livemix-capture-fallback-{}", replay_stamp()));
+    app.s.replay_setup.folder = folder.to_string_lossy().into_owned();
+    app.s.replay_setup.direct_capture = true;
+    app.s.replay_load = Some(true);
+    app.record_format = ([320, 180], 25.0);
+    let camera = app.s.add(Input::new(0, "Camera", Kind::Device { link: "test:camera".into(), blackmagic: false }));
+    let mic = app.s.add(Input::new(0, "Mic", Kind::Device { link: "audio:test".into(), blackmagic: false }));
+    app.update_replay(0.0);
+    app.s.replay_angles = [MV_AUTO; 8];
+    app.s.replay_angles[0] = camera + 1;
+    app.s.replay_angles[1] = mic + 1;
+    app.s.replay_angles[2] = SRC_OUTPUT;
+    app.s.replay_arm = true;
+    app.update_replay(0.0);
+    let capture = |app: &App| app.replay.current.iter()
+        .map(|track| track.recording.as_ref().and_then(|recording| recording.capture)).collect::<Vec<_>>();
+    // Only the camera is recorded from its capture thread; audio devices and Program are composed.
+    assert_eq!(capture(&app), [Some(camera), None, None]);
+    app.update_replay(1.0);
+    assert_eq!(capture(&app)[0], Some(camera));
+    // No picture arrived: the angle is composed for the rest of the session.
+    app.update_replay(2.5);
+    assert_eq!(capture(&app)[0], None);
+    assert!(app.replay.capture_failed.contains(&camera));
+    assert!(app.s.replay_status.contains("Camera 1"), "{}", app.s.replay_status);
+    app.s.replay_arm = false;
+    app.update_replay(3.0);
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !app.replay.finalizing.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.update_replay(3.0);
+    }
+    let _ = std::fs::remove_dir_all(folder);
 }

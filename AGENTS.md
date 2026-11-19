@@ -18,7 +18,7 @@ The repository root contains documentation and CI. The Rust crate is in `app/`. 
 | Mixing, capture, monitoring and per-input processing | `audio.rs`, `dsp.rs`, `mixer.rs` |
 | Physical and network I/O | `decklink.rs`, `decklink_macos.rs`, `ndi.rs`, `omt.rs`, `srt.rs`, `stream.rs` |
 | Presentation conversion and output integration tests | `slides.rs`, `livecheck.rs` |
-| Titles and operator controls | `gt.rs`, `automation.rs`, `midi.rs`, `ptz.rs` |
+| Titles and operator controls | `gt.rs`, `timing.rs`, `automation.rs`, `midi.rs`, `ptz.rs` |
 
 ## Implementation checks
 

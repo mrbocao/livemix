@@ -20,6 +20,7 @@ mod media;
 mod program;
 mod performance;
 mod gt;
+mod timing;
 mod preset;
 #[cfg(target_os = "macos")]
 #[path = "decklink_macos.rs"]
@@ -64,8 +65,12 @@ mod app;
 mod startup;
 mod disk_speed;
 mod cammatch;
+mod slowframe;
 mod outputs;
 mod desk;
+mod production_clock;
+mod hyperdeck;
+mod sony_remote;
 mod sources;
 mod mixer;
 mod settings;
@@ -79,6 +84,13 @@ use replay::ui::*;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(path) = args.iter().position(|arg| arg == "--gt-report").and_then(|at| args.get(at + 1)) {
+        // livemix --gt-report <file or folder>: list the GT features LiveMix does not support.
+        match gt::report(std::path::Path::new(path)) {
+            Ok(text) => { print!("{text}"); std::process::exit(0); }
+            Err(error) => { eprintln!("{error}"); std::process::exit(2); }
+        }
+    }
     let mut screenshot: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -352,10 +364,13 @@ struct App {
     /// Video Delay buffers, keyed by the delay input's id.
     delays: std::collections::HashMap<u32, DelayFeed>,
     audio_monitor: Option<audio::Monitor>,
+    bus_monitors: [Option<(String, Result<audio::Monitor, String>)>; 8],
     mixer: MixerControls,
     /// Recording slots 1 and 2 start and stop with Record.
     recordings: [Option<ComposedRecording>; 2],
     replay: ReplayCapture,
+    /// Live timing reads, one per GT title that has a source.
+    timing: std::collections::HashMap<u32, timing::Tracker>,
     multi_outputs: [Option<ComposedRecording>; OUTPUT_COUNT],
     multi_output_failed: [bool; OUTPUT_COUNT],
     decklink_outputs: [Option<(decklink::OutputConfig, decklink::OutputSink)>; OUTPUT_COUNT],
@@ -394,6 +409,8 @@ struct App {
     scope_jobs: std::sync::mpsc::SyncSender<program::ScopeFrame>,
     scope_images: scopes::Mailbox,
     controls: controls::Controls,
+    /// Slow-frame log, active only with LIVEMIX_SLOW_FRAMES (see slowframe.rs).
+    probe: slowframe::Probe,
 }
 
 #[derive(Default)]
@@ -420,6 +437,9 @@ struct ComposedRecording {
     channel: usize,
     route_override: Option<OutputRoute>,
     audio_override: Option<u32>,
+    /// Input whose capture thread sends the pictures (replay cameras); the update loop then
+    /// sends only the audio. None: the picture is composed and read back.
+    capture: Option<u32>,
     started: f64,
 }
 
@@ -449,8 +469,15 @@ struct ReplayTrack {
     worker: std::thread::JoinHandle<()>,
 }
 
+impl ReplayTrack {
+    fn readable_while_recording(&self) -> bool {
+        self.direct.is_some() || replay::fragmented_mp4(&self.file)
+    }
+}
+
 struct FinalizingTrack {
     angle: usize,
+    encoded: bool,
     file: String,
     storage: Option<std::path::PathBuf>,
     error: Arc<Mutex<String>>,
@@ -459,6 +486,7 @@ struct FinalizingTrack {
 }
 
 struct FinalizingReplay {
+    hardware_encoding: bool,
     origin: Instant,
     start: u64,
     end: u64,
@@ -521,6 +549,11 @@ struct ReplayCapture {
     session: replay::Session,
     clock: Option<(f64, u64)>,
     current: Vec<ReplayTrack>,
+    current_uses_hardware: bool,
+    software_fallback: bool,
+    /// Inputs that sent no pictures to a capture-thread recording: their angles are composed
+    /// and read back for the rest of the session.
+    capture_failed: std::collections::HashSet<u32>,
     finalizing: Vec<FinalizingReplay>,
     mark_in: Option<u64>,
     provisional: Vec<u64>,
@@ -533,6 +566,9 @@ struct ReplayCapture {
     queue: Option<ReplayQueue>,
     /// Highlight or clip last started on each channel.
     playing: [Option<u64>; 2],
+    /// A quick mark waiting for its recording: player, event and when it was marked.
+    pending_cue: Option<(usize, u64, f64)>,
+    paused_by_speed: [bool; 2],
 }
 
 impl ReplayCapture {
@@ -565,6 +601,21 @@ impl ReplayCapture {
         self.session.save(self.folder.as_deref().ok_or("No replay session")?)
     }
 
+    fn active_readable_segment(&self, angle: usize, end: u64) -> Option<replay::Segment> {
+        let track = self.current.iter().find(|track| track.angle == angle && track.readable_while_recording())?;
+        let start = self.position(track.started);
+        if end <= start { return None; }
+        let index = track.index.as_ref()?.try_lock().ok()?;
+        let show_time = |at: Instant| at.saturating_duration_since(track.origin).as_millis() as u64;
+        // Leave a small lead for embedded audio and avoid reading the last packet while it is being written.
+        if start.saturating_add(show_time(index.last()?.0)).saturating_sub(80) < end { return None; }
+        let mut segment = replay::Segment { start, end, ..Default::default() };
+        segment.files[angle] = Some(track.file.clone());
+        segment.storage[angle] = track.storage.clone();
+        segment.frames[angle] = index.iter().map(|&(at, media_ms)| replay::FrameStamp { show_ms: show_time(at), media_ms }).collect();
+        Some(segment)
+    }
+
     fn job(&self, event: u64, angle: usize, speed: u8, export: bool, start: Option<u64>) -> Result<ReplayJob, String> {
         let mut event = self.session.find(event)
             .filter(|event| event.angles.get(angle) == Some(&true)).ok_or("Select an angle available in this event")?;
@@ -573,7 +624,10 @@ impl ReplayCapture {
             event.start = start;
         }
         let folder = self.folder.clone().ok_or("Open a replay session first")?;
-        let segments = self.session.segments.iter().filter(|segment| segment.start < event.end && segment.end > event.start).cloned().collect::<Vec<_>>();
+        let mut segments = self.session.segments.iter()
+            .filter(|segment| segment.start < event.end && segment.end > event.start).cloned().collect::<Vec<_>>();
+        let active = (!export).then(|| self.active_readable_segment(angle, event.end)).flatten();
+        if let Some(segment) = &active { segments.push(segment.clone()); }
         let native = self.session.native;
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -591,6 +645,13 @@ impl ReplayCapture {
             let pending = target.join(format!("render-{stamp}.mp4"));
             let result = std::fs::create_dir_all(target).map_err(|error| error.to_string()).and_then(|_| {
                 if output.is_file() { return Ok(()); }
+                if let Some(segment) = &active {
+                    let name = segment.files[angle].as_deref().unwrap();
+                    if replay::fragmented_mp4(name) {
+                        let path = segment.path(&folder, angle).ok_or("Active Replay MP4 unavailable")?;
+                        replay::wait_for_mp4(&path, segment.cut_end(angle, event.end))?;
+                    }
+                }
                 replay::event_media(&folder, &segments, &event, angle, speed, &pending)?;
                 if !output.is_file() {
                     std::fs::rename(&pending, &output).or_else(|error| if output.is_file() { Ok(()) } else { Err(error) })
@@ -621,7 +682,7 @@ impl ComposedRecording {
     fn new(folder: &str, name: &str, channel: usize, started: f64, opts: media::RecOpts) -> Self {
         let path = rec_dir(folder).join(format!("{}.{}", media::recording_name(name), opts.format.extension()));
         let recorder = Arc::new(media::Recorder::start_opts(path.to_string_lossy().into_owned(), opts));
-        Self { recorder, channel, route_override: None, audio_override: None, started }
+        Self { recorder, channel, route_override: None, audio_override: None, capture: None, started }
     }
 
     fn route(&self, settings: &Settings) -> OutputRoute {
@@ -643,6 +704,8 @@ fn safe_name(s: &str) -> String {
 /// What a keyboard shortcut does (function names from the original's shortcut list).
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let screen = ctx.screen_rect().size();
+        self.probe.begin([screen.x, screen.y]);
         locale::set(ctx, self.s.cfg.language);
         if self.applied_theme != self.s.cfg.theme {
             self.applied_theme = self.s.cfg.theme;
@@ -652,6 +715,7 @@ impl eframe::App for App {
         self.performance.update(now, || {
             self.program.lock().unwrap().target.as_ref().map_or(0, program::Target::transfer_bytes)
         });
+        self.probe.mark("performance");
         let render_started = Instant::now();
         let t = ctx.input(|i| i.time);
         // Project format and performance settings used by the engine and the camera readers.
@@ -683,13 +747,18 @@ impl eframe::App for App {
         }
         automation::State::tick(&mut self.s, now);
         if let Some(remote) = &self.s.remote { remote.publish(&self.s, now); }
+        self.probe.mark("tick");
         self.handle_requests(ctx);
+        self.probe.mark("requests");
         self.update_media(ctx, video_due);
+        self.probe.mark("media");
         self.update_levels();
         if self.s.show_mixer || self.s.cfg.master_meter || self.s.cfg.mv_audio_program.contains(&true) {
             self.s.program_audio_level = audio::stereo_peaks(&self.mix_audio(SRC_OUTPUT, Instant::now(), 960));
         }
+        self.probe.mark("levels");
         self.update_recording(t);
+        self.probe.mark("recording");
         if ctx.input(|input| input.viewport().close_requested())
             && (!self.replay.current.is_empty() || !self.replay.finalizing.is_empty())
         {
@@ -698,6 +767,8 @@ impl eframe::App for App {
             self.s.replay_arm = false;
         }
         self.update_replay(t);
+        self.probe.mark("replay");
+        timing::update(&mut self.s.inputs, &mut self.timing, t);
         if self.replay.close_after_recording && self.replay.finalizing.is_empty() && self.replay.current.is_empty() {
             self.replay.close_after_recording = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -706,6 +777,19 @@ impl eframe::App for App {
         self.update_network_outputs();
         self.update_scopes(ctx, t);
         cammatch::drive(&mut self.s);
+        if let Some((id, exposure, white_balance)) = self.s.cam_match.hardware_request.take() {
+            #[cfg(windows)]
+            {
+                if let Some(shared) = self.media.get(&id).and_then(|feed| feed.shared.as_ref()) {
+                    *shared.uvc_match.lock().unwrap() = Some((exposure, white_balance));
+                } else {
+                    self.s.cam_match.status = "Camera capture is not running".into();
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = (id, exposure, white_balance);
+        }
+        self.probe.mark("outputs");
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.s.fullscreen = [false; 2];
@@ -714,11 +798,14 @@ impl eframe::App for App {
             }
         }
         self.controls.tick(ctx, &mut self.s, t);
+        self.probe.mark("controls");
 
         top_bar(ctx, &mut self.s);
         status_bar(ctx, &self.s, self.video_clock.fps, &self.performance.status);
         bottom_bar(ctx, &mut self.s, t);
+        self.probe.mark("bars");
         monitors(ctx, &mut self.s, picture_time);
+        self.probe.mark("monitors");
         if self.s.show_mixer {
             let master = self.s.program_audio_level;
             let mut monitor = self.audio_monitor.is_some();
@@ -736,7 +823,10 @@ impl eframe::App for App {
             }
         }
         self.update_audio_monitor();
+        self.update_bus_monitors();
+        self.probe.mark("mixer");
         inputs_panel(ctx, &mut self.s, picture_time);
+        self.probe.mark("inputs");
         let encoder = if self.recordings.iter().all(Option::is_none) {
             "Start recording to identify the encoder".into()
         } else {
@@ -778,6 +868,7 @@ impl eframe::App for App {
         self.last_autosave.tick(&mut self.s);
         self.controls.feedback(&self.s);
         self.audio_mixer_windows(ctx);
+        self.probe.mark("dialogs");
         for channel in 0..OUTPUT_COUNT {
             if self.s.external[channel].open {
                 output_window(ctx, &mut self.s, picture_time, channel);
@@ -790,10 +881,15 @@ impl eframe::App for App {
                 ctx.data_mut(|data| data.remove::<u32>(egui::Id::new(("fs-started", slot))));
             }
         }
-        input_preview_window(ctx, &mut self.s, picture_time);
+        let browser = self.s.input_preview.and_then(|id| self.media.get(&id))
+            .and_then(|feed| feed.shared.as_deref());
+        input_preview_window(ctx, &mut self.s, picture_time, browser);
+        self.probe.mark("windows");
 
         self.handle_screenshots(ctx, t);
         self.finish_frame(ctx, t, render_started);
+        self.probe.mark("finish");
+        self.probe.end();
         if self.s.cfg.lock_refresh {
             // Synchronize Output with Refresh Rate: draw at the screen's refresh rate.
             ctx.request_repaint();

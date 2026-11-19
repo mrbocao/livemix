@@ -403,7 +403,7 @@ pub(crate) fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32)
         ui.add_space(6.0);
         let bw = w - 28.0;
         let overlay_space = if s.cfg.show_overlays { 52.0 } else { 0.0 }
-            + if s.cfg.production_clock { 26.0 } else { 0.0 };
+            + if s.cfg.production_clock { 26.0 * crate::production_clock::rows(&s.cfg.production_clocks) as f32 } else { 0.0 };
         let bh = ((h - 6.0 - 7.0 * 6.0 - overlay_space - 70.0) / 7.0).clamp(24.0, 40.0);
         let busy = s.trans.is_some();
         if s.cfg.show_quickplay && ui
@@ -502,30 +502,7 @@ pub(crate) fn center_column(ui: &mut egui::Ui, s: &mut Switcher, w: f32, h: f32)
                 });
             }
         }
-        if s.cfg.production_clock {
-            let id = ui.make_persistent_id("production-clock");
-            let now = ui.input(|input| input.time);
-            let (mut start, mut elapsed) = ui.data(|data| data.get_temp::<(Option<f64>, f64)>(id)).unwrap_or((Some(0.0), 0.0));
-            let shown = elapsed + start.map_or(0.0, |start| (now - start).max(0.0));
-            let response = ui.add_sized([bw, 22.0], egui::Button::new(RichText::new(clock(shown)).monospace()))
-                .on_hover_text("Production Clock · click to pause or resume · right-click to reset");
-            if response.clicked() {
-                if start.is_some() {
-                    start = None;
-                    elapsed = shown;
-                } else {
-                    start = Some(now);
-                }
-            }
-            response.context_menu(|ui| {
-                if ui.button("Reset Production Clock").clicked() {
-                    elapsed = 0.0;
-                    if start.is_some() { start = Some(now); }
-                    ui.close_menu();
-                }
-            });
-            ui.data_mut(|data| data.insert_temp(id, (start, elapsed)));
-        }
+        crate::production_clock::show(ui, s, bw);
         if s.cfg.show_tbar {
             ui.add_space(4.0);
             ui.horizontal(|ui| {

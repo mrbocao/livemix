@@ -441,6 +441,17 @@ fn mix_into<'a>(inputs: impl IntoIterator<Item = (&'a crate::media::Shared, bool
     }
 }
 
+/// Fader position (0–100) → amplitude gain, like the original's audio faders and SetVolume
+/// shortcuts (`be::e` 0x06000265 @0x33050): (position / 100)⁴, so 100 = 0 dB, 50 ≈ −24 dB.
+pub fn fader_gain(position: f32) -> f32 {
+    if position >= 100.0 { 1.0 } else { (position.max(0.0) / 100.0).powi(4) }
+}
+
+/// Amplitude gain → fader position, the inverse (`be::a` 0x06000261 @0x32f68): gain^¼ × 100.
+pub fn fader_position(gain: f32) -> f32 {
+    if gain >= 1.0 { 100.0 } else { gain.max(0.0).powf(0.25) * 100.0 }
+}
+
 pub fn stereo_peaks(packet: &[Stereo]) -> [f32; 2] {
     let mut peaks = [0u16; 2];
     for &[left, right] in packet {
@@ -667,7 +678,7 @@ impl Monitor {
         let device = if name.is_empty() { host.default_output_device() } else {
             host.output_devices().map_err(|error| error.to_string())?
                 .find(|device| device.name().is_ok_and(|current| current == name))
-        }.ok_or("Headphone output device is unavailable")?;
+        }.ok_or("Selected audio output device is unavailable")?;
         let default = device.default_output_config().map_err(|e| e.to_string())?;
         let config = device.supported_output_configs().ok().and_then(|ranges| {
             ranges.filter(|range| range.channels() == default.channels() && range.sample_format() == default.sample_format())
@@ -1023,6 +1034,7 @@ impl NetworkClock {
             latest = self.video.pop_front();
         }
         if let Some((_, frame)) = latest {
+            shared.tap_frame(&frame);
             *shared.size.lock().unwrap() = (frame.w, frame.h);
             *shared.frame.lock().unwrap() = Some(frame);
             shared.seq.fetch_add(1, Relaxed);
@@ -1186,6 +1198,17 @@ mod tests {
             assert!(moved.abs() <= 1000.0 / f64::from(RATE) + 1e-9, "position stepped by {moved} ms");
             previous = clock.unwrap().ms;
         }
+    }
+
+    #[test]
+    fn faders_use_the_original_fourth_power_curve() {
+        assert_eq!(fader_gain(100.0), 1.0);
+        assert_eq!(fader_gain(120.0), 1.0);
+        assert_eq!(fader_gain(0.0), 0.0);
+        assert!((fader_gain(50.0) - 0.0625).abs() < 1e-6);
+        assert!((fader_position(0.0625) - 50.0).abs() < 1e-3);
+        assert_eq!(fader_position(1.5), 100.0);
+        assert_eq!(crate::mixer::fader_tooltip(50.0), "6% -24dB");
     }
 
     #[test]

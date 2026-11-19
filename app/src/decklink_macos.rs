@@ -207,6 +207,8 @@ fn stop_child(child: &mut Child) {
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct OutputConfig {
+    pub target_size: (u32, u32),
+    pub target_fps: f32,
     pub device: usize,
     pub key_fill: bool,
     pub ten_bit: bool,
@@ -267,7 +269,7 @@ fn output(state: &Playback, config: OutputConfig, rx: mpsc::Receiver<OutputFrame
     let modes = display_modes(config.device, true);
     let mode = modes.iter().find(|mode| mode.mode == config.mode).or_else(|| {
         modes.iter().find(|mode| {
-            (mode.w, mode.h) == config.size && (mode.fps() - f64::from(config.fps)).abs() < 0.03
+            (mode.w, mode.h) == config.target_size && (mode.fps() - f64::from(config.target_fps)).abs() < 0.03
                 && (mode.fields != "progressive") == config.interlaced
         })
     }).ok_or("Select a supported DeckLink output format or match the project format to the device.")?;

@@ -221,7 +221,10 @@ fn write_compressed(address: &str, path: &std::path::Path, origin: Instant, audi
                 mux.as_mut().unwrap().packet(track, media_ms, &bytes).map_err(|error| error.to_string())?;
                 if track == 1 {
                     video_written = true;
-                    if let Some(index) = index { index.lock().unwrap().push((stamp.max(origin), media_ms)); }
+                    if let Some(index) = index {
+                        mux.as_mut().unwrap().checkpoint().map_err(|error| error.to_string())?;
+                        index.lock().unwrap().push((stamp.max(origin), media_ms));
+                    }
                 }
             }
         }
@@ -440,10 +443,7 @@ fn omt_compressed_loopback() {
         sender.submit(frame.clone(), packet.clone());
         std::thread::sleep(Duration::from_millis(40));
     }
-    drop(recording);
-    worker.join().unwrap();
-    sender.stop();
-    assert!(error.lock().unwrap().is_empty(), "{:?}", error);
+    assert!(!worker.is_finished(), "{:?}", error);
     assert!(index.lock().unwrap().len() >= 32);
     let result = crate::stream::command().args(["-v", "error", "-xerror", "-ss", "0.50", "-i"])
         .arg(&path).args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"]).output().unwrap();
@@ -456,10 +456,16 @@ fn omt_compressed_loopback() {
     segment.frames[0] = index.iter().map(|(stamp, media_ms)| crate::replay::FrameStamp {
         show_ms: stamp.saturating_duration_since(first).as_millis() as u64, media_ms: *media_ms,
     }).collect();
+    drop(index);
     let output = path.with_extension("mp4");
     let event = crate::replay::Event { id: 1, start: 200, end: 800, speed: 50, angles: [true; 8], ..Default::default() };
     crate::replay::event_media(folder, &[segment], &event, 0, event.speed, &output).unwrap();
     assert!(std::fs::metadata(&output).unwrap().len() > 1024);
+    assert!(!worker.is_finished());
+    drop(recording);
+    worker.join().unwrap();
+    sender.stop();
+    assert!(error.lock().unwrap().is_empty(), "{:?}", error);
     std::fs::remove_file(output).unwrap();
     std::fs::remove_file(path).unwrap();
 }

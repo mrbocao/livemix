@@ -709,7 +709,9 @@ impl IDeckLinkInputCallback_Impl for CaptureCallback_Impl {
             let _ = buffer.EndAccess(1);
         }
         *self.shared.size.lock().unwrap() = (width, height);
-        *self.shared.frame.lock().unwrap() = Some(Frame { w: width, h: height, rgba });
+        let frame = Frame { w: width, h: height, rgba };
+        self.shared.tap_frame(&frame);
+        *self.shared.frame.lock().unwrap() = Some(frame);
         self.shared.seq.fetch_add(1, Ordering::Relaxed);
         self.shared.status.lock().unwrap().clear();
         S_OK
@@ -794,6 +796,8 @@ pub fn run_capture(shared: Arc<Shared>, config: CaptureConfig) {
 /// Settings of one DeckLink output.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputConfig {
+    pub target_size: (u32, u32),
+    pub target_fps: f32,
     pub device: usize,
     pub key_fill: bool,
     pub ten_bit: bool,
@@ -895,7 +899,7 @@ fn output_thread(shared: Arc<OutputShared>, config: OutputConfig) {
                 .cast()
                 .map_err(|e| format!("This DeckLink device has no playback output: {e}"))?;
             let modes = read_modes(&device, true);
-            let mode = pick_mode(&modes, config.mode, config.size, config.fps, config.interlaced)
+            let mode = pick_mode(&modes, config.mode, config.target_size, config.target_fps, config.interlaced)
                 .ok_or_else(|| "The selected DeckLink output mode is unavailable".to_string())?;
             let (width, height) = (mode.w as i32, mode.h as i32);
             if width <= 0 || height <= 0 {

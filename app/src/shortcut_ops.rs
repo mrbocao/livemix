@@ -89,7 +89,7 @@ fn has_input(op: &str) -> bool {
 
 fn has_value(op: &str) -> bool {
     matches!(op, "setgain" | "setbalance" | "setalpha" | "setccsaturation" | "setframedelay"
-        | "setposition" | "setcrop" | "setinputname" | "settext" | "setcolor" | "moveinput"
+        | "setposition" | "setcrop" | "setinputname" | "settext" | "setcolor" | "moveinput" | "settimingmode" | "settimingclass" | "titlebeginanimation"
         | "setlayer" | "layeron" | "layeroff" | "layeronoff" | "movelayer" | "audiobus" | "audiobuson"
         | "audiobusoff" | "setmultiviewoverlay" | "multiviewoverlay" | "multiviewoverlayon" | "multiviewoverlayoff")
         || op.strip_prefix("setlayer").is_some_and(|rest| {
@@ -225,6 +225,17 @@ pub fn run(
                 _ => return Err("Available audio buses are M, A and B".into()),
             };
             *bus = if op == "audiobus" { !*bus } else { op == "audiobuson" };
+        }
+        "titlebeginanimation" => {
+            let id = input(s, 0)?;
+            let page = arg(1)?.to_ascii_lowercase();
+            let number = page.strip_prefix("page").and_then(|number| number.parse::<usize>().ok()).ok_or("Use Page1, Page2…")?;
+            s.input_mut(id).unwrap().begin_gt_page(number, now)?;
+        }
+        "settimingmode" | "settimingclass" => {
+            let id = input(s, 0)?;
+            let item = s.input_mut(id).unwrap();
+            crate::timing::command(item, if op == "settimingmode" { "mode" } else { "class" }, &text(1)?)?;
         }
         "setinputname" | "settext" | "setcolor" => {
             let id = input(s, 0)?;
@@ -394,18 +405,7 @@ fn set_title_text(input: &mut Input, field: &str, value: String, now: f64) -> Re
             "sub" | "subtitle" => *sub = value,
             _ => return Err("Unknown title field".into()),
         },
-        Kind::GtTitle { texts, document: Some(document), .. } => {
-            let (field, default) = document.fields.iter().find(|(name, _)| {
-                name.eq_ignore_ascii_case(field)
-                    || field.get(..field.len().saturating_sub(5)).is_some_and(|base| base.eq_ignore_ascii_case(name))
-                        && field.to_ascii_lowercase().ends_with(".text")
-            }).ok_or("Unknown GT title field")?;
-            let previous = input.gt_change.as_ref().filter(|change| {
-                matches!(document.data_cue((now - change.started) as f32, &change.field), Some(crate::gt::Cue::DataOut(_, _)))
-            }).map_or_else(|| texts.clone(), |change| change.previous.clone());
-            if &value == default { texts.remove(field); } else { texts.insert(field.clone(), value); }
-            input.gt_change = Some(crate::gt::DataChange { started: now, field: field.clone(), previous });
-        }
+        Kind::GtTitle { document: Some(_), .. } => { input.set_gt_field(field, value, now)?; }
         _ => return Err("SetText requires a title input".into()),
     }
     Ok(())

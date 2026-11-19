@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resultspage>
+  <label type="eventname">SAMPLE GRAND PRIX</label>
+  <label type="runname">RACE - LAP 60</label>
+  <results>
+    <result position="1" no="10" fullname="ALMEIDA" class="A" lasttime="1:31.000" gap="" total_ms="5400000"/>
+    <result position="2" no="17" fullname="BARROS" class="A" lasttime="1:31.377" gap="+4.290" total_ms="5404290"/>
+    <result position="3" no="24" fullname="CARVALHO" class="B" lasttime="1:31.754" gap="+8.760" total_ms="5408760"/>
+    <result position="4" no="31" fullname="DIAS" class="A" lasttime="1:32.131" gap="+13.410" total_ms="5413410"/>
+    <result position="5" no="38" fullname="ESTEVES" class="A" lasttime="1:32.508" gap="+18.240" total_ms="5418240"/>
+    <result position="6" no="45" fullname="FARIAS" class="B" lasttime="1:31.085" gap="+21.550" total_ms="5421550"/>
+    <result position="7" no="52" fullname="GOMES" class="A" lasttime="1:31.462" gap="+26.740" total_ms="5426740"/>
+    <result position="8" no="59" fullname="HENRIQUE" class="A" lasttime="1:31.839" gap="+30.410" total_ms="5430410"/>
+    <result position="9" no="66" fullname="IGLESIAS" class="B" lasttime="1:32.216" gap="+34.260" total_ms="5434260"/>
+    <result position="10" no="73" fullname="JARDIM" class="A" lasttime="1:32.593" gap="+38.290" total_ms="5438290"/>
+    <result position="11" no="80" fullname="KRAUSE" class="A" lasttime="1:31.170" gap="+42.500" total_ms="5442500"/>
+    <result position="12" no="87" fullname="LIMA" class="B" lasttime="1:31.547" gap="+46.890" total_ms="5446890"/>
+  </results>
+</resultspage>

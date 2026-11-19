@@ -104,6 +104,13 @@ pub(crate) fn srt_connection_rows(ui: &mut egui::Ui, config: &mut srt::Connectio
         ui.text_edit_singleline(&mut config.host);
         ui.end_row();
     }
+    srt_listener_rows(ui, config, &[16, 24, 32]);
+    ui.label(tr(ui, "Stream ID"));
+    ui.add_enabled(!config.listen, egui::TextEdit::singleline(&mut config.stream_id));
+    ui.end_row();
+}
+
+pub(crate) fn srt_listener_rows(ui: &mut egui::Ui, config: &mut srt::Connection, key_sizes: &[u8]) {
     ui.label("Port");
     ui.add(egui::DragValue::new(&mut config.port).range(1..=65535));
     ui.end_row();
@@ -116,14 +123,11 @@ pub(crate) fn srt_connection_rows(ui: &mut egui::Ui, config: &mut srt::Connectio
     if !config.passphrase.is_empty() {
         ui.label(tr(ui, "Key length"));
         egui::ComboBox::from_id_salt("srt-key-bytes").selected_text(format!("{} bit", u16::from(config.key_bytes) * 8))
-            .show_ui(ui, |ui| for bytes in [16, 24, 32] {
+            .show_ui(ui, |ui| for &bytes in key_sizes {
                 ui.selectable_value(&mut config.key_bytes, bytes, format!("{} bit", u16::from(bytes) * 8));
             });
         ui.end_row();
     }
-    ui.label(tr(ui, "Stream ID"));
-    ui.add_enabled(!config.listen, egui::TextEdit::singleline(&mut config.stream_id));
-    ui.end_row();
 }
 
 pub(crate) fn stream_log(ui: &mut egui::Ui, log: &str) {
@@ -335,7 +339,30 @@ pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
                     ui.selectable_value(&mut s.cfg.ext_size, index as u8, *label);
                 }
             });
-            ui.label(if route.mode == 0 { format!("{width} × {height} · project") } else { "From selected mode".into() });
+            ui.add_enabled_ui(route.mode == 0, |ui| {
+                let label = route.format_size.and_then(|i| OUTPUT_SIZES.get(i as usize))
+                    .map_or_else(|| format!("{width} × {height} · project"), |(w,h)| format!("{w} × {h}"));
+                egui::ComboBox::from_id_salt("renderer-size").selected_text(label).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut route.format_size, None, "Project size");
+                    for (i, (w,h)) in OUTPUT_SIZES.iter().enumerate() {
+                        ui.selectable_value(&mut route.format_size, Some(i as u8), format!("{w} × {h}"));
+                    }
+                });
+            });
+            ui.end_row();
+            ui.label("Renderer Auto timing");
+            ui.label("DeckLink");
+            ui.add_enabled_ui(route.mode == 0, |ui| {
+                egui::ComboBox::from_id_salt("renderer-rate")
+                    .selected_text(route.format_rate.and_then(|i| FRAME_RATES.get(i as usize)).map_or("Project rate", |(label, _)| *label))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut route.format_rate, None, "Project rate");
+                        for (i, (label, _)) in FRAME_RATES.iter().enumerate() {
+                            ui.selectable_value(&mut route.format_rate, Some(i as u8), *label);
+                        }
+                    });
+                if route.format_rate.is_some() { ui.checkbox(&mut route.format_interlaced, "Interlaced"); }
+            });
             ui.end_row();
             ui.label("Source");
             egui::ComboBox::from_id_salt("external-source").selected_text(source_name).show_ui(ui, |ui| {
@@ -593,7 +620,8 @@ fn display_fullscreen(ui: &mut egui::Ui, s: &mut Switcher) {
     });
     ui.separator();
     setting_toggle(ui, &mut s.cfg.input_numbers, "Show Input Numbers");
-    setting_toggle(ui, &mut s.cfg.production_clock, "Show Production Clock");
+    setting_toggle(ui, &mut s.cfg.production_clock, "Show Production Clocks");
+    crate::production_clock::settings(ui, &mut s.cfg.production_clocks);
     ui.separator();
     ui.label(RichText::new("Transition Display:").strong());
     ui.horizontal_wrapped(|ui| {
@@ -816,6 +844,20 @@ pub(crate) fn settings_page(ui: &mut egui::Ui, s: &mut Switcher, graphics_adapte
                 }
             });
             ui.label(tr(ui, "The selection applies the next time headphone monitoring starts."));
+            ui.separator();
+            let devices = audio::output_devices();
+            for (index, bus) in AUDIO_BUS_NAMES.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(*bus);
+                    let selected = &mut s.cfg.bus_devices[index];
+                    let label = selected.as_deref().map_or("Off", |name| if name.is_empty() { "System default" } else { name });
+                    egui::ComboBox::from_id_salt(("bus-device", index)).selected_text(label).show_ui(ui, |ui| {
+                        ui.selectable_value(selected, None, "Off");
+                        ui.selectable_value(selected, Some(String::new()), "System default");
+                        for name in &devices { ui.selectable_value(selected, Some(name.clone()), name); }
+                    });
+                });
+            }
         }
         11 => controls.shortcuts(ui, s),
         12 => controls.activators(ui, s),
@@ -887,7 +929,20 @@ pub(crate) fn directshow_settings(ui: &mut egui::Ui, config: &mut settings_xml::
     let filters = ui.ctx().data_mut(|data| {
         data.get_temp_mut_or_insert_with(egui::Id::new("directshow-filters"), directshow::filter_names).clone()
     });
-    egui::Grid::new("directshow-decoders").spacing([16.0, 8.0]).show(ui, |ui| {
+    let property_job = ui.id().with("directshow-properties");
+    let job: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>> = ui.data_mut(|data| {
+        data.get_temp_mut_or_insert_with(property_job, || std::sync::Arc::new(std::sync::Mutex::new(None::<Result<(), String>>))).clone()
+    });
+    let busy = ui.data(|data| data.get_temp::<bool>(property_job.with("busy"))).unwrap_or(false);
+    let result = job.lock().unwrap().take();
+    if let Some(result) = result {
+        ui.data_mut(|data| {
+            data.insert_temp(property_job.with("busy"), false);
+            data.insert_temp(property_job.with("error"), result.err().unwrap_or_default());
+        });
+    }
+    if busy { ui.ctx().request_repaint_after(std::time::Duration::from_millis(200)); }
+    egui::Grid::new("directshow-decoders").num_columns(3).spacing([16.0, 8.0]).show(ui, |ui| {
         for (label, value) in [("MPEG-2 Video", &mut config.mpeg_video), ("H.264 Video", &mut config.h264_video)] {
             ui.label(label);
             let selected = if value.is_empty() { "Auto" } else { value.as_str() };
@@ -899,9 +954,18 @@ pub(crate) fn directshow_settings(ui: &mut egui::Ui, config: &mut settings_xml::
                     }
                 }
             });
+            if ui.add_enabled(!busy && !value.is_empty(), egui::Button::new("Properties")).clicked() {
+                let name = value.clone();
+                let job = job.clone();
+                ui.data_mut(|data| data.insert_temp(property_job.with("busy"), true));
+                std::thread::spawn(move || *job.lock().unwrap() = Some(directshow::filter_properties(name)));
+            }
             ui.end_row();
         }
     });
+    if let Some(error) = ui.data(|data| data.get_temp::<String>(property_job.with("error"))).filter(|error| !error.is_empty()) {
+        ui.label(error);
+    }
     ui.collapsing("Blocked Filter List", |ui| {
         let mut names = filters;
         names.extend(config.blocked.iter().cloned());

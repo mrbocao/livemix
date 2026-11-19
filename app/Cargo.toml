@@ -23,6 +23,8 @@ serde = { version = "1", features = ["derive"] }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 base64 = "0.22.1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -39,6 +41,7 @@ windows = { version = "0.58", features = [
     "Win32_Devices_Properties",
     "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
+    "Win32_System_Ole",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",

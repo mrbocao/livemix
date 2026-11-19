@@ -304,19 +304,26 @@ fn draw_raw(p: &Painter, r: Rect, inp: &Input, a: f32, t: f64, cue: Cue) {
         }
         Kind::GtTitle { document, texts, .. } => {
             if let Some(document) = document {
-                let mut cue = cue;
-                let mut values = texts;
-                if matches!(cue, Cue::Rest | Cue::In(1.0)) {
-                    if let Some(change) = &inp.gt_change {
-                        if let Some(data_cue) = document.data_cue((t - change.started).max(0.0) as f32, &change.field) {
-                            cue = data_cue;
-                            if matches!(cue, Cue::DataOut(_, _)) {
-                                values = &change.previous;
-                            }
-                        }
+                // Fields that just changed animate together, each with its own data-change cue.
+                let mut data: Vec<(Cue<'_>, &str)> = if matches!(cue, Cue::Rest | Cue::In(1.0)) {
+                    inp.gt_changes.iter().filter_map(|change| {
+                        document.data_cue((t - change.started).max(0.0) as f32, &change.field)
+                            .map(|data_cue| (data_cue, change.previous.as_str()))
+                    }).collect()
+                } else { Vec::new() };
+                if let (Some((page, started)), true) = (inp.gt_page, matches!(cue, Cue::Rest | Cue::In(1.0))) {
+                    if let Some(seconds) = document.page_seconds(page) {
+                        let age = (t - started).max(0.0) as f32;
+                        if age < seconds { data.push((Cue::Page(age / seconds, page), "")); }
                     }
                 }
-                document.draw(p, r, a, values, cue, t);
+                let offsets = match &inp.timing {
+                    Some(source) if source.enabled => {
+                        inp.timing_run.offsets(t, document.row_pitch().unwrap_or(0.0), source.slide_ms)
+                    }
+                    _ => Default::default(),
+                };
+                document.draw_with(p, r, a, texts, cue, &data, &offsets, t);
             }
         }
         Kind::Title { text, sub } => {

@@ -680,6 +680,13 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                                 network_thumbnail_grid(ui, d);
                             }
                         }
+                        AddKind::SonySrt => {
+                            ui.label("Set the camera to SRT Caller. Enter this computer’s LAN IP as the destination and use the same UDP port.");
+                            s.add_dialog.sony_srt.listen = true;
+                            egui::Grid::new("sony-srt-input").spacing([12.0, 6.0]).show(ui, |ui| {
+                                srt_listener_rows(ui, &mut s.add_dialog.sony_srt, &[16, 32]);
+                            });
+                        }
                         AddKind::StreamSrt => {
                             egui::Grid::new("srt-input-connection").spacing([12.0, 6.0]).show(ui, |ui| {
                                 srt_connection_rows(ui, &mut s.add_dialog.srt);
@@ -759,7 +766,11 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                             ui.label(RichText::new("The Telestrator is a transparent drawing layer. Add it as an Overlay over Program; draw from the Web Controller page or from Input Settings.")
                                 .size(11.0).color(TEXT_DIM));
                         }
-                        AddKind::Camera | AddKind::AudioInput => {
+                        AddKind::Camera | AddKind::HyperDeck | AddKind::AudioInput => {
+                            if s.add_dialog.kind == AddKind::HyperDeck {
+                                ui.label("HyperDeck IP address");
+                                ui.add(egui::TextEdit::singleline(&mut s.add_dialog.path).char_limit(45));
+                            }
                             let list = s.dialog_devices();
                             if s.add_dialog.kind == AddKind::Camera && list.iter().any(|device| device.blackmagic) {
                                 let ok = media::blackmagic_driver_installed();
@@ -801,7 +812,7 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                                     decklink_mode_picker(ui, "add-decklink-mode", device, false, &mut s.add_dialog.decklink_mode);
                                 });
                             }
-                            if s.add_dialog.kind == AddKind::Camera {
+                            if matches!(s.add_dialog.kind, AddKind::Camera | AddKind::HyperDeck) {
                                 let link = list.get(s.add_dialog.device).map(|d| d.link.clone())
                                     .filter(|link| decklink::device_index(link).is_none());
                                 camera_mode_section(ui, &mut s.add_dialog, link);
@@ -979,7 +990,7 @@ pub(crate) fn dialogs(ctx: &egui::Context, s: &mut Switcher, graphics_adapter: &
                                 10 => input_ptz(ui, inp),
                                 11 => input_advanced(ui, inp, number),
                                 12 => input_telestrator(ui, inp, &all, t, output, web),
-                                13 => input_teleprompter(ui, inp, &mut browse_script),
+                                13 => input_teleprompter(ui, inp, &all, &mut browse_script),
                                 _ => {
                                     ui.label(RichText::new("This section of the original is not available in this version yet.").color(TEXT_DIM));
                                 }

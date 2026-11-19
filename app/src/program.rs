@@ -18,6 +18,8 @@ pub struct Target {
     readback_bytes: u64,
     readback_frames: u64,
     ndi_pack: Option<Result<NdiPack, String>>,
+    #[cfg(windows)]
+    nv12_pack: Option<Result<NdiPack, String>>,
     gpu_scopes: Option<Result<crate::scopes::Gpu, String>>,
     #[cfg(windows)]
     dx_bridge: Option<Result<crate::dx_interop::Bridge, String>>,
@@ -35,6 +37,7 @@ struct Readback {
     captured_at: Instant,
     destinations: Destinations,
     uyvy: bool,
+    nv12: bool,
 }
 
 #[derive(Clone, Default)]
@@ -95,9 +98,40 @@ void main() {
 }
 "#;
 
+#[cfg(windows)]
+const NV12_FRAGMENT: &str = r#"
+#version 330 core
+uniform sampler2D picture;
+out vec4 packed_frame;
+const vec3 weights = vec3(0.2126, 0.7152, 0.0722);
+float luma(ivec2 p) {
+    return 16.0 + 219.0 * dot(texelFetch(picture, p, 0).rgb, weights);
+}
+vec2 chroma(ivec2 p) {
+    vec3 rgb = (texelFetch(picture, p, 0).rgb +
+                texelFetch(picture, p + ivec2(1, 0), 0).rgb +
+                texelFetch(picture, p + ivec2(0, 1), 0).rgb +
+                texelFetch(picture, p + ivec2(1, 1), 0).rgb) * 0.25;
+    float y = dot(rgb, weights);
+    return 128.0 + 112.0 * (rgb.br - y) / (1.0 - weights.br);
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    p.x *= 4;
+    int height = textureSize(picture, 0).y;
+    if (p.y < height) {
+        packed_frame = vec4(luma(p), luma(p + ivec2(1, 0)),
+                            luma(p + ivec2(2, 0)), luma(p + ivec2(3, 0))) / 255.0;
+    } else {
+        p.y = (p.y - height) * 2;
+        packed_frame = vec4(chroma(p), chroma(p + ivec2(2, 0))) / 255.0;
+    }
+}
+"#;
+
 impl NdiPack {
-    unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
-        let shader = link(gl, PACK_VERTEX, PACK_FRAGMENT)?;
+    unsafe fn new(gl: &glow::Context, fragment: &str) -> Result<Self, String> {
+        let shader = link(gl, PACK_VERTEX, fragment)?;
         let framebuffer = gl.create_framebuffer().map_err(|e| { gl.delete_program(shader); e })?;
         let texture = gl.create_texture().map_err(|e| {
             gl.delete_framebuffer(framebuffer);
@@ -108,12 +142,12 @@ impl NdiPack {
         Ok(Self { framebuffer, texture, shader, coefficients, size: [0, 0] })
     }
 
-    unsafe fn pack(&mut self, gl: &glow::Context, source: glow::Texture, [w, h]: [u32; 2]) -> bool {
-        let size = [w / 2, h];
+    unsafe fn pack(&mut self, gl: &glow::Context, source: glow::Texture, size: [u32; 2], source_height: u32) -> bool {
+        let [w, h] = size;
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
         if size != self.size {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
-            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, size[0] as i32, h as i32,
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w as i32, h as i32,
                 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.texture), 0);
             if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
@@ -121,19 +155,19 @@ impl NdiPack {
             }
             self.size = size;
         }
-        gl.viewport(0, 0, size[0] as i32, h as i32);
+        gl.viewport(0, 0, w as i32, h as i32);
         gl.disable(glow::SCISSOR_TEST);
         // The alpha channel is the second pixel's luma, so it must not blend.
         let blending = gl.is_enabled(glow::BLEND);
         gl.disable(glow::BLEND);
         gl.use_program(Some(self.shader));
-        let [r, g, b] = if h >= 720 { [0.2126, 0.7152, 0.0722] } else { [0.299, 0.587, 0.114] };
+        let [r, g, b] = if source_height >= 720 { [0.2126, 0.7152, 0.0722] } else { [0.299, 0.587, 0.114] };
         gl.uniform_3_f32(self.coefficients.as_ref(), r, g, b);
         gl.bind_texture(glow::TEXTURE_2D, Some(source));
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
         if blending { gl.enable(glow::BLEND); }
         gl.enable(glow::SCISSOR_TEST);
-        true
+        gl.get_error() == glow::NO_ERROR
     }
 }
 
@@ -228,6 +262,8 @@ impl Target {
             framebuffer, color, shader, vao, vertices, indices, size_uniform, size: [0, 0],
             readbacks: VecDeque::new(), free_buffers: Vec::new(), cpu_frames: Vec::new(), ndi_pack: None,
             gpu_scopes: None,
+            #[cfg(windows)]
+            nv12_pack: None,
             readback_bytes: 0,
             readback_frames: 0,
             #[cfg(windows)]
@@ -272,8 +308,17 @@ impl Target {
             }
         }
         let frame = Arc::new(source.to_vec());
-        let reserved: usize = self.cpu_frames.iter().map(|bytes| bytes.capacity()).sum();
-        if self.cpu_frames.len() < 4 && reserved + frame.capacity() <= 96 * 1024 * 1024 {
+        // Each output (up to eight replay cameras plus the Program sinks) keeps a full recording
+        // queue, the frame being encoded and this one, so every recording reuses buffers instead
+        // of allocating a frame each time. Outputs of different layouts (NV12 and BGRA) share it.
+        let slots = (crate::media_common::RECORD_QUEUE_FRAMES + 2) * (crate::model::OUTPUT_COUNT + 1);
+        const BUDGET: usize = 512 * 1024 * 1024;
+        let reserved = |frames: &[Arc<Vec<u8>>]| frames.iter().map(|bytes| bytes.capacity()).sum::<usize>();
+        // Over budget, free slots of another size (the Output Size changed) are released first.
+        if self.cpu_frames.len() >= slots || reserved(&self.cpu_frames) + frame.capacity() > BUDGET {
+            self.cpu_frames.retain(|slot| slot.len() == source.len() || Arc::strong_count(slot) > 1);
+        }
+        if self.cpu_frames.len() < slots && reserved(&self.cpu_frames) + frame.capacity() <= BUDGET {
             self.cpu_frames.push(Arc::clone(&frame));
         }
         frame
@@ -297,7 +342,7 @@ impl Target {
                 break;
             }
             let [w, h] = frame.size.map(|n| n as usize);
-            let len = w * h * if frame.uyvy { 2 } else { 4 };
+            let len = if frame.nv12 { w * h * 3 / 2 } else { w * h * if frame.uyvy { 2 } else { 4 } };
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
             let data = gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT);
             if data.is_null() {
@@ -307,6 +352,12 @@ impl Target {
             }
             let pixels = self.copy_readback(std::slice::from_raw_parts(data, len));
             gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+            #[cfg(windows)]
+            if frame.nv12 {
+                crate::media::Recorder::push_nv12_group(&frame.destinations.recorders, pixels, frame.size,
+                    frame.captured_at, frame.destinations.audio);
+                continue;
+            }
             for (_, sink, audio) in &frame.destinations.decklinks {
                 sink.submit(Arc::clone(&pixels), w, h, audio.clone());
             }
@@ -358,7 +409,8 @@ impl Target {
     ) -> Result<(), String> {
         let gl = painter.gl();
         let [width, height] = size.map(|dimension| dimension as i32);
-        if self.readbacks.len() >= 2 * crate::model::OUTPUT_COUNT {
+        // Several frames in flight for every output, including all eight replay cameras.
+        if self.readbacks.len() >= 4 * crate::model::OUTPUT_COUNT {
             for recorder in &destinations.recorders { recorder.note_dropped_frames(1); }
             return Ok(());
         }
@@ -450,15 +502,29 @@ impl Target {
         };
         gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer.id));
         let uyvy = width % 2 == 0 && destinations.only_ndi() && self.ndi_pack
-            .get_or_insert_with(|| NdiPack::new(gl)).as_mut().is_ok_and(|target| target.pack(gl, self.color, size));
-        if !uyvy { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer)); }
-        let read_width = if uyvy { width / 2 } else { width };
-        let len = read_width * height * 4;
+            .get_or_insert_with(|| NdiPack::new(gl, PACK_FRAGMENT)).as_mut()
+            .is_ok_and(|target| target.pack(gl, self.color, [size[0] / 2, size[1]], size[1]));
+        #[cfg(windows)]
+        let nv12 = width % 4 == 0 && height % 2 == 0
+            && !destinations.recorders.is_empty() && destinations.recorders.iter().all(|r| r.accepts_nv12(size))
+            && destinations.decklinks.is_empty() && destinations.streams.is_empty() && destinations.ndi.is_empty()
+            && destinations.omt.is_empty() && destinations.scope.is_none()
+            && self.nv12_pack.get_or_insert_with(|| NdiPack::new(gl, NV12_FRAGMENT)).as_mut()
+                .is_ok_and(|target| target.pack(gl, self.color, [size[0] / 4, size[1] * 3 / 2], size[1]));
+        #[cfg(not(windows))]
+        let nv12 = false;
+        if !uyvy && !nv12 { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer)); }
+        let (read_width, read_height, read_format) = if nv12 {
+            (width / 4, height * 3 / 2, glow::RGBA)
+        } else {
+            (if uyvy { width / 2 } else { width }, height, glow::BGRA)
+        };
+        let len = read_width * read_height * 4;
         if buffer.bytes != len {
             gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, len, glow::STREAM_READ);
             buffer.bytes = len;
         }
-        gl.read_pixels(0, 0, read_width, height, glow::BGRA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
+        gl.read_pixels(0, 0, read_width, read_height, read_format, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
         if gl.get_error() != glow::NO_ERROR {
             gl.delete_buffer(buffer.id);
             return Err("OpenGL could not read the Program framebuffer".into());
@@ -470,7 +536,7 @@ impl Target {
                 return Err(error);
             }
         };
-        self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone(), uyvy });
+        self.readbacks.push_back(Readback { buffer, fence, size, captured_at, destinations: destinations.clone(), uyvy, nv12 });
         self.readback_bytes = self.readback_bytes.saturating_add(len as u64);
         self.readback_frames = self.readback_frames.saturating_add(1);
         gl.flush();
@@ -492,7 +558,11 @@ impl Target {
             gl.delete_buffer(buffer.id);
         }
         if let Some(Ok(scopes)) = self.gpu_scopes { scopes.destroy(gl); }
-        if let Some(Ok(pack)) = self.ndi_pack {
+        #[cfg(windows)]
+        let packs = [self.ndi_pack, self.nv12_pack];
+        #[cfg(not(windows))]
+        let packs = [self.ndi_pack];
+        for pack in packs.into_iter().flatten().flatten() {
             gl.delete_framebuffer(pack.framebuffer);
             gl.delete_texture(pack.texture);
             gl.delete_program(pack.shader);

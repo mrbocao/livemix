@@ -8,6 +8,8 @@ pub(crate) mod ui;
 
 const MANIFEST: &str = "livemix-replay.json";
 pub const SEGMENT_MS: u64 = 4_000;
+
+pub(crate) fn fragmented_mp4(path: &str) -> bool { path.ends_with(".fmp4.mp4") }
 const STORAGE_DIR: &str = "LiveMix Replay";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,6 +18,8 @@ pub struct Setup {
     pub folder: String,
     pub camera_folders: [String; 8],
     pub compressed_omt: bool,
+    pub fragmented_mp4: bool,
+    pub hardware_encoding: bool,
     pub size: Option<[u32; 2]>,
     pub fps: Option<f32>,
     pub mbps: u32,
@@ -28,13 +32,17 @@ pub struct Setup {
     pub show_live_sources: bool,
     pub advanced: bool,
     pub play_to_program: bool,
+    pub resume_on_speed: bool,
+    /// Record camera angles from their capture threads instead of composing and reading
+    /// them back from the GPU. Off in older sessions.
+    pub direct_capture: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Self { folder: String::new(), camera_folders: Default::default(), compressed_omt: false, size: None, fps: None, mbps: 25, codec: "h264".into(),
+        Self { folder: String::new(), camera_folders: Default::default(), compressed_omt: false, fragmented_mp4: false, hardware_encoding: false, size: None, fps: None, mbps: 25, codec: "h264".into(),
             audio: 0, buffer_seconds: 120, delete_old: true, transition_ms: 0, match_speed: false,
-            show_live_sources: false, advanced: false, play_to_program: false }
+            show_live_sources: false, advanced: false, play_to_program: false, resume_on_speed: false, direct_capture: false }
     }
 }
 
@@ -103,7 +111,7 @@ impl Segment {
         self.start.saturating_add(position).min(self.end)
     }
 
-    fn cut_end(&self, angle: usize, time: u64) -> u64 {
+    pub(crate) fn cut_end(&self, angle: usize, time: u64) -> u64 {
         let show = time.saturating_sub(self.start);
         let Some(frames) = self.frames.get(angle).filter(|frames| !frames.is_empty()) else { return show; };
         let first = frames.partition_point(|frame| frame.show_ms < show);
@@ -503,6 +511,25 @@ impl NativeRemux {
                 String::from_utf8_lossy(&result.stderr).lines().last().unwrap_or("unknown MPEG error")));
         }
         Ok(target)
+    }
+}
+
+/// The audio/video input index advances before the FFmpeg muxer commits its output.
+pub(crate) fn wait_for_mp4(path: &Path, end_ms: u64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let probe = crate::audio::ffprobe_command().args(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1"]).arg(path).output()
+            .map_err(|error| format!("Fragmented Replay needs FFprobe: {error}"))?;
+        if probe.status.success() && String::from_utf8_lossy(&probe.stdout).trim().parse::<f64>()
+            .is_ok_and(|seconds| seconds.is_finite() && seconds * 1000.0 + 0.01 >= end_ms as f64)
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Replay MP4 has not published video through the Out Point".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
     }
 }
 

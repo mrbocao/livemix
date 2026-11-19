@@ -230,6 +230,72 @@ fn start_reader(src: Source, paused: bool, gpu_playback: bool) -> Arc<Shared> {
     sh
 }
 
+fn picture_bytes(dims: &Dims) -> usize { dims.w * dims.h * 4 }
+
+/// Decoded pictures of one file, each with the timestamp of the picture decoded just before
+/// it in the same run, so a lookup only answers when no frame between them was skipped.
+struct StepCache<T> {
+    frames: std::collections::VecDeque<(i64, Option<i64>, T, usize)>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl<T> Default for StepCache<T> {
+    fn default() -> Self { Self { frames: Default::default(), bytes: 0, budget: 256 * 1024 * 1024 } }
+}
+
+impl<T> StepCache<T> {
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn push(&mut self, ts: i64, previous: Option<i64>, picture: T, bytes: usize) {
+        if let Some(entry) = self.frames.iter_mut().find(|entry| entry.0 == ts) {
+            // A later run may know the frame before it; keep that link.
+            entry.1 = entry.1.or(previous);
+            return;
+        }
+        self.frames.push_back((ts, previous, picture, bytes));
+        self.bytes += bytes;
+        // The oldest runs go first: they hold the frames already shown.
+        while self.bytes > self.budget && self.frames.len() > 1 {
+            if let Some((_, _, _, freed)) = self.frames.pop_front() { self.bytes -= freed; }
+        }
+    }
+
+    /// The picture a precise seek to `target` would show: the first frame at or after it,
+    /// when the frame decoded before it lies before the target.
+    fn find(&self, target: i64) -> Option<(i64, &T)> {
+        self.frames.iter().filter(|(ts, previous, _, _)| *ts >= target && previous.is_some_and(|previous| previous < target))
+            .min_by_key(|(ts, ..)| *ts).map(|(ts, _, picture, _)| (*ts, picture))
+    }
+}
+
+#[test]
+fn step_cache_answers_backward_steps_inside_a_decoded_run() {
+    let mut cache = StepCache { budget: 4, ..StepCache::default() };
+    // A seek decoded 0, 400_000 and 800_000 (100 ns units) on the way to 1_200_000.
+    let mut previous = None;
+    for ts in [0, 400_000, 800_000, 1_200_000] {
+        cache.push(ts, previous, ts, 1);
+        previous = Some(ts);
+    }
+    assert_eq!(cache.find(800_000).map(|(ts, _)| ts), Some(800_000));
+    assert_eq!(cache.find(700_000).map(|(ts, _)| ts), Some(800_000));
+    assert_eq!(cache.find(400_000).map(|(ts, _)| ts), Some(400_000));
+    // The keyframe has no known frame before it: the decoder has to seek.
+    assert_eq!(cache.find(0), None);
+    assert_eq!(cache.find(1_300_000), None);
+    // Over budget, the oldest picture is released.
+    cache.push(1_600_000, Some(1_200_000), 1_600_000, 1);
+    assert_eq!(cache.frames.len(), 4);
+    assert_eq!(cache.frames.front().map(|entry| entry.0), Some(400_000));
+    assert_eq!(cache.find(1_400_000).map(|(ts, _)| ts), Some(1_600_000));
+    cache.clear();
+    assert_eq!(cache.find(800_000), None);
+}
+
 unsafe fn gpu_picture(sample: &IMFSample, dims: &Dims) -> Res<crate::dx_interop::Picture> {
     use windows::Win32::Graphics::Direct3D11::*;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM};
@@ -388,6 +454,43 @@ unsafe fn open(src: &Source, manager: Option<&IMFDXGIDeviceManager>, sh: &Shared
     };
     let dims = configure(&reader, dev)?;
     Ok((reader, dims))
+}
+
+unsafe fn apply_uvc_match(reader: &IMFSourceReader, exposure: f32, wb: f32) -> String {
+    use windows::Win32::Media::DirectShow::{IAMCameraControl, IAMVideoProcAmp, CameraControl_Exposure,
+        CameraControl_Flags_Manual, VideoProcAmp_WhiteBalance, VideoProcAmp_Flags_Manual};
+    unsafe fn control<T: Interface>(reader: &IMFSourceReader) -> windows::core::Result<T> {
+        let mut ptr = std::ptr::null_mut();
+        reader.GetServiceForStream(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &GUID::zeroed(), &T::IID, &mut ptr)?;
+        if ptr.is_null() { return Err(windows::core::Error::from(E_FAIL)); }
+        Ok(T::from_raw(ptr))
+    }
+    let nearest = |value: f32, min: i32, max: i32, step: i32| {
+        let step = step.max(1) as f32;
+        (min as f32 + ((value - min as f32) / step).round() * step).clamp(min as f32, max.max(min) as f32) as i32
+    };
+    let exposure = (|| -> windows::core::Result<i32> {
+        let camera = control::<IAMCameraControl>(reader)?;
+        let (mut value, mut flags, mut min, mut max, mut step, mut default, mut caps) = (0,0,0,0,0,0,0);
+        camera.Get(CameraControl_Exposure.0, &mut value, &mut flags)?;
+        camera.GetRange(CameraControl_Exposure.0, &mut min, &mut max, &mut step, &mut default, &mut caps)?;
+        let result = nearest(value as f32 + exposure, min, max, step);
+        if result != value { camera.Set(CameraControl_Exposure.0, result, CameraControl_Flags_Manual.0)?; }
+        Ok(result)
+    })();
+    let wb = (|| -> windows::core::Result<i32> {
+        let camera = control::<IAMVideoProcAmp>(reader)?;
+        let (mut value, mut flags, mut min, mut max, mut step, mut default, mut caps) = (0,0,0,0,0,0,0);
+        camera.Get(VideoProcAmp_WhiteBalance.0, &mut value, &mut flags)?;
+        camera.GetRange(VideoProcAmp_WhiteBalance.0, &mut min, &mut max, &mut step, &mut default, &mut caps)?;
+        if value <= 0 { return Err(windows::core::Error::from(E_FAIL)); }
+        let kelvin = 1.0e6 / (1.0e6 / value as f32 - wb).clamp(60.0, 500.0);
+        let result = nearest(kelvin, min, max, step);
+        if result != value { camera.Set(VideoProcAmp_WhiteBalance.0, result, VideoProcAmp_Flags_Manual.0)?; }
+        Ok(result)
+    })();
+    format!("USB camera: {} · {}", exposure.map_or_else(|e| format!("exposure unavailable ({e})"), |v| format!("exposure 2^{v} s")),
+        wb.map_or_else(|e| format!("white balance unavailable ({e})"), |v| format!("white balance {v} K")))
 }
 
 unsafe fn open_reader(src: &Source, attrs: &IMFAttributes) -> Res<IMFSourceReader> {
@@ -587,8 +690,8 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
         return;
     }
     let is_file = matches!(src, Source::File(_));
-    // Capture devices keep their existing driver path. File readers can use DXVA.
-    let mut manager = if is_file {
+    let gpu_source = is_file || (matches!(src, Source::Device(..)) && sh.gpu_playback.load(Ordering::Acquire));
+    let mut manager = if gpu_source {
         unsafe { video_device_manager().ok() }
     } else {
         None
@@ -604,6 +707,12 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
     let mut seek_to = None;
     let mut needs_picture = true;
     let mut last_decoder_gpu = None;
+    // Reverse and jog on a replay file: pictures decoded on the way to an earlier frame are
+    // kept on the GPU, so the following backward steps are shown without another seek.
+    let mut steps = StepCache::<crate::dx_interop::Picture>::default();
+    let mut stepping_back = false;
+    let mut previous_ts: Option<i64> = None;
+    let mut reposition: Option<i64> = None;
     while !sh.stop.load(Ordering::Relaxed) {
         if sh.restart.swap(false, Ordering::Relaxed) {
             need_open = true;
@@ -613,6 +722,10 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
         }
         if need_open {
             reader = None;
+            steps.clear();
+            stepping_back = false;
+            previous_ts = None;
+            reposition = None;
             let r = unsafe {
                 open(&src, manager.as_ref().map(|(manager, _)| manager), &sh).or_else(|e| {
                     if manager.take().is_some() { open(&src, None, &sh) } else { Err(e) }
@@ -628,7 +741,7 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
                             sh.dur_ms.store(ticks / 10_000, Ordering::Relaxed);
                         }
                     }
-                    *sh.video_adapter.lock().unwrap() = if is_file {
+                    *sh.video_adapter.lock().unwrap() = if gpu_source {
                         Some(manager.as_ref().map_or_else(|| "System-memory reader".into(), |(_, name)| name.clone()))
                     } else { None };
                     if let Some(ts) = resume_at {
@@ -661,6 +774,31 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
                 let margin = if sh.precise_seek.load(Ordering::Relaxed) { 1 } else { 50 };
                 let ms = if duration > 0 { ms.min(duration.saturating_sub(margin)) } else { ms };
                 let ts = (ms.min(i64::MAX as u64 / 10_000) * 10_000) as i64;
+                let cacheable = gpu_source && sh.precise_seek.load(Ordering::Relaxed)
+                    && sh.gpu_playback.load(Ordering::Acquire) && !sh.cpu_frames_required.load(Ordering::Acquire);
+                let backward = cacheable && last_frame_ts.is_some_and(|last| ts < last);
+                if !cacheable { steps.clear(); }
+                if let Some((frame_ts, picture)) = backward.then(|| steps.find(ts)).flatten() {
+                    // The decoder stays where it is; it moves to this frame before reading on.
+                    *sh.frame.lock().unwrap() = None;
+                    *sh.gpu_frame.lock().unwrap() = Some(crate::dx_interop::Picture {
+                        surface: crate::dx_interop::Surface(picture.surface.0.clone()), size: picture.size });
+                    crate::audio::reset_position(&sh);
+                    sh.pos_ms.store((frame_ts / 10_000).max(0) as u64, Ordering::Relaxed);
+                    crate::audio::mark_position(&sh, frame_ts.max(0) as f64 / 10_000.0);
+                    sh.ended.store(false, Ordering::Relaxed);
+                    sh.seq.fetch_add(1, Ordering::Release);
+                    needs_picture = false;
+                    last_frame_ts = Some(frame_ts);
+                    seek_to = None;
+                    resume_at = None;
+                    reposition = Some(frame_ts);
+                    continue;
+                }
+                if !backward { steps.clear(); }
+                stepping_back = backward;
+                previous_ts = None;
+                reposition = None;
                 if let Some(r) = &reader {
                     match unsafe { r.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(ts)) } {
                         Ok(()) => {
@@ -702,6 +840,21 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
             }
         }
         let Some(r) = reader.as_ref() else { continue };
+        if let Some(frame_ts) = reposition.take() {
+            // Playback continues after a picture from the step cache: read on from that frame.
+            if unsafe { r.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(frame_ts)) }.is_ok() {
+                crate::audio::reset_position(&sh);
+                resume_at = Some(frame_ts);
+                base_ts = -1;
+                previous_ts = None;
+                stepping_back = false;
+            }
+        }
+        if matches!(src, Source::Device(..)) {
+            if let Some((exposure, wb)) = sh.uvc_match.lock().unwrap().take() {
+                sh.set_status(unsafe { apply_uvc_match(r, exposure, wb) });
+            }
+        }
         let mut flags = 0u32;
         let mut ts = 0i64;
         let mut sample: Option<IMFSample> = None;
@@ -745,6 +898,12 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
         let Some(s) = sample else { continue };
         if is_file {
             if seek_to.is_some_and(|target| ts < target) {
+                if stepping_back && dims.w > 0 && dims.h > 0 {
+                    if let Ok(picture) = unsafe { gpu_picture(&s, &dims) } {
+                        steps.push(ts, previous_ts, picture, picture_bytes(&dims));
+                    }
+                }
+                previous_ts = Some(ts);
                 continue;
             }
             if resume_at.is_some_and(|last| ts <= last) {
@@ -768,12 +927,19 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
             continue;
         }
         let key = sh.key.load(Ordering::Relaxed);
-        if is_file && sh.gpu_playback.load(Ordering::Acquire) && !sh.cpu_frames_required.load(Ordering::Acquire) {
+        if gpu_source && sh.gpu_playback.load(Ordering::Acquire) && !sh.cpu_frames_required.load(Ordering::Acquire) {
             if let Ok(picture) = unsafe { gpu_picture(&s, &dims) } {
                 if last_decoder_gpu != Some(true) {
                     *sh.decoder.lock().unwrap() = "Media Foundation · D3D11 texture".into();
                     last_decoder_gpu = Some(true);
                 }
+                if stepping_back && is_file {
+                    steps.push(ts, previous_ts, crate::dx_interop::Picture {
+                        surface: crate::dx_interop::Surface(picture.surface.0.clone()), size: picture.size,
+                    }, picture_bytes(&dims));
+                    stepping_back = false;
+                }
+                previous_ts = Some(ts);
                 *sh.frame.lock().unwrap() = None;
                 *sh.gpu_frame.lock().unwrap() = Some(picture);
                 sh.seq.fetch_add(1, Ordering::Release);
@@ -784,13 +950,15 @@ fn run(sh: Arc<Shared>, src: Source, fallback: Option<(u8, bool)>) {
             }
         }
         if let Ok(rgba) = unsafe { copy_sample(&s, &dims, key) } {
-            if is_file && last_decoder_gpu != Some(false) {
+            if gpu_source && last_decoder_gpu != Some(false) {
                 *sh.decoder.lock().unwrap() = "Media Foundation · system memory".into();
                 last_decoder_gpu = Some(false);
             }
             *sh.gpu_frame.lock().unwrap() = None;
             needs_picture = false;
-            *sh.frame.lock().unwrap() = Some(Frame { w, h, rgba });
+            let frame = Frame { w, h, rgba };
+            sh.tap_frame(&frame);
+            *sh.frame.lock().unwrap() = Some(frame);
             sh.seq.fetch_add(1, Ordering::Relaxed);
             last_frame_ts = Some(ts);
             seek_to = None;
@@ -814,7 +982,33 @@ impl RecordFormat {
     }
 }
 
-unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Option<&IMFDXGIDeviceManager>) -> Res<(IMFSinkWriter, u32, Option<u32>)> {
+/// AAC rate for the Windows encoder, like the original's MP4 writer (`ka::.ctor` 0x0600222d
+/// @0xe29e4): the Audio Bit Rate is capped at 192 Kbps and written as Kbps × 125 bytes/s.
+pub(crate) fn aac_bytes_per_second(kbps: u32) -> u32 {
+    kbps.min(192) * 125
+}
+
+/// Keyframe interval of replay segments: half a second, so a cue, jog or reverse step
+/// decodes at most that many frames.
+pub(crate) fn replay_gop(fps: f32) -> u32 {
+    if fps.is_finite() && fps > 0.0 { ((fps / 2.0).round() as u32).clamp(1, 60) } else { 15 }
+}
+
+/// Encoder properties for replay segments, applied through the sink writer: short GOP,
+/// no B-frames and low-latency mode.
+unsafe fn replay_encoding(fps: f32) -> Res<IMFAttributes> {
+    let mut a: Option<IMFAttributes> = None;
+    MFCreateAttributes(&mut a, 3)?;
+    let a = a.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+    a.SetUINT32(&CODECAPI_AVEncMPVGOPSize, replay_gop(fps))?;
+    a.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0)?;
+    a.SetUINT32(&CODECAPI_AVLowLatencyMode, 1)?;
+    Ok(a)
+}
+
+unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Option<&IMFDXGIDeviceManager>, nv12: bool,
+    replay: bool) -> Res<(IMFSinkWriter, u32, Option<u32>)>
+{
     let bitrate = opts.mbps.clamp(1, 100) * 1_000_000;
     let mut a: Option<IMFAttributes> = None;
     MFCreateAttributes(&mut a, 2)?;
@@ -836,16 +1030,21 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Optio
     out.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
     out.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
     out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par)?;
+    if nv12 { set_recording_color(&out)?; }
     let idx = wr.AddStream(&out)?;
     let inp = MFCreateMediaType()?;
     inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-    inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+    inp.SetGUID(&MF_MT_SUBTYPE, if nv12 { &MFVideoFormat_NV12 } else { &MFVideoFormat_RGB32 })?;
     inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     inp.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
     inp.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
     inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par)?;
-    inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4)?;
-    wr.SetInputMediaType(idx, &inp, None)?;
+    inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, if nv12 { w } else { w * 4 })?;
+    if nv12 { set_recording_color(&inp)?; }
+    // An encoder that rejects the replay properties still records with its defaults.
+    let tuned = replay && opts.format != RecordFormat::Wmv9
+        && replay_encoding(opts.fps).and_then(|params| wr.SetInputMediaType(idx, &inp, &params)).is_ok();
+    if !tuned { wr.SetInputMediaType(idx, &inp, None)?; }
     let audio = if opts.audio {
         let make_audio_type = |subtype, bytes_per_second, alignment| -> Res<IMFMediaType> {
             let ty = MFCreateMediaType()?;
@@ -876,7 +1075,7 @@ unsafe fn make_writer(path: &str, w: u32, h: u32, opts: &RecOpts, manager: Optio
             }
             chosen.ok_or_else(|| windows::core::Error::from(E_FAIL))?
         } else {
-            make_audio_type(&MFAudioFormat_AAC, 16_000, 1)?
+            make_audio_type(&MFAudioFormat_AAC, aac_bytes_per_second(crate::media_common::RECORD_AUDIO_KBPS), 1)?
         };
         let pcm = make_audio_type(&MFAudioFormat_PCM, crate::audio::RATE * 4, 4)?;
         let index = wr.AddStream(&target)?;
@@ -924,10 +1123,200 @@ unsafe fn encoder_name(writer: &IMFSinkWriter, stream: u32, format: RecordFormat
     unknown
 }
 
+unsafe fn set_recording_color(ty: &IMFMediaType) -> Res<()> {
+    ty.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+    ty.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+    ty.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+    ty.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)
+}
+
+// A route can start sharing its frame with a BGRA-only output during a segment.
+// Keep the already-negotiated NV12 encoder and convert those frames on its worker.
+fn fill_recording_nv12(dst: &mut [u8], w: usize, h: usize, src: &[u8], sw: usize, sh: usize, bgra: bool) {
+    let scaled;
+    let (src, bgra) = if (sw, sh) == (w, h) && src.len() >= w * h * 4 {
+        (src, bgra)
+    } else {
+        scaled = {
+            let mut pixels = vec![0; w * h * 4];
+            crate::media_common::fill_bgra(&mut pixels, w, h, src, sw, sh, bgra, true);
+            pixels
+        };
+        (scaled.as_slice(), true)
+    };
+    let (r, b) = if bgra { (2, 0) } else { (0, 2) };
+    let (y_plane, uv_plane) = dst.split_at_mut(w * h);
+    let luma = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    for y in (0..h).step_by(2) {
+        for x in (0..w).step_by(2) {
+            let mut chroma = [0.0; 2];
+            for row in y..y + 2 {
+                for col in x..x + 2 {
+                    let i = row * w + col;
+                    let px = &src[i * 4..][..4];
+                    let (r, g, b) = (f32::from(px[r]), f32::from(px[1]), f32::from(px[b]));
+                    let l = luma(r, g, b);
+                    y_plane[i] = (16.0 + 219.0 / 255.0 * l).round() as u8;
+                    chroma[0] += b - l;
+                    chroma[1] += r - l;
+                }
+            }
+            let uv = y / 2 * w + x;
+            uv_plane[uv] = (128.0 + 28.0 / (255.0 * (1.0 - 0.0722)) * chroma[0]).round() as u8;
+            uv_plane[uv + 1] = (128.0 + 28.0 / (255.0 * (1.0 - 0.2126)) * chroma[1]).round() as u8;
+        }
+    }
+}
+
+#[test]
+fn recording_nv12_uses_limited_range_and_averages_chroma() {
+    let rgba = [255, 0, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255];
+    let mut nv12 = [0; 6];
+    fill_recording_nv12(&mut nv12, 2, 2, &rgba, 2, 2, false);
+    assert_eq!(nv12, [63, 32, 235, 16, 150, 153]);
+}
+
+#[test]
+fn capture_nv12_matches_the_recorder_conversion() {
+    let (w, h) = (34, 6);
+    let mut seed = 0x1234_5678u32;
+    let rgba: Vec<u8> = (0..w * h * 4).map(|_| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 24) as u8
+    }).collect();
+    let mut expected = vec![0; w * h * 3 / 2];
+    fill_recording_nv12(&mut expected, w, h, &rgba, w, h, false);
+    let mut fast = vec![0; w * h * 3 / 2];
+    crate::media_common::rgba_to_nv12(&rgba, w, h, &mut fast);
+    for (n, (a, b)) in expected.iter().zip(&fast).enumerate() {
+        assert!(a.abs_diff(*b) <= 1, "sample {n}: {a} vs {b}");
+    }
+    let mut small = [0; 6];
+    crate::media_common::rgba_to_nv12(&[255, 0, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255], 2, 2, &mut small);
+    assert_eq!(small, [63, 32, 235, 16, 150, 153]);
+}
+
+/// Pictures sent from a capture thread through `Shared::tap_frame` and audio sent apart, as
+/// a replay camera with Record cameras from capture records them.
+#[cfg(test)]
+fn record_from_tap(path: &std::path::Path) -> (Vec<u64>, String) {
+    let source = Arc::new(Shared::default());
+    let (rec, worker) = Recorder::spawn_writer_indexed(path.to_string_lossy().into_owned(),
+        RecOpts { hw: false, size: Some((320, 180)), fps: 30.0, audio: true, ..RecOpts::default() }, true);
+    let rec = Arc::new(rec);
+    source.add_replay_tap(&rec);
+    assert!(source.tapped());
+    let index = rec.replay_index.clone().unwrap();
+    let error = rec.error.clone();
+    let capture = {
+        let source = Arc::clone(&source);
+        std::thread::spawn(move || {
+            // A 60 fps camera: the recording keeps one picture in two.
+            for n in 0..60u8 {
+                source.tap_frame(&Frame { w: 320, h: 180, rgba: vec![n.wrapping_mul(4); 320 * 180 * 4] });
+                std::thread::sleep(Duration::from_micros(16_667));
+            }
+        })
+    };
+    for _ in 0..30 {
+        rec.push_audio_only(Instant::now(), crate::audio::test_tone(1600));
+        std::thread::sleep(Duration::from_micros(33_333));
+    }
+    capture.join().unwrap();
+    drop(rec);
+    worker.join().unwrap();
+    assert!(!source.tapped(), "a released recording stays tapped");
+    let stamps = index.lock().unwrap().iter().map(|&(_, ms)| ms).collect();
+    let message = error.lock().unwrap().clone();
+    (stamps, message)
+}
+
+#[test]
+fn replay_records_pictures_from_the_capture_thread_with_separate_audio() {
+    for name in ["mp4", "fmp4.mp4"] {
+        let path = std::env::temp_dir().join(format!("livemix-capture-tap-{}.{name}", std::process::id()));
+        let (stamps, error) = record_from_tap(&path);
+        assert!(error.is_empty(), "{name}: {error}");
+        assert!((26..=32).contains(&stamps.len()), "{name}: {} pictures", stamps.len());
+        assert!(stamps.windows(2).all(|pair| pair[0] < pair[1]), "{name}: {stamps:?}");
+        let probe = crate::audio::ffprobe_command().args(["-v", "error", "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0"]).arg(&path).output().unwrap();
+        let types = String::from_utf8(probe.stdout).unwrap();
+        assert!(types.contains("video") && types.contains("audio"), "{name}: {types}");
+        crate::audio::assert_audio_file(&path);
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[test]
+fn replay_segments_use_half_second_keyframes_without_b_frames() {
+    let path = std::env::temp_dir().join(format!("livemix-replay-gop-{}.mp4", std::process::id()));
+    let (rec, worker) = Recorder::spawn_writer_indexed(path.to_string_lossy().into_owned(),
+        RecOpts { hw: false, size: Some((320, 180)), fps: 30.0, audio: false, ..RecOpts::default() }, true);
+    let start = Instant::now();
+    for n in 0..60u64 {
+        let mut pixels = vec![128; 320 * 180 * 3 / 2];
+        pixels[..320 * 180].fill((n * 4) as u8);
+        rec.tx.send(RecFrame { pixels: Arc::new(pixels), w: 320, h: 180, bgra: false, nv12: true, surface: None,
+            audio: crate::audio::Packet::default(), captured_at: start + Duration::from_millis(n * 1000 / 30),
+            timeline_origin: Some(start) }).unwrap();
+    }
+    let error = rec.error.clone();
+    drop(rec);
+    worker.join().unwrap();
+    assert!(error.lock().unwrap().is_empty(), "{}", error.lock().unwrap());
+    let probe = crate::audio::ffprobe_command().args(["-v", "error", "-select_streams", "v:0", "-show_entries",
+        "frame=key_frame,pict_type", "-of", "csv=p=0"]).arg(&path).output().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(probe.status.success(), "{:?}", probe.stderr);
+    let frames = String::from_utf8(probe.stdout).unwrap();
+    let frames: Vec<_> = frames.lines().filter(|line| !line.is_empty()).collect();
+    assert!(frames.len() >= 55, "{frames:?}");
+    assert!(!frames.iter().any(|frame| frame.contains('B')), "{frames:?}");
+    let keys: Vec<_> = frames.iter().enumerate().filter(|(_, frame)| frame.starts_with('1')).map(|(n, _)| n).collect();
+    let gop = replay_gop(30.0) as usize;
+    assert!(keys.windows(2).all(|pair| pair[1] - pair[0] <= gop) && frames.len() - keys.last().unwrap() <= gop,
+        "keyframes at {keys:?}");
+}
+
+#[test]
+fn replay_records_nv12_with_audio_and_frame_index() {
+    let path = std::env::temp_dir().join(format!("livemix-nv12-{}.mp4", std::process::id()));
+    let (rec, worker) = Recorder::spawn_writer_indexed(path.to_string_lossy().into_owned(),
+        RecOpts { hw: false, size: Some((320, 180)), fps: 30.0, audio: true, ..RecOpts::default() }, true);
+    let start = Instant::now();
+    let index = rec.replay_index.clone().unwrap();
+    let error = rec.error.clone();
+    let mut pixels = vec![128; 320 * 180 * 3 / 2];
+    pixels[..320 * 180].fill(80);
+    for n in 0..5 {
+        let nv12 = n < 3;
+        rec.tx.send(RecFrame {
+            pixels: Arc::new(if nv12 { pixels.clone() } else { vec![255; 320 * 180 * 4] }),
+            w: 320, h: 180, bgra: false, nv12, surface: None,
+            audio: crate::audio::test_tone(1600), captured_at: start + Duration::from_millis(n * 33),
+            timeline_origin: Some(start),
+        }).unwrap();
+    }
+    drop(rec);
+    worker.join().unwrap();
+    let error = error.lock().unwrap();
+    assert!(error.is_empty(), "{error}");
+    let recorded = index.lock().unwrap().iter().map(|&(_, ms)| ms).collect::<Vec<_>>();
+    assert_eq!(recorded, [0, 33, 66, 99, 132]);
+    assert!(mf_init());
+    unsafe {
+        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.to_str().unwrap()), None).unwrap();
+        let audio = reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0).unwrap();
+        assert_eq!(audio.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap(), 2);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
 pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex<String>>, encoder: Arc<Mutex<String>>, opts: RecOpts,
-    index: Option<ReplayIndex>, gpu: Arc<std::sync::atomic::AtomicBool>)
+    index: Option<ReplayIndex>, gpu: Arc<std::sync::atomic::AtomicBool>, accept_nv12: Arc<std::sync::atomic::AtomicBool>)
 {
-    if !opts.format.native_windows() {
+    if !opts.format.native_windows() || crate::replay::fragmented_mp4(&path) {
         if let Err(message) = crate::ffmpeg_media::record(&path, rx, &encoder, opts, index.as_ref()) {
             *err.lock().unwrap() = message;
         }
@@ -943,37 +1332,39 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
     let mut next_audio_slot = 0;
     let mut audio_queue = crate::audio::AudioFifo::default();
     let mut wrote_video = false;
+    let mut writer_nv12 = false;
     let (rn, rd) = rate_fraction(opts.fps);
     let frame_dur = (10_000_000u64 * u64::from(rd) / u64::from(rn.max(1))) as i64;
-    while let Ok(RecFrame { mut pixels, w: mut fw, h: mut fh, captured_at, timeline_origin, bgra, audio, surface }) = rx.recv() {
+    // The project's Output Size; pictures of another size are scaled while being copied into
+    // the encoder buffer (crate::media_common::fill_bgra), with no extra frame copy.
+    let target = opts.size.map(|(tw, th)| ((tw as usize & !1).max(2), (th as usize & !1).max(2)));
+    while let Ok(RecFrame { pixels, w: fw, h: fh, captured_at, timeline_origin, bgra, audio, surface, nv12 }) = rx.recv() {
         // Every frame's audio is queued, including frames whose picture is not written.
         audio_queue.push(&audio);
+        // Audio-only frames (pictures from a capture thread) are written with the next picture.
+        if surface.is_none() && (fw == 0 || fh == 0) { continue; }
+        if nv12 && (!accept_nv12.load(Ordering::Acquire) || pixels.len() != fw * fh * 3 / 2
+            || writer.as_ref().is_some_and(|(_, _, _, w, h)| (*w, *h) != (fw, fh)))
+        {
+            accept_nv12.store(false, Ordering::Release);
+            continue;
+        }
         if surface.is_some() && !gpu.load(Ordering::Acquire) { continue; }
-        // Scale the picture to the project's Output Size.
-        if let Some((tw, th)) = opts.size {
-            let (tw, th) = ((tw as usize & !1).max(2), (th as usize & !1).max(2));
-            if (fw, fh) != (tw, th) && fw > 0 && fh > 0 {
-                if surface.is_some() {
-                    gpu.store(false, Ordering::Release);
-                    continue;
-                }
-                let Some(img) = image::RgbaImage::from_raw(fw as u32, fh as u32, Arc::unwrap_or_clone(pixels)) else { continue };
-                pixels = Arc::new(image::imageops::resize(&img, tw as u32, th as u32, image::imageops::FilterType::Triangle).into_raw());
-                fw = tw;
-                fh = th;
-            }
+        // A GPU surface can't be scaled here: fall back to system-memory frames.
+        if surface.is_some() && target.is_some_and(|t| t != (fw, fh)) && fw > 0 && fh > 0 {
+            gpu.store(false, Ordering::Release);
+            continue;
         }
         if writer.is_none() {
-            let w = (fw & !1).max(2);
-            let h = (fh & !1).max(2);
-            let manager = if opts.hw && opts.format != RecordFormat::Wmv9 {
+            let (w, h) = target.unwrap_or(((fw & !1).max(2), (fh & !1).max(2)));
+            let manager = if index.is_none() && opts.hw && opts.format != RecordFormat::Wmv9 {
                 unsafe { video_device_manager().ok() }
             } else {
                 None
             };
-            let opened = unsafe { make_writer(&path, w as u32, h as u32, &opts, manager.as_ref().map(|(manager, _)| manager)) };
+            let opened = unsafe { make_writer(&path, w as u32, h as u32, &opts, manager.as_ref().map(|(manager, _)| manager), nv12, index.is_some()) };
             let opened = if manager.is_some() && opened.is_err() {
-                unsafe { make_writer(&path, w as u32, h as u32, &opts, None) }
+                unsafe { make_writer(&path, w as u32, h as u32, &opts, None, false, index.is_some()) }
             } else { opened };
             match opened {
                 Ok((wr, idx, audio_idx)) => {
@@ -986,9 +1377,15 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                         }
                     }
                     *encoder.lock().unwrap() = name;
+                    writer_nv12 = nv12;
+                    if !nv12 { accept_nv12.store(false, Ordering::Release); }
                     writer = Some((wr, idx, audio_idx, w, h));
                 }
                 Err(e) => {
+                    if nv12 {
+                        accept_nv12.store(false, Ordering::Release);
+                        continue;
+                    }
                     if surface.is_some() {
                         gpu.store(false, Ordering::Release);
                         continue;
@@ -1000,7 +1397,7 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
         }
         let Some((wr, idx, audio_idx, w, h)) = writer.as_ref() else { continue };
         let (w, h) = (*w, *h);
-        let len = w * h * 4;
+        let len = if writer_nv12 { w * h * 3 / 2 } else { w * h * 4 };
         let start = *first_frame.get_or_insert(timeline_origin.unwrap_or(captured_at));
         let mut t = (captured_at.saturating_duration_since(start).as_nanos() / 100) as i64;
         if t <= last_t {
@@ -1021,21 +1418,12 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 let mut p: *mut u8 = std::ptr::null_mut();
                 buf.Lock(&mut p, None, None)?;
                 let dst = std::slice::from_raw_parts_mut(p, len);
-                if bgra && (fw, fh) == (w, h) {
+                if nv12 {
                     dst.copy_from_slice(&pixels);
+                } else if writer_nv12 {
+                    fill_recording_nv12(dst, w, h, &pixels, fw, fh, bgra);
                 } else {
-                    for y in 0..h {
-                        for x in 0..w {
-                            let d = (y * w + x) * 4;
-                            if x < fw && y < fh {
-                                let s = (y * fw + x) * 4;
-                                let (b, r) = if bgra { (s, s + 2) } else { (s + 2, s) };
-                                dst[d..d + 4].copy_from_slice(&[pixels[b], pixels[s + 1], pixels[r], 255]);
-                            } else {
-                                dst[d..d + 4].copy_from_slice(&[0, 0, 0, 255]);
-                            }
-                        }
-                    }
+                    crate::media_common::fill_bgra(dst, w, h, &pixels, fw, fh, bgra, target.is_some());
                 }
                 buf.Unlock()?;
                 buf.SetCurrentLength(len as u32)?;
@@ -1048,6 +1436,10 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
                 wr.WriteSample(*idx, &s)?;
                 if let Some(index) = &index { index.lock().unwrap().push((captured_at, (t / 10_000) as u64)); }
                 wrote_this_frame = true;
+                if writer_nv12 && !wrote_video {
+                    let mut status = encoder.lock().unwrap();
+                    status.push_str(" · NV12 input");
+                }
                 wrote_video = true;
                 if surface.is_some() {
                     let mut status = encoder.lock().unwrap();
@@ -1086,6 +1478,17 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
             })()
         };
         if let Err(e) = r {
+            if index.is_some() && matches!(e.code().0 as u32, 0x887A0005..=0x887A0007 | 0x887A0020) {
+                *err.lock().unwrap() = format!("Recording GPU failure (0x{:08X}): {}", e.code().0 as u32, e.message());
+                return;
+            }
+            if writer_nv12 && !wrote_video {
+                accept_nv12.store(false, Ordering::Release);
+                writer = None;
+                first_frame = None;
+                last_t = -1;
+                continue;
+            }
             if surface.is_some() && !wrote_this_frame {
                 gpu.store(false, Ordering::Release);
                 if !wrote_video {
@@ -1102,7 +1505,7 @@ pub(crate) fn record_thread(path: String, rx: Receiver<RecFrame>, err: Arc<Mutex
         if let Err(error) = unsafe { wr.Finalize() } {
             let mut status = err.lock().unwrap();
             if status.is_empty() {
-                *status = format!("Could not finalize recording: {}", error.message());
+                *status = format!("Could not finalize recording (0x{:08X}): {}", error.code().0 as u32, error.message());
             }
         }
     }
@@ -1233,7 +1636,9 @@ fn run_desktop(sh: Arc<Shared>) {
             {
                 let mut rgba = vec![0u8; wu * hu * 4];
                 copy_rows(buf.as_ptr(), (wu * 4) as isize, wu, hu, &mut rgba, sh.key.load(Ordering::Relaxed));
-                *sh.frame.lock().unwrap() = Some(Frame { w: wu, h: hu, rgba });
+                let frame = Frame { w: wu, h: hu, rgba };
+                sh.tap_frame(&frame);
+                *sh.frame.lock().unwrap() = Some(frame);
                 sh.seq.fetch_add(1, Ordering::Relaxed);
             } else {
                 sh.set_status("Desktop capture failed");
@@ -1375,6 +1780,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aac_rate_follows_the_original_writer() {
+        // Default Audio Bit Rate 384 Kbps is capped at 192 Kbps = 24000 bytes/s.
+        assert_eq!(aac_bytes_per_second(crate::media_common::RECORD_AUDIO_KBPS), 24_000);
+        assert_eq!(aac_bytes_per_second(128), 16_000);
+    }
+
+    #[test]
     fn lists_devices_without_crashing() {
         let d = list_devices();
         println!("video devices: {:?}", d);
@@ -1490,6 +1902,7 @@ mod tests {
                 let mut frame = RecFrame {
                     timeline_origin: None,
                     surface: None,
+                    nv12: false,
                     audio: crate::audio::test_tone(1600),
                     pixels: Arc::new(px), w, h, bgra: false,
                     captured_at: first_capture + Duration::from_millis(33 * u64::from(f)),

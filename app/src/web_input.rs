@@ -6,14 +6,136 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command as ProcessCommand, Stdio},
     sync::{atomic::Ordering::Relaxed, Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 use tungstenite::{Message, WebSocket};
+use crate::egui;
+
+#[derive(Debug)]
+pub struct Command(&'static str, Value);
+
+fn modifiers(value: egui::Modifiers) -> u8 {
+    u8::from(value.alt) | u8::from(value.ctrl) << 1 | u8::from(value.shift) << 3 | u8::from(value.mac_cmd) << 2
+}
+
+pub fn interact(ui: &mut egui::Ui, rect: egui::Rect, id: u32, shared: &Shared) {
+    let response = ui.interact(rect, ui.id().with(("browser-interact", id)), egui::Sense::click_and_drag());
+    let (events, pointer, mods, pressed) = ui.input(|i| (i.events.clone(), i.pointer.hover_pos(), i.modifiers, i.pointer.any_pressed()));
+    if pressed {
+        if pointer.is_some_and(|pos| rect.contains(pos)) { response.request_focus(); }
+        else { response.surrender_focus(); }
+    }
+    let Ok(mut queue) = shared.browser_input.try_lock() else { return };
+    let coords = |pos: egui::Pos2| ((pos.x - rect.left()) * 1280.0 / rect.width(), (pos.y - rect.top()) * 720.0 / rect.height());
+    for event in events {
+        if queue.len() >= 96 { break; }
+        let command = match event {
+            egui::Event::PointerMoved(pos) if rect.contains(pos) || response.dragged() => {
+                let (x,y) = coords(pos);
+                Command("Input.dispatchMouseEvent", json!({"type":"mouseMoved","x":x,"y":y,"modifiers":modifiers(mods)}))
+            }
+            egui::Event::PointerButton { pos, button, pressed, modifiers: mods }
+                if rect.contains(pos) || (!pressed && response.has_focus()) =>
+            {
+                let button = match button { egui::PointerButton::Primary => "left", egui::PointerButton::Secondary => "right",
+                    egui::PointerButton::Middle => "middle", _ => continue };
+                let (x,y) = coords(pos);
+                Command("Input.dispatchMouseEvent", json!({"type":if pressed {"mousePressed"} else {"mouseReleased"},
+                    "x":x,"y":y,"button":button,"clickCount":1,"modifiers":modifiers(mods)}))
+            }
+            egui::Event::MouseWheel { unit, delta, modifiers: mods } if pointer.is_some_and(|pos| rect.contains(pos)) => {
+                let (x,y) = coords(pointer.unwrap());
+                let scale = match unit { egui::MouseWheelUnit::Point => 1.0, egui::MouseWheelUnit::Line => 32.0, egui::MouseWheelUnit::Page => 720.0 };
+                Command("Input.dispatchMouseEvent", json!({"type":"mouseWheel","x":x,"y":y,
+                    "deltaX":-delta.x*scale,"deltaY":-delta.y*scale,"modifiers":modifiers(mods)}))
+            }
+            egui::Event::Text(text) | egui::Event::Paste(text) if response.has_focus() =>
+                Command("Input.insertText", json!({"text":text.chars().take(16384).collect::<String>()})),
+            egui::Event::Key { key, pressed, repeat, modifiers: mods, .. } if response.has_focus() && key != egui::Key::Escape => {
+                let name = key.name();
+                let virtual_key = match key {
+                    egui::Key::Backspace => 8, egui::Key::Tab => 9, egui::Key::Enter => 13, egui::Key::Space => 32,
+                    egui::Key::PageUp => 33, egui::Key::PageDown => 34, egui::Key::End => 35, egui::Key::Home => 36,
+                    egui::Key::ArrowLeft => 37, egui::Key::ArrowUp => 38, egui::Key::ArrowRight => 39, egui::Key::ArrowDown => 40,
+                    egui::Key::Delete => 46, _ if name.len() == 1 => u32::from(name.as_bytes()[0]), _ => 0,
+                };
+                let key_name = if name.len() == 1 && !mods.shift { name.to_ascii_lowercase() } else { name.to_owned() };
+                Command("Input.dispatchKeyEvent", json!({"type":if pressed {"rawKeyDown"} else {"keyUp"},
+                    "key":key_name,"windowsVirtualKeyCode":virtual_key,"modifiers":modifiers(mods),"autoRepeat":repeat}))
+            }
+            _ => continue,
+        };
+        if command.1["type"] == "mouseMoved" && queue.back().is_some_and(|last| last.1["type"] == "mouseMoved") {
+            queue.pop_back();
+        }
+        queue.push_back(command);
+    }
+}
 
 const MAX_CAPTURE: usize = 16 * 1024 * 1024;
 static HOST: Mutex<Weak<Browser>> = Mutex::new(Weak::new());
+
+// The browser's hardware output remains muted. Tap its top-level Web Audio
+// graph and eligible HTML media elements before samples reach the output.
+const AUDIO_TAP: &str = r#"
+if (window === window.top) (() => {
+    const chunks = [];
+    const taps = new WeakMap();
+    const media = new WeakSet();
+    const connect = AudioNode.prototype.connect;
+    let mediaContext;
+    function tap(context) {
+        if (taps.has(context)) return taps.get(context);
+        const processor = context.createScriptProcessor(1024, 2, 1);
+        let phase = 0;
+        processor.onaudioprocess = event => {
+            const input = event.inputBuffer;
+            const left = input.getChannelData(0);
+            const right = input.numberOfChannels > 1 ? input.getChannelData(1) : left;
+            let bytes = "";
+            const step = input.sampleRate / 48000;
+            for (; phase < left.length; phase += step) {
+                const i = Math.floor(phase);
+                for (const channel of [left, right]) {
+                    const sample = Math.round(Math.max(-1, Math.min(1, channel[i])) * 32767);
+                    bytes += String.fromCharCode(sample & 255, (sample >> 8) & 255);
+                }
+            }
+            phase -= left.length;
+            if (chunks.length >= 8) chunks.shift();
+            chunks.push(btoa(bytes));
+        };
+        connect.call(processor, context.destination);
+        taps.set(context, processor);
+        return processor;
+    }
+    AudioNode.prototype.connect = function(destination, ...args) {
+        const result = connect.call(this, destination, ...args);
+        if (destination === this.context.destination && this.context instanceof AudioContext) {
+            try { connect.call(this, tap(this.context), args[0] || 0); } catch (_) {}
+        }
+        return result;
+    };
+    function attach(element) {
+        if (!(element instanceof HTMLMediaElement) || media.has(element)) return;
+        try {
+            const stream = element.captureStream();
+            if (!stream.getAudioTracks().length) return;
+            mediaContext ||= new AudioContext({sampleRate: 48000});
+            const source = mediaContext.createMediaStreamSource(stream);
+            connect.call(source, tap(mediaContext));
+            media.add(element);
+        } catch (_) {}
+    }
+    addEventListener("playing", event => attach(event.target), true);
+    Object.defineProperty(window, "__liveMixTakeAudio", {value: () => {
+        if (mediaContext?.state === "suspended") mediaContext.resume().catch(() => {});
+        return chunks.splice(0);
+    }});
+})();
+"#;
 
 pub fn valid_url(url: &str) -> bool {
     url.split_once("://").is_some_and(|(scheme, rest)| {
@@ -73,7 +195,7 @@ impl Browser {
             .map_err(|error| error.to_string())?.as_nanos();
         let profile = std::env::temp_dir().join(format!("livemix-browser-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&profile).map_err(|error| error.to_string())?;
-        let mut command = Command::new(exe);
+        let mut command = ProcessCommand::new(exe);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -236,6 +358,7 @@ pub fn run(shared: Arc<Shared>, url: String, transparent: bool) {
         shared.set_status("Starting browser…");
         let mut page = Page::new(Browser::get()?, &shared)?;
         page.command(&shared, "Page.enable", json!({}))?;
+        page.command(&shared, "Page.addScriptToEvaluateOnNewDocument", json!({"source":AUDIO_TAP}))?;
         page.command(&shared, "Emulation.setDeviceMetricsOverride",
             json!({"width":1280,"height":720,"deviceScaleFactor":1,"mobile":false}))?;
         if transparent {
@@ -245,8 +368,32 @@ pub fn run(shared: Arc<Shared>, url: String, transparent: bool) {
         let navigation = page.command(&shared, "Page.navigate", json!({"url":url}))?;
         if let Some(error) = navigation["errorText"].as_str() { return Err(error.into()); }
         let mut first = true;
+        let mut next_picture = Instant::now();
         while !shared.stop.load(Relaxed) {
             let started = Instant::now();
+            let commands: Vec<_> = shared.browser_input.lock().unwrap().drain(..).take(96).collect();
+            for Command(method, params) in commands {
+                let _ = page.command(&shared, method, params);
+            }
+            if let Ok(audio) = page.command(&shared, "Runtime.evaluate",
+                json!({"expression":"window.__liveMixTakeAudio?.()","returnByValue":true}))
+            {
+                if let Some(chunks) = audio["result"]["value"].as_array() {
+                    let samples: Vec<_> = chunks.iter().take(8).filter_map(Value::as_str)
+                        .filter(|chunk| chunk.len() <= 16384)
+                        .filter_map(|chunk| STANDARD.decode(chunk).ok())
+                        .flat_map(|bytes| bytes.chunks_exact(2).map(|sample| i16::from_le_bytes([sample[0], sample[1]])).collect::<Vec<_>>())
+                        .collect();
+                    if !samples.is_empty() {
+                        shared.audio_channels.store(2, Relaxed);
+                        if let Ok(mut buffer) = shared.audio.lock() { buffer.capture_interleaved(&samples, 2, false); }
+                    }
+                }
+            }
+            if started < next_picture {
+                std::thread::sleep((next_picture - started).min(Duration::from_millis(12)));
+                continue;
+            }
             let result = page.command(&shared, "Page.captureScreenshot", json!({"format":"png","fromSurface":true}))?;
             let data = result["data"].as_str().ok_or("Chromium did not return a picture")?;
             let bytes = STANDARD.decode(data).map_err(|e| e.to_string())?;
@@ -259,10 +406,7 @@ pub fn run(shared: Arc<Shared>, url: String, transparent: bool) {
             }
             crate::ffmpeg_media::publish(&shared, Frame { w: w as usize, h: h as usize, rgba: rgba.into_raw() });
             let rate = shared.browser_fps.load(Relaxed).clamp(2, 20);
-            let delay = Duration::from_millis(1000 / rate);
-            while !shared.stop.load(Relaxed) && started.elapsed() < delay {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            next_picture = started + Duration::from_millis(1000 / rate);
         }
         Ok(())
     })();
@@ -296,7 +440,17 @@ fn browser_renders_a_local_page_with_alpha() {
                     socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                     let mut request = [0; 2048];
                     let _ = socket.read(&mut request);
-                    let html = "<!doctype html><style>html,body{margin:0;background:transparent}div{width:400px;height:400px;background:#ff0000}</style><div></div>";
+                    let html = r##"<!doctype html><style>html,body{margin:0;background:transparent}div{width:400px;height:400px;background:#ff0000}</style><div></div><script>
+                    document.querySelector("div").onclick = async e => {
+                        e.target.style.background = "#00ff00";
+                        const ctx = new AudioContext();
+                        const tone = ctx.createOscillator();
+                        tone.connect(ctx.destination);
+                        tone.start();
+                        await ctx.resume();
+                    };
+                    addEventListener("keydown", e => { if (e.key === "a") document.querySelector("div").style.background = "#0000ff"; });
+                    </script>"##;
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(20)),
@@ -319,8 +473,22 @@ fn browser_renders_a_local_page_with_alpha() {
         if good { break; }
         std::thread::sleep(Duration::from_millis(30));
     }
+    let command = |kind, button| Command("Input.dispatchMouseEvent",
+        json!({"type":kind,"x":20,"y":20,"button":button,"clickCount":1}));
+    shared.browser_input.lock().unwrap().extend([command("mousePressed", "left"), command("mouseReleased", "left"),
+        Command("Input.dispatchKeyEvent", json!({"type":"rawKeyDown","key":"a","windowsVirtualKeyCode":65}))]);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (mut blue, mut audible) = (false, false);
+    while Instant::now() < deadline && !(blue && audible) {
+        if let Some(frame) = &*shared.frame.lock().unwrap() {
+            blue |= frame.rgba.get((20 * frame.w + 20) * 4..(20 * frame.w + 20) * 4 + 4) == Some(&[0,0,255,255]);
+        }
+        audible |= crate::audio::input_peak((&shared, false, 1.0), Instant::now()) > 0.1;
+        std::thread::sleep(Duration::from_millis(30));
+    }
     shared.stop.store(true, Relaxed);
     worker.join().unwrap();
+    assert!(blue && audible, "browser events or audio missing: blue={blue}, audio={audible}");
     server.join().unwrap();
     assert!(good, "{}", shared.status.lock().unwrap());
 }

@@ -315,6 +315,7 @@ fn playlist(ui: &mut egui::Ui, s: &mut Switcher, height: f32) {
     let channel = s.replay_channel.min(1);
     let program = s.replay_setup.play_to_program;
     let selected = s.replay_ui.clip;
+    let editable = !s.replay_read_only;
     let mut command = None;
     let mut dirty = false;
     let mut pick = None;
@@ -332,11 +333,11 @@ fn playlist(ui: &mut egui::Ui, s: &mut Switcher, height: f32) {
                 }
                 ui.label(&clip.comment);
                 let (start, end) = (clip.start, clip.end);
-                dirty |= time_drag(ui, &mut clip.start, 0..=end.saturating_sub(1), frame, true);
-                dirty |= time_drag(ui, &mut clip.end, start + 1..=u64::MAX / 4, frame, true);
+                dirty |= time_drag(ui, &mut clip.start, 0..=end.saturating_sub(1), frame, editable);
+                dirty |= time_drag(ui, &mut clip.end, start + 1..=u64::MAX / 4, frame, editable);
                 ui.label(timecode(clip.end.saturating_sub(clip.start)));
-                dirty |= ui.add(egui::DragValue::new(&mut clip.speed).range(1..=100).suffix("%")).changed();
-                dirty |= ui.add(egui::DragValue::new(&mut clip.mix_ms).range(0..=5000).speed(10.0).suffix(" ms")).changed();
+                dirty |= ui.add_enabled(editable, egui::DragValue::new(&mut clip.speed).range(1..=100).suffix("%")).changed();
+                dirty |= ui.add_enabled(editable, egui::DragValue::new(&mut clip.mix_ms).range(0..=5000).speed(10.0).suffix(" ms")).changed();
                 ui.end_row();
             }
         });
@@ -470,8 +471,13 @@ fn player_row(ui: &mut egui::Ui, s: &mut Switcher, channel: usize, cameras: &[us
     if tool(ui, "PL", 30.0, None).on_hover_text(tr(ui, "Play the current playlist on this player")).clicked() {
         let items = s.replay_ui.playlists[s.replay_ui.playlist].iter().filter(|clip| clip.id != 0)
             .map(|clip| QueueItem { id: clip.id, angle: clip.angle, speed: clip.speed, mix_ms: clip.mix_ms }).collect();
-        *command = Some(Action::PlayQueue { items, channel, program: s.replay_setup.play_to_program,
-            looped: s.replay_ui.looped });
+        let items: Vec<QueueItem> = items;
+        if items.is_empty() {
+            s.replay_status = format!("Playlist {} is empty. Select an angle and press Add.", s.replay_ui.playlist + 1);
+        } else {
+            *command = Some(Action::PlayQueue { items, channel, program: s.replay_setup.play_to_program,
+                looped: s.replay_ui.looped });
+        }
     }
     if !role.is_empty() {
         let colour = if role == "PGM" { ACTIVE_RED } else { PREVIEW };
@@ -538,26 +544,28 @@ fn toolbar(ui: &mut egui::Ui, s: &mut Switcher, t: f64, cameras: &[usize], on_ai
         let list = &mut s.replay_ui.playlists[s.replay_ui.playlist];
         let selected = selected.filter(|&row| row < list.len());
         let mut changed = false;
-        if tool_if(ui, source.is_some(), "Add", 44.0, None) {
+        // Imported sessions are read-only: their playlists cannot be saved.
+        let edit = !s.replay_read_only;
+        if tool_if(ui, edit && source.is_some(), "Add", 44.0, None) {
             list.extend(source.clone());
             changed = true;
         }
-        if tool_if(ui, source.is_some(), "Insert", 50.0, None) {
+        if tool_if(ui, edit && source.is_some(), "Insert", 50.0, None) {
             list.insert(selected.unwrap_or(list.len()), source.unwrap());
             changed = true;
         }
-        if tool_if(ui, selected.is_some(), "Delete", 50.0, None) {
+        if tool_if(ui, edit && selected.is_some(), "Delete", 50.0, None) {
             list.remove(selected.unwrap());
             s.replay_ui.clip = None;
             changed = true;
         }
-        if tool_if(ui, selected.is_some_and(|row| row > 0), "Up", 34.0, None) {
+        if tool_if(ui, edit && selected.is_some_and(|row| row > 0), "Up", 34.0, None) {
             let row = selected.unwrap();
             list.swap(row, row - 1);
             s.replay_ui.clip = Some(row - 1);
             changed = true;
         }
-        if tool_if(ui, selected.is_some_and(|row| row + 1 < list.len()), "Down", 44.0, None) {
+        if tool_if(ui, edit && selected.is_some_and(|row| row + 1 < list.len()), "Down", 44.0, None) {
             let row = selected.unwrap();
             list.swap(row, row + 1);
             s.replay_ui.clip = Some(row + 1);
@@ -622,7 +630,12 @@ fn toolbar(ui: &mut egui::Ui, s: &mut Switcher, t: f64, cameras: &[usize], on_ai
             let items = events.into_iter().flat_map(|event| (0..REPLAY_ANGLES)
                 .filter(|&angle| event.selected[angle] && event.angles[angle])
                 .map(|angle| QueueItem { id: event.id, angle, speed: event.speed, mix_ms })).collect();
-            command = Some(Action::PlayQueue { items, channel, program, looped: false });
+            let items: Vec<QueueItem> = items;
+            if items.is_empty() {
+                s.replay_status = format!("No Selected angles in Events list {}. Click a camera's square to select it.", list + 1);
+            } else {
+                command = Some(Action::PlayQueue { items, channel, program, looped: false });
+            }
         }
         if tool_if(ui, event.is_some(), "⏮", 34.0, None) { command = Some(Action::Cue(channel, s.replay_events[event.unwrap()].id)); }
         if tool_if(ui, event.is_some(), "⏭", 34.0, None) { command = Some(Action::CueOut(channel, s.replay_events[event.unwrap()].id)); }

@@ -37,7 +37,7 @@ impl App {
         };
         let source = self.media.get(&original.id)?.shared.as_ref()?;
         let file = matches!(original.kind, Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::Replay { .. });
-        let gain = if input.audio_on { input.volume / 100.0 } else { 0.0 };
+        let gain = if input.audio_on { audio::fader_gain(input.volume) } else { 0.0 };
         Some((source, file, gain, delay))
     }
 
@@ -47,7 +47,7 @@ impl App {
         let levels: Vec<_> = self.s.inputs.iter().filter(|input| input.kind.has_audio())
             .map(|input| (input.id, self.audio_input(input).map_or([0.0; 2], |(source, file, _, delay)| {
                 audio::delayed_peaks((source, file, 1.0, delay), at)
-            }), if input.audio_on { input.volume / 100.0 } else { 0.0 }))
+            }), if input.audio_on { audio::fader_gain(input.volume) } else { 0.0 }))
             .collect();
         for (id, level, gain) in levels {
             if let Some(input) = self.s.input_mut(id) {
@@ -85,7 +85,7 @@ impl App {
 
     pub(crate) fn master_gain(&self) -> f32 {
         let fade = if self.s.ftb_audio { 1.0 - self.s.ftb_level / FULL } else { 1.0 };
-        if self.s.master_on { self.s.master_volume / 100.0 * fade } else { 0.0 }
+        if self.s.master_on { audio::fader_gain(self.s.master_volume) * fade } else { 0.0 }
     }
 
     pub(crate) fn mix_external_audio(&self, bus: u8, delay_ms: u32, at: Instant, frames: usize) -> audio::Packet {
@@ -94,6 +94,36 @@ impl App {
             Some((source.as_ref(), file, gain * self.s.automatic_audio_gain(input),
                 delay + delay_ms as f32 / 1000.0, input_bus_mask(input), &input.audio_effects.direct_routes))
         }), 1 << bus.min(7), self.master_gain(), at, frames)
+    }
+
+    pub(crate) fn update_bus_monitors(&mut self) {
+        for bus in 0..8 {
+            let slot = &mut self.bus_monitors[bus];
+            let Some(device) = &self.s.cfg.bus_devices[bus] else { *slot = None; continue; };
+            if slot.as_ref().is_none_or(|(current, _)| current != device) {
+                *slot = None;
+                let result = audio::Monitor::start(device);
+                let error = result.as_ref().err().cloned();
+                *slot = Some((device.clone(), result));
+                if let Some(error) = error { self.s.notice(&format!("{} output: {error}", AUDIO_BUS_NAMES[bus])); }
+            }
+            if let Some((_, Ok(monitor))) = slot {
+                if let Some(error) = monitor.error.lock().unwrap().take() {
+                    self.s.notice(&format!("{} output: {error}", AUDIO_BUS_NAMES[bus]));
+                    continue;
+                }
+            }
+            let Some((_, Ok(monitor))) = &self.bus_monitors[bus] else { continue; };
+            let bus_gain = if bus == 0 { self.master_gain() } else { 1.0 };
+            let sources = self.s.inputs.iter().filter(|input| input_bus(input, bus)).filter_map(|input| {
+                let (source, file, gain, delay) = self.audio_input(input)?;
+                let matrix = if bus < 3 && source.audio_channels.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    input.audio_effects.direct_routes[bus]
+                } else { None };
+                Some((source.clone(), file, gain * bus_gain * self.s.automatic_audio_gain(input), delay, matrix))
+            }).collect::<Vec<_>>().into();
+            *monitor.sources.lock().unwrap() = sources;
+        }
     }
 
     pub(crate) fn update_audio_monitor(&mut self) {
@@ -107,7 +137,8 @@ impl App {
         }
         let solo = self.s.inputs.iter().any(|input| input.solo && input.kind.has_audio());
         let bus_gain = if self.mixer.bus == 0 && self.s.cfg.headphones_post_master { self.master_gain() } else { 1.0 };
-        let headphones = self.mixer.headphones / 100.0;
+        // Headphone knob → gain through the fader curve (bl::v → be::e → bg::set_g → cr::set_d).
+        let headphones = audio::fader_gain(self.mixer.headphones);
         let sources = self.s.inputs.iter().filter(|input| {
             if solo {
                 return input.solo && input.kind.has_audio();
@@ -255,6 +286,14 @@ pub(crate) fn picture_audio_meter(painter: &egui::Painter, picture: egui::Rect, 
     }
 }
 
+/// Fader tooltip like the original (`bm::c` 0x0600030c @0x37594): the gain as a percentage and
+/// in dB (`bm::a`: 10·log10(gain²)), e.g. position 50 → "6% -24dB".
+pub(crate) fn fader_tooltip(position: f32) -> String {
+    let gain = audio::fader_gain(position);
+    if gain <= 0.0 { return "0% -∞dB".into(); }
+    format!("{:.0}% {:.0}dB", gain * 100.0, 20.0 * gain.log10())
+}
+
 pub(crate) fn meter_fraction(level: f32) -> f32 {
     ((20.0 * level.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
@@ -279,7 +318,7 @@ pub(crate) fn headphone_knob(ui: &mut egui::Ui, volume: &mut f32) {
     let style = ui.style().interact(&response);
     ui.painter().circle(center, 10.0, style.bg_fill, style.bg_stroke);
     ui.painter().line_segment([center, center + pointer * 7.5], Stroke::new(1.5_f32, TEXT));
-    response.on_hover_text(format!("Headphones {:.0}% · Drag up or down", *volume));
+    response.on_hover_text(format!("Headphones {} · Drag up or down", fader_tooltip(*volume)));
 }
 
 pub(crate) fn mixer_panel(ctx: &egui::Context, s: &mut Switcher, master: [f32; 2], monitor: &mut bool, controls: &mut MixerControls) {
@@ -428,7 +467,7 @@ pub(crate) fn mixer_strip(ui: &mut egui::Ui, name: &str, volume: &mut f32, on: &
             ui.spacing_mut().slider_rail_height = 3.0;
             ui.add(egui::Slider::new(volume, 0.0..=100.0).vertical().show_value(false)
                 .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.48 }))
-                .on_hover_text(format!("Volume {:.0}%", *volume));
+                .on_hover_text(fader_tooltip(*volume));
             for (label, level) in ["Left", "Right"].into_iter().zip(levels) {
                 let (r, hover) = ui.allocate_exact_size(Vec2::new(10.0, meter_height), Sense::hover());
                 let db = 20.0 * level.log10();

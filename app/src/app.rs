@@ -201,6 +201,26 @@ impl App {
                 s.add_dialog.open = true;
                 s.add_dialog.kind = AddKind::Colour;
             }
+            "timing" if screenshot.is_some() => {
+                // A timing tower over Camera 1. LIVEMIX_TIMING_TEMPLATE and LIVEMIX_TIMING_DATA pick other files,
+                // LIVEMIX_TIMING_MODE (0 lap, 1 gap, 2 interval) and LIVEMIX_TIMING_CLASS the view.
+                let examples = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/examples/timing-tower/");
+                let template = std::env::var("LIVEMIX_TIMING_TEMPLATE").unwrap_or_else(|_| format!("{examples}timing-tower.gtzip"));
+                let data = std::env::var("LIVEMIX_TIMING_DATA").unwrap_or_else(|_| format!("{examples}timing-sample.json"));
+                let mut tower = Input::new(0, "Timing Tower", Kind::GtTitle { path: template, texts: Default::default(), document: None });
+                if let Err(error) = tower.reload_gt() { eprintln!("timing template: {error}"); }
+                tower.timing = Some(crate::timing::Source {
+                    location: data,
+                    mode: std::env::var("LIVEMIX_TIMING_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    class: std::env::var("LIVEMIX_TIMING_CLASS").unwrap_or_default(),
+                    ..Default::default()
+                });
+                let tower = s.add(tower);
+                let camera = s.inputs[1].id;
+                if let Some(i) = s.input_mut(camera) {
+                    i.layers[0] = Layer { on: true, input: Some(tower), ..Layer::default() };
+                }
+            }
             "replay-advanced" if screenshot.is_some() => {
                 s.ensure_replay_inputs();
                 s.replay_open = true;
@@ -261,9 +281,11 @@ impl App {
             media: Default::default(),
             delays: Default::default(),
             audio_monitor: None,
+            bus_monitors: Default::default(),
             mixer: MixerControls::default(),
             recordings: Default::default(),
             replay: Default::default(),
+            timing: Default::default(),
             multi_outputs: Default::default(),
             multi_output_failed: [false; OUTPUT_COUNT],
             decklink_outputs: Default::default(),
@@ -294,6 +316,7 @@ impl App {
             scope_jobs,
             scope_images,
             controls: Default::default(),
+            probe: Default::default(),
         }
     }
 
@@ -328,13 +351,13 @@ impl App {
                 let source = feeds.get(&id)?.shared.clone()?;
                 let file = matches!(original.kind, Kind::VideoFile { .. } | Kind::AudioFile { .. }
                     | Kind::VideoList { .. } | Kind::Replay { .. });
-                let gain = if input.audio_on { input.volume / 100.0 * s.automatic_audio_gain(input) } else { 0.0 };
+                let gain = if input.audio_on { audio::fader_gain(input.volume) * s.automatic_audio_gain(input) } else { 0.0 };
                 Some((source, file, gain, delay, mixer::input_bus_mask(input), input.audio_effects.direct_routes))
             }).collect()
         } else { Vec::new() };
         let mc_bus = s.cfg.mc_audio_bus;
         let master_gain = if s.master_on {
-            s.master_volume / 100.0 * if s.ftb_audio { 1.0 - s.ftb_level / FULL } else { 1.0 }
+            audio::fader_gain(s.master_volume) * if s.ftb_audio { 1.0 - s.ftb_level / FULL } else { 1.0 }
         } else { 0.0 };
         let ids: std::collections::HashSet<u32> = s.inputs.iter().map(|i| i.id).collect();
         let direct_audio_inputs: std::collections::HashSet<_> = s.inputs.iter()
@@ -414,7 +437,7 @@ impl App {
             layer_parents = children;
         }
         let cam_watch = s.cam_match.watching();
-        let cam_roi = s.cam_match.roi;
+        let cam_areas = [(s.cam_match.reference, s.cam_match.ref_area), (s.cam_match.target, s.cam_match.tgt_area)];
         let mut cam_samples: Vec<(u32, Option<cammatch::Stats>, Option<cammatch::Stats>)> = Vec::new();
         for inp in &mut s.inputs {
             match &inp.kind {
@@ -463,7 +486,7 @@ impl App {
                             (source, format!("{idx}:{key}"), true, false)
                         }
                         Kind::Replay { path, .. } => (
-                            if std::path::Path::new(path).extension().is_some_and(|ext| ext == "mkv") {
+                            if replay::fragmented_mp4(path) || std::path::Path::new(path).extension().is_some_and(|ext| ext == "mkv") {
                                 media::Source::FfmpegFile(path.clone(), 0, false)
                             } else { media::Source::File(path.clone()) }, format!("replay:{path}"), true, false,
                         ),
@@ -508,7 +531,10 @@ impl App {
                     }
                     #[cfg(windows)]
                     let delay_changed = {
-                        let required = delay_sources.contains(&inp.id) || inp.colour_fx.needs_cpu();
+                        let required = delay_sources.contains(&inp.id) || inp.colour_fx.needs_cpu()
+                            || (multicorder && is_device && !s.mc_off.contains(&inp.id))
+                            // A replay camera recorded from its capture thread needs system-memory frames.
+                            || sh.tapped();
                         sh.cpu_frames_required.swap(required, std::sync::atomic::Ordering::AcqRel) != required
                     };
                     #[cfg(not(windows))]
@@ -516,6 +542,7 @@ impl App {
                     let k = inp.key;
                     let key = if k.on { (1u64 << 40) | ((k.tolerance as u64) << 24) | ((k.colour[0] as u64) << 16) | ((k.colour[1] as u64) << 8) | k.colour[2] as u64 } else { 0 };
                     let key_changed = sh.key.swap(key, Relaxed) != key;
+                    sh.deinterlace_blend.store(inp.deinterlace, Relaxed);
                     if matches!(inp.kind, Kind::Web { .. }) {
                         sh.browser_fps.store(if live.contains(&inp.id) { 15 } else { 2 }, Relaxed);
                     }
@@ -657,13 +684,14 @@ impl App {
                         if let Some(mut fr) = fr {
                             // Camera Match measures the picture as delivered and as corrected.
                             let matching = cam_watch.contains(&Some(inp.id));
-                            let raw_stats = if matching { cammatch::measure(&fr.rgba, fr.w, fr.h, cam_roi) } else { None };
+                            let cam_area = cam_areas.iter().find(|(id, _)| *id == Some(inp.id)).map_or(cammatch::DEFAULT_AREA, |(_, area)| *area);
+                            let raw_stats = if matching { cammatch::measure(&fr.rgba, fr.w, fr.h, cam_area) } else { None };
                             inp.colour_fx.luma.apply(&mut fr.rgba);
                             inp.colour_adjust.apply(&mut fr.rgba);
                             inp.colour_fx.apply_lut(&mut fr.rgba);
                             inp.colour_fx.apply_spatial(&mut fr.rgba, fr.w, fr.h);
                             if matching {
-                                cam_samples.push((inp.id, raw_stats, cammatch::measure(&fr.rgba, fr.w, fr.h, cam_roi)));
+                                cam_samples.push((inp.id, raw_stats, cammatch::measure(&fr.rgba, fr.w, fr.h, cam_area)));
                             }
                             // Video Delay inputs that copy this one take the new picture.
                             for delay in delays.values_mut().filter(|delay| delay.source == inp.id) {
@@ -722,7 +750,7 @@ impl App {
                             #[cfg(windows)]
                             gpu_size: None,
                         };
-                        match image::open(path) {
+                        match crate::media_common::open_image(path) {
                             Ok(im) => {
                                 let mut im = im.to_rgba8();
                                 inp.colour_fx.luma.apply(im.as_mut());
@@ -804,9 +832,15 @@ impl App {
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
             let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("program-offscreen"));
             let mut groups: Vec<(OutputRoute, u32, program::Destinations)> = Vec::new();
+            // Replay cameras recorded from their capture threads only need their audio here.
+            let mut captured: Vec<(OutputRoute, u32, Arc<media::Recorder>)> = Vec::new();
             for recording in self.composed_recordings() {
                 let route = recording.route(&self.s.cfg);
                 let audio_source = recording.audio_override.unwrap_or(route.source);
+                if recording.capture.is_some() {
+                    captured.push((route, audio_source, Arc::clone(&recording.recorder)));
+                    continue;
+                }
                 if let Some((_, _, destinations)) = groups.iter_mut().find(|(existing, audio, destinations)| *existing == route && *audio == audio_source && !destinations.key_fill) {
                     destinations.recorders.push(Arc::clone(&recording.recorder));
                 } else {
@@ -864,7 +898,32 @@ impl App {
             let captured_at = Instant::now();
             let nominal = (f64::from(audio::RATE) / self.record_format.1).round() as usize;
             // Groups that ended lose their cursor, so a new output starts a new run.
-            self.group_audio.retain(|(key, _)| groups.iter().any(|(route, audio, _)| (*route, *audio) == *key));
+            self.group_audio.retain(|(key, _)| groups.iter().any(|(route, audio, _)| (*route, *audio) == *key)
+                || captured.iter().any(|(route, audio, _)| (*route, *audio) == *key));
+            let mut captured_audio: Vec<((OutputRoute, u32), audio::Packet)> = Vec::new();
+            // A camera whose audio matches a composed group takes that group's packet below,
+            // so one cursor is read once per frame.
+            let (shared_audio, captured): (Vec<_>, Vec<_>) = captured.into_iter()
+                .partition(|(route, audio, _)| groups.iter().any(|(existing, source, _)| (existing, source) == (route, audio)));
+            for (route, audio_source, recorder) in captured {
+                let key = (route, audio_source);
+                // Cameras with the same audio share one packet, like a composed group.
+                if let Some((_, packet)) = captured_audio.iter().find(|(existing, _)| *existing == key) {
+                    recorder.push_audio_only(captured_at, packet.clone());
+                    continue;
+                }
+                let cursor = match self.group_audio.iter().position(|(existing, _)| *existing == key) {
+                    Some(index) => &mut self.group_audio[index].1,
+                    None => {
+                        self.group_audio.push((key, audio::AudioCursor::default()));
+                        &mut self.group_audio.last_mut().unwrap().1
+                    }
+                };
+                let (end, count) = cursor.window(captured_at, nominal);
+                let packet = self.mix_audio(audio_source, end, count);
+                recorder.push_audio_only(captured_at, packet.clone());
+                captured_audio.push((key, packet));
+            }
             for (route, audio_source, mut recorders) in groups {
                 let cursor = match self.group_audio.iter().position(|(key, _)| *key == (route, audio_source)) {
                     Some(index) => &mut self.group_audio[index].1,
@@ -874,11 +933,14 @@ impl App {
                     }
                 };
                 let (end, count) = cursor.window(captured_at, nominal);
+                let sharing: Vec<_> = shared_audio.iter().filter(|(existing, source, _)| (*existing, *source) == (route, audio_source))
+                    .map(|(_, _, recorder)| recorder).collect();
                 if !recorders.recorders.is_empty() || !recorders.ndi.is_empty() || !recorders.omt.is_empty()
-                    || !recorders.streams.is_empty()
+                    || !recorders.streams.is_empty() || !sharing.is_empty()
                 {
                     recorders.audio = self.mix_audio(audio_source, end, count);
                 }
+                for recorder in sharing { recorder.push_audio_only(captured_at, recorders.audio.clone()); }
                 for (channel, _, packet) in &mut recorders.decklinks {
                     if recorders.key_fill { continue; }
                     let config = self.s.cfg.decklink_outputs[*channel];

@@ -68,7 +68,7 @@ pub(crate) fn network_thumbnail_grid(ui: &mut egui::Ui, dialog: &mut AddDialog) 
         }
     });
 }
-pub(crate) fn input_preview_window(ctx: &egui::Context, s: &mut Switcher, t: f64) {
+pub(crate) fn input_preview_window(ctx: &egui::Context, s: &mut Switcher, t: f64, shared: Option<&media::Shared>) {
     let Some(input) = s.input_preview.and_then(|id| s.input(id)) else { return };
     let title = format!("Input Preview · {}", input.title);
     let viewport = egui::ViewportId::from_hash_of("livemix-input-preview");
@@ -83,6 +83,13 @@ pub(crate) fn input_preview_window(ctx: &egui::Context, s: &mut Switcher, t: f64
             let painter = ui.painter_at(out);
             if input.kind.transparent() {
                 checker(&painter, out);
+            }
+            if matches!(input.kind, Kind::Web { .. }) {
+                if let Some((texture, _)) = input.tex {
+                    painter.image(texture, out, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    if let Some(shared) = shared { crate::web_input::interact(ui, out, input.id, shared); }
+                    return;
+                }
             }
             let live = match input.kind { Kind::Replay { channel, .. } => s.replay_live_source(channel), _ => None };
             if let Some(camera) = live { draw_replay_camera(&painter, out, s, t, camera); }
@@ -821,6 +828,7 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
         let kind = match &inp.kind {
             Kind::Device { link, .. } if link.starts_with("ndi:") => "NDI",
             Kind::Device { link, .. } if link.starts_with("omt:") => "OMT",
+            Kind::Device { link, .. } if link.starts_with("srt:") && inp.sony_camera.is_some() => "Sony Camera / SRT",
             Kind::Device { link, .. } if link.starts_with("srt:") => "SRT",
             Kind::Device { blackmagic: true, .. } => "Camera (Blackmagic)",
             Kind::Device { .. } => "Camera",
@@ -999,24 +1007,41 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
         }
     });
     ui.add_space(4.0);
-    if let Kind::GtTitle { document, texts, .. } = &mut inp.kind {
-        if let Some(document) = document {
-            ui.heading("Title Editor");
-            for (field, default) in &document.fields {
-                ui.label(format!("{field}.Text"));
-                let mut value = texts.get(field).unwrap_or(default).clone();
-                if ui.add(egui::TextEdit::multiline(&mut value).desired_rows(1)).changed() {
-                    let now = ui.input(|i| i.time);
-                    let previous = inp.gt_change.as_ref().filter(|change| {
-                        matches!(document.data_cue((now - change.started) as f32, &change.field), Some(gt::Cue::DataOut(_, _)))
-                    }).map(|change| change.previous.clone()).unwrap_or_else(|| texts.clone());
-                    inp.gt_change = Some(gt::DataChange { started: now, field: field.clone(), previous });
-                    if &value == default {
-                        texts.remove(field);
-                    } else {
-                        texts.insert(field.clone(), value);
+    if let Some(id) = &mut inp.sony_camera {
+        crate::sony_remote::show(ui, inp.id, id);
+    }
+    if inp.sony_camera.is_none() && matches!(&inp.kind, Kind::Device { link, .. } if !link.starts_with("audio:")) {
+        crate::hyperdeck::show(ui, inp.id, &mut inp.hyperdeck_address, &mut inp.hyperdeck_playlist);
+    }
+    if matches!(&inp.kind, Kind::GtTitle { .. }) {
+        let now = ui.input(|i| i.time);
+        let mut edits: Vec<(String, String)> = Vec::new();
+        let mut begin_page = None;
+        if let Kind::GtTitle { document: Some(document), texts, .. } = &inp.kind {
+            let mut fields = |ui: &mut egui::Ui| {
+                for (field, default) in &document.fields {
+                    ui.label(format!("{field}.Text"));
+                    let mut value = texts.get(field).unwrap_or(default).clone();
+                    if ui.add(egui::TextEdit::multiline(&mut value).desired_rows(1)).changed() {
+                        edits.push((field.clone(), value));
                     }
                 }
+            };
+            // A timing tower fills its fields from data, so its editor starts folded away.
+            if inp.timing.as_ref().is_some_and(|source| source.enabled) {
+                ui.collapsing("Title Editor", fields);
+            } else {
+                ui.heading("Title Editor");
+                fields(ui);
+            }
+            let pages = document.pages();
+            if !pages.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label("Play page");
+                    for page in pages {
+                        if ui.button(format!("Page {page}")).clicked() { begin_page = Some(page); }
+                    }
+                });
             }
             if !document.unsupported.is_empty() {
                 ui.collapsing(tr(ui, "This template uses unsupported GT features"), |ui| {
@@ -1026,6 +1051,11 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
                 });
             }
         }
+        for (field, value) in edits {
+            let _ = inp.set_gt_field(&field, value, now);
+        }
+        if let Some(page) = begin_page { let _ = inp.begin_gt_page(page, now); }
+        crate::timing::settings(ui, inp, now);
         if !inp.status.is_empty() {
             ui.colored_label(Color32::LIGHT_RED, &inp.status);
         }
@@ -1129,7 +1159,7 @@ pub(crate) fn input_general(ui: &mut egui::Ui, inp: &mut Input, others: &[(usize
 }
 
 /// Teleprompter: the script, the reading speed and the look of the scrolling text.
-pub(crate) fn input_teleprompter(ui: &mut egui::Ui, inp: &mut Input, browse_script: &mut bool) {
+pub(crate) fn input_teleprompter(ui: &mut egui::Ui, inp: &mut Input, inputs: &[Input], browse_script: &mut bool) {
     let Kind::Teleprompter(cfg) = &mut inp.kind else {
         ui.label(RichText::new("This section belongs to Teleprompter inputs. Add one from Add Input.").color(TEXT_DIM));
         return;
@@ -1163,6 +1193,44 @@ pub(crate) fn input_teleprompter(ui: &mut egui::Ui, inp: &mut Input, browse_scri
         ui.label("Speed");
         ui.add(egui::Slider::new(&mut cfg.lines_per_min, 0.0..=240.0).suffix(" lines/min"));
         ui.end_row();
+        ui.label(tr(ui, "Audio to follow"));
+        let previous = cfg.audio_source;
+        let label = previous.map_or_else(|| tr(ui, "None").to_string(), |id| {
+            inputs.iter().find(|input| input.id == id && input.kind.has_audio())
+                .map_or_else(|| tr(ui, "Source unavailable").to_string(), |input| input.title.clone())
+        });
+        egui::ComboBox::from_id_salt("prompter-audio").selected_text(label).show_ui(ui, |ui| {
+            ui.selectable_value(&mut cfg.audio_source, None, tr(ui, "None"));
+            for (number, input) in inputs.iter().enumerate().filter(|(_, input)| input.kind.has_audio()) {
+                ui.selectable_value(&mut cfg.audio_source, Some(input.id), format!("{} · {}", number + 1, input.title));
+            }
+        });
+        if cfg.audio_source != previous { cfg.last_voice = None; }
+        ui.end_row();
+        if let Some(source) = cfg.audio_source {
+            ui.label(tr(ui, "Speech threshold"));
+            ui.add(egui::Slider::new(&mut cfg.speech_threshold_db, -60.0..=-6.0).integer().suffix(" dBFS"));
+            ui.end_row();
+            ui.label(tr(ui, "Pause after silence"));
+            ui.add(egui::Slider::new(&mut cfg.silence_hold_ms, 0..=3000).suffix(" ms"));
+            ui.end_row();
+            ui.label(tr(ui, "Audio level"));
+            let input = inputs.iter().find(|input| input.id == source && input.kind.has_audio());
+            let status = if input.is_none() { "Source unavailable" }
+                else if !inp.playing { "Paused" }
+                else if cfg.speech_active(ui.input(|input| input.time)) { "Scrolling" }
+                else { "Waiting for speech" };
+            ui.horizontal(|ui| {
+                if let Some(input) = input {
+                    let peak = input.pre_fader_level[0].max(input.pre_fader_level[1]);
+                    if peak > 0.0 {
+                        ui.monospace(format!("{:.0} dBFS", 20.0 * peak.log10()));
+                    }
+                }
+                ui.label(tr(ui, status));
+            });
+            ui.end_row();
+        }
         ui.label("Text size");
         let mut percent = cfg.size * 100.0;
         if ui.add(egui::Slider::new(&mut percent, 2.0..=25.0).suffix(" % of height")).changed() {
@@ -1658,7 +1726,7 @@ pub(crate) fn input_audio_general(ui: &mut egui::Ui, inp: &mut Input) {
             .color(TEXT_DIM));
         return;
     }
-    let post = inp.pre_fader_level.map(|level| level * if inp.audio_on { inp.volume / 100.0 } else { 0.0 });
+    let post = inp.pre_fader_level.map(|level| level * if inp.audio_on { crate::audio::fader_gain(inp.volume) } else { 0.0 });
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(46.0, 152.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.label(RichText::new("Volume").size(10.0).color(TEXT_DIM));

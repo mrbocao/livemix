@@ -247,13 +247,21 @@ pub(crate) fn publish(shared: &Shared, mut frame: Frame) {
             pixel[3] = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
         }
     }
+    shared.tap_frame(&frame);
     *shared.size.lock().unwrap() = (frame.w, frame.h);
     *shared.frame.lock().unwrap() = Some(frame);
     shared.seq.fetch_add(1, Relaxed);
 }
 
 pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>, opts: RecOpts, index: Option<&crate::media_common::ReplayIndex>) -> Result<(), String> {
-    let Ok(first) = rx.recv() else { return Ok(()) };
+    // Audio-only frames (pictures from a capture thread) before the first picture are kept
+    // for it; the file's size comes from the first picture.
+    let mut early_audio = Vec::new();
+    let first = loop {
+        let Ok(frame) = rx.recv() else { return Ok(()) };
+        if frame.w > 0 && frame.h > 0 { break frame; }
+        early_audio.extend(frame.audio.iter().copied());
+    };
     let profile = opts.format.ffmpeg_profile();
     let (n, d) = rate_fraction(opts.fps);
     let size = opts.size.unwrap_or((first.w as u32, first.h as u32));
@@ -272,7 +280,16 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
         if !profile.audio.starts_with("pcm") { cmd.args(["-b:a", "192k"]); }
     } else { cmd.arg("-an"); }
     crate::stream::hardware_only(&mut cmd, encoder);
-    cmd.args(profile.extra);
+    if index.is_some() && crate::replay::fragmented_mp4(path) {
+        if encoder == profile.video {
+            cmd.args(["-preset", "ultrafast", "-tune", "zerolatency"]);
+        }
+        if profile.video == "libx265" { cmd.args(["-tag:v", "hvc1"]); }
+        cmd.args(["-bf", "0", "-force_key_frames", "expr:gte(t,n_forced*0.25)", "-movflags",
+            "+empty_moov+default_base_moof+frag_keyframe", "-frag_duration", "250000", "-flush_packets", "1"]);
+    } else {
+        cmd.args(profile.extra);
+    }
     let mut child = cmd.args(["-f", profile.container]).arg(path)
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
         .map_err(|e| format!("Could not start FFmpeg: {e}"))?;
@@ -291,7 +308,12 @@ pub(crate) fn record(path: &str, rx: Receiver<RecFrame>, status: &Mutex<String>,
         let mut next = 0_u64;
         let mut previous: Option<Arc<Vec<u8>>> = None;
         let mut written = 0;
+        pipe.queue_audio(&early_audio);
         for frame in std::iter::once(first).chain(rx) {
+            if frame.w == 0 || frame.h == 0 {
+                pipe.queue_audio(&frame.audio);
+                continue;
+            }
             if (frame.w, frame.h, frame.bgra) != dimensions { continue; }
             let slot = (frame.captured_at.saturating_duration_since(start).as_secs_f64()
                 * f64::from(n) / f64::from(d)).round() as u64;
@@ -346,6 +368,8 @@ fn recording_profiles_mux_video_and_stereo_audio() {
             tx.send(RecFrame {
                 #[cfg(windows)]
                 surface: None,
+                #[cfg(windows)]
+                nv12: false,
                 audio: audio.clone(),
                 pixels: pixels.clone(),
                 w: 320,
@@ -361,7 +385,7 @@ fn recording_profiles_mux_video_and_stereo_audio() {
         if format == RecordFormat::Wmv9 {
             let error = Arc::new(Mutex::new(String::new()));
             crate::media::record_thread(path.to_str().unwrap().to_owned(), rx, error.clone(),
-                Arc::default(), opts, None, Arc::default());
+                Arc::default(), opts, None, Arc::default(), Arc::default());
             let error = error.lock().unwrap().clone();
             assert!(error.is_empty(), "{error}");
         } else {

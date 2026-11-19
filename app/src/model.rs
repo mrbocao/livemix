@@ -166,6 +166,13 @@ pub struct Prompter {
     /// highlighted when `guide` is on.
     pub guide: bool,
     pub guide_pos: f32,
+    /// Stable input ID. Zero denotes a configured source that is missing.
+    #[serde(skip)]
+    pub audio_source: Option<u32>,
+    pub speech_threshold_db: f32,
+    pub silence_hold_ms: u32,
+    #[serde(skip)]
+    pub last_voice: Option<(u32, f64)>,
     /// Lines in the wrapped script, measured by the renderer so the scroll stops at the end.
     #[serde(skip)]
     pub measured: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -186,6 +193,10 @@ impl Default for Prompter {
             background: [0, 0, 0],
             guide: true,
             guide_pos: 0.35,
+            audio_source: None,
+            speech_threshold_db: -36.0,
+            silence_hold_ms: 450,
+            last_voice: None,
             measured: Default::default(),
         }
     }
@@ -231,6 +242,20 @@ pub fn decode_script(bytes: &[u8]) -> String {
 
 impl Prompter {
     /// Wrapped lines in the script as measured by the last draw (0 before the first draw).
+    pub fn speech_active(&self, now: f64) -> bool {
+        self.last_voice.is_some_and(|(source, heard)| self.audio_source == Some(source)
+            && now - heard <= f64::from(self.silence_hold_ms.min(3000)) / 1000.0)
+    }
+
+    fn audio_allows_scroll(&mut self, now: f64, peak: Option<f32>) -> bool {
+        let Some(source) = self.audio_source else { self.last_voice = None; return true; };
+        let Some(peak) = peak else { self.last_voice = None; return false; };
+        let threshold = self.speech_threshold_db.clamp(-60.0, -6.0);
+        let threshold = if self.speech_active(now) { threshold - 3.0 } else { threshold };
+        if peak >= 10.0_f32.powf(threshold / 20.0) { self.last_voice = Some((source, now)); }
+        self.speech_active(now)
+    }
+
     pub fn lines(&self) -> f32 {
         f32::from_bits(self.measured.load(std::sync::atomic::Ordering::Relaxed))
     }
@@ -267,7 +292,7 @@ impl Kind {
     pub fn has_audio(&self) -> bool {
         match self {
             Kind::Replay { path, .. } => !path.is_empty(),
-            _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::VideoDelay { .. }),
+            _ => matches!(self, Kind::Device { .. } | Kind::VideoFile { .. } | Kind::AudioFile { .. } | Kind::VideoList { .. } | Kind::VideoDelay { .. } | Kind::Web { .. }),
         }
     }
     /// The input a Video Delay copies (None for every other kind).
@@ -488,6 +513,9 @@ pub struct Input {
     pub volume: f32,
     pub audio_effects: crate::audio::Effects,
     pub ptz_address: String,
+    pub hyperdeck_address: String,
+    pub sony_camera: Option<String>,
+    pub hyperdeck_playlist: String,
     pub on_program: String,
     pub colour_adjust: ColourAdjust,
     pub colour_fx: crate::colour_fx::Effects,
@@ -541,7 +569,13 @@ pub struct Input {
     pub decklink_port: u32,
     pub decklink_mode: u32,
     pub decklink_audio_channels: u8,
-    pub gt_change: Option<crate::gt::DataChange>,
+    /// GT fields that changed recently, each with its own data-change animation.
+    pub gt_changes: Vec<crate::gt::DataChange>,
+    /// The page animation of a GT title that is playing: its number and when it started.
+    pub gt_page: Option<(usize, f64)>,
+    /// Live timing source of a GT title, and what its last read did.
+    pub timing: Option<crate::timing::Source>,
+    pub timing_run: crate::timing::Runtime,
     pub cam_modes: Vec<crate::media::CamMode>,
     pub cam_current: Option<crate::media::CamMode>,
 }
@@ -554,6 +588,39 @@ impl Input {
         let loaded = crate::gt::Document::load(std::path::Path::new(path))?;
         *document = Some(std::sync::Arc::new(loaded));
         self.status.clear();
+        Ok(())
+    }
+
+    /// Sets a GT field by name (with or without `.Text`) and starts its data-change animation.
+    /// Returns whether the text changed.
+    pub fn set_gt_field(&mut self, field: &str, value: String, now: f64) -> Result<bool, String> {
+        let Kind::GtTitle { texts, document: Some(document), .. } = &mut self.kind else {
+            return Err("This input is not a GT Title.".into());
+        };
+        let lower = field.to_ascii_lowercase();
+        let (name, default) = document.fields.iter().find(|(name, _)| {
+            name.eq_ignore_ascii_case(field) || lower.strip_suffix(".text").is_some_and(|base| name.eq_ignore_ascii_case(base))
+        }).map(|(name, default)| (name.clone(), default.clone())).ok_or("Unknown GT title field")?;
+        let current = texts.get(&name).unwrap_or(&default).clone();
+        if current == value { return Ok(false); }
+        let age = |change: &crate::gt::DataChange| (now - change.started).max(0.0) as f32;
+        // A field that was still animating out keeps showing the text it was leaving.
+        let previous = self.gt_changes.iter().find(|change| {
+            change.field == name && matches!(document.data_cue(age(change), &change.field), Some(crate::gt::Cue::DataOut(_, _)))
+        }).map_or(current, |change| change.previous.clone());
+        if value == default { texts.remove(&name); } else { texts.insert(name.clone(), value); }
+        self.gt_changes.retain(|change| change.field != name && document.data_cue(age(change), &change.field).is_some());
+        self.gt_changes.push(crate::gt::DataChange { started: now, field: name, previous });
+        Ok(true)
+    }
+
+    /// Plays a page animation (`Page1`, `Page2`…) of a GT title once.
+    pub fn begin_gt_page(&mut self, page: usize, now: f64) -> Result<(), String> {
+        let Kind::GtTitle { document: Some(document), .. } = &self.kind else {
+            return Err("This input is not a GT Title.".into());
+        };
+        if document.page_seconds(page).is_none() { return Err(format!("This title has no Page{page} animation")); }
+        self.gt_page = Some((page, now));
         Ok(())
     }
 
@@ -575,9 +642,13 @@ impl Input {
             audio_on: true,
             solo: false,
             solo_pfl: false,
-            volume: 80.0,
+            // mz::.ctor: a new input starts at gain 1 on both channels = fader 100.
+            volume: 100.0,
             audio_effects: Default::default(),
             ptz_address: String::new(),
+            hyperdeck_address: String::new(),
+            sony_camera: None,
+            hyperdeck_playlist: String::new(),
             on_program: String::new(),
             colour_adjust: Default::default(),
             colour_fx: Default::default(),
@@ -616,7 +687,10 @@ impl Input {
             decklink_port: 0,
             decklink_mode: 0,
             decklink_audio_channels: 2,
-            gt_change: None,
+            gt_changes: Vec::new(),
+            gt_page: None,
+            timing: None,
+            timing_run: Default::default(),
             cam_modes: Vec::new(),
             cam_current: None,
         }
@@ -922,6 +996,8 @@ pub enum AddKind {
     Zoom,
     Telestrator,
     // extras of this app
+    HyperDeck,
+    SonySrt,
     Clock,
     Teleprompter,
     TestCamera,
@@ -929,7 +1005,7 @@ pub enum AddKind {
     TestImage,
 }
 
-pub const ADD_KINDS: [AddKind; 27] = [
+pub const ADD_KINDS: [AddKind; 29] = [
     AddKind::VideoFile,
     AddKind::Dvd,
     AddKind::List,
@@ -952,6 +1028,8 @@ pub const ADD_KINDS: [AddKind; 27] = [
     AddKind::Zoom,
     AddKind::Telestrator,
     AddKind::Mix,
+    AddKind::HyperDeck,
+    AddKind::SonySrt,
     AddKind::Clock,
     AddKind::Teleprompter,
     AddKind::TestCamera,
@@ -969,6 +1047,8 @@ impl AddKind {
             AddKind::Dvd => "DVD",
             AddKind::List => "List",
             AddKind::Camera => "Camera",
+            AddKind::HyperDeck => "Blackmagic HyperDeck",
+            AddKind::SonySrt => "Sony Camera / SRT",
             AddKind::Desktop => "NDI / OMT / Desktop Capture",
             AddKind::StreamSrt => "Stream / SRT",
             AddKind::Replay => "Instant Replay",
@@ -1017,6 +1097,8 @@ impl AddKind {
         match self {
             AddKind::VideoFile => "A video file (MP4, MOV, WMV, AVI, MKV…). Plays, pauses, restarts and loops.",
             AddKind::List => "Several video files played one after another. Loop repeats the whole list.",
+            AddKind::SonySrt => "Receive a Sony camera as an SRT listener and link it to the Sony control bridge.",
+            AddKind::HyperDeck => "Control a HyperDeck over Ethernet and select the device that receives its video.",
             AddKind::Camera => "A webcam, USB camera, HDMI/SDI capture card, Blackmagic device or NDI Webcam on this computer.",
             AddKind::Desktop => "Choose an NDI or OMT source or capture this computer's main screen.",
             AddKind::ImageSequence => "A folder of numbered pictures (PNG with transparency works as a stinger) played as a clip at the output frame rate.",
@@ -1045,7 +1127,7 @@ impl AddKind {
         }
     }
     pub fn uses_device(self) -> bool {
-        matches!(self, AddKind::Camera | AddKind::AudioInput)
+        matches!(self, AddKind::Camera | AddKind::HyperDeck | AddKind::AudioInput)
     }
 }
 
@@ -1075,6 +1157,7 @@ pub struct AddDialog {
     pub omt_sources: Vec<String>,
     pub omt_status: String,
     pub srt: crate::srt::Connection,
+    pub sony_srt: crate::srt::Connection,
     pub path: String,
     /// Colour type options of the original (frmInput rColour / rTransparent / rColourBars):
     /// 0 = Colour, 1 = Transparent, 2 = Colour Bars.
@@ -1258,6 +1341,9 @@ pub struct DeckLinkRoute {
     pub key_fill: bool,
     pub ten_bit: bool,
     pub multichannel_audio: bool,
+    pub format_size: Option<u8>,
+    pub format_rate: Option<u8>,
+    pub format_interlaced: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1501,6 +1587,8 @@ pub struct Settings {
     pub directshow: crate::settings_xml::DirectShow,
     pub record_audio: [bool; 3],
     pub production_clock: bool,
+    pub production_clocks: [crate::production_clock::Config; 2],
+    pub bus_devices: [Option<String>; 8],
     pub default_audio_bus: usize,
     pub default_audio_delay_ms: u32,
     pub default_auto_mix: bool,
@@ -1642,6 +1730,8 @@ impl Default for Settings {
             directshow: Default::default(),
             record_audio: [true; 3],
             production_clock: true,
+            production_clocks: crate::production_clock::defaults(),
+            bus_devices: Default::default(),
             default_audio_bus: 0,
             default_audio_delay_ms: 0,
             default_auto_mix: false,
@@ -1890,6 +1980,8 @@ impl Switcher {
             format!("directshow={}", serde_json::to_string(&c.directshow).unwrap_or_default()),
             format!("record_audio={}", c.record_audio.map(b).join(",")),
             format!("production_clock={}", b(c.production_clock)),
+            format!("production_clocks={}", serde_json::to_string(&c.production_clocks).unwrap_or_default()),
+            format!("bus_devices={}", serde_json::to_string(&c.bus_devices).unwrap_or_default()),
             format!("default_audio_bus={}", c.default_audio_bus),
             format!("default_audio_delay_ms={}", c.default_audio_delay_ms),
             format!("default_auto_mix={}", b(c.default_auto_mix)),
@@ -1920,8 +2012,9 @@ impl Switcher {
             format!("omt_quality={}", serde_json::to_string(&c.omt_quality).unwrap_or_default()),
             format!("srt_outputs={}", serde_json::to_string(&c.srt_outputs).unwrap_or_default()),
             format!("decklink_outputs={}", c.decklink_outputs.iter().map(|route| {
-                format!("{},{},{},{},{},{},{},{}", route.device.map_or(-1, |n| n as i64), route.port, route.mode,
-                    route.audio_bus, route.audio_delay_ms, u8::from(route.key_fill), u8::from(route.ten_bit), u8::from(route.multichannel_audio))
+                format!("{},{},{},{},{},{},{},{},{},{},{}", route.device.map_or(-1, |n| n as i64), route.port, route.mode,
+                    route.audio_bus, route.audio_delay_ms, u8::from(route.key_fill), u8::from(route.ten_bit), u8::from(route.multichannel_audio), route.format_size.map_or(-1, i16::from),
+                    route.format_rate.map_or(-1, i16::from), u8::from(route.format_interlaced))
             }).collect::<Vec<_>>().join(";")),
             format!("ext_overlays={}", b(c.outputs[0].overlays)),
             format!("additional_outputs={}", c.outputs[1..].iter()
@@ -2028,6 +2121,8 @@ impl Switcher {
                     }
                 }
                 "production_clock" => c.production_clock = on,
+                "production_clocks" => c.production_clocks = serde_json::from_str(v).unwrap_or_else(|_| crate::production_clock::defaults()),
+                "bus_devices" => c.bus_devices = serde_json::from_str(v).unwrap_or_default(),
                 "default_audio_bus" => c.default_audio_bus = v.parse::<usize>().unwrap_or(0).min(2),
                 "default_audio_delay_ms" => c.default_audio_delay_ms = v.parse::<u32>().unwrap_or(0).min(1000),
                 "default_auto_mix" => c.default_auto_mix = on,
@@ -2090,6 +2185,9 @@ impl Switcher {
                             route.key_fill = extra.get(2) == Some(&"1");
                             route.ten_bit = extra.get(3) == Some(&"1");
                             route.multichannel_audio = extra.get(4) == Some(&"1");
+                            route.format_size = extra.get(5).and_then(|value| value.parse::<u8>().ok()).filter(|&i| usize::from(i) < OUTPUT_SIZES.len());
+                            route.format_rate = extra.get(6).and_then(|value| value.parse::<u8>().ok()).filter(|&i| usize::from(i) < FRAME_RATES.len());
+                            route.format_interlaced = extra.get(7) == Some(&"1");
                         }
                     }
                 }
@@ -2284,6 +2382,7 @@ impl Switcher {
                 omt_sources: Vec::new(),
                 omt_status: String::new(),
                 srt: crate::srt::Settings::default().connection,
+                sony_srt: crate::srt::Connection { listen: true, key_bytes: 16, port: 9000, latency_ms: 120, ..Default::default() },
                 path: String::new(),
                 colour_mode: 0,
                 list: Vec::new(),
@@ -2301,7 +2400,8 @@ impl Switcher {
             filter: None,
             confirm_close: None,
             program_audio_level: [0.0; 2],
-            master_volume: 85.0,
+            // bg::.ctor (0x0600027d): every bus, Master included, starts at gain 1 = fader 100.
+            master_volume: 100.0,
             master_on: true,
             pause_preview: true,
             play_active: true,
@@ -3099,6 +3199,12 @@ impl Switcher {
             }
         }
         for i in &mut self.inputs {
+            if let Kind::Teleprompter(cfg) = &mut i.kind {
+                if cfg.audio_source == Some(id) {
+                    cfg.audio_source = Some(0);
+                    cfg.last_voice = None;
+                }
+            }
             if i.mix_preview == Some(id) { i.mix_preview = None; }
             if i.mix_fade.is_some_and(|(source, _)| source == id) { i.mix_fade = None; }
             for l in i.layers.iter_mut().filter(|l| l.input == Some(id)) {
@@ -3197,14 +3303,23 @@ impl Switcher {
             self.frame_acc -= frame;
             self.output_frame();
         }
+        // Pre-fader meters let a microphone drive the prompter while muted on air.
+        let mut audio_peaks = Vec::new();
+        if self.inputs.iter().any(|input| matches!(&input.kind, Kind::Teleprompter(cfg) if cfg.audio_source.is_some())) {
+            audio_peaks.extend(self.inputs.iter().filter(|input| input.kind.has_audio())
+                .map(|input| (input.id, input.pre_fader_level[0].max(input.pre_fader_level[1]))));
+        }
         // playback
         for i in &mut self.inputs {
-            if let Kind::Teleprompter(cfg) = &i.kind {
+            if let Kind::Teleprompter(cfg) = &mut i.kind {
                 // Scroll in lines; the length comes from the renderer once the script is laid out.
                 let lines = cfg.lines();
                 i.duration = lines;
-                if i.playing {
-                    i.pos += dt * cfg.lines_per_min.max(0.0) / 60.0;
+                let peak = cfg.audio_source.and_then(|source| audio_peaks.iter().find(|&&(id, _)| id == source).map(|&(_, peak)| peak));
+                if !i.playing { cfg.last_voice = None; }
+                if i.playing && cfg.audio_allows_scroll(t, peak) {
+                    let elapsed = if cfg.audio_source.is_some() { dt.min(0.1) } else { dt };
+                    i.pos += elapsed * cfg.lines_per_min.max(0.0) / 60.0;
                     if lines > 0.0 && i.pos >= lines {
                         if i.loop_on {
                             i.pos = 0.0;
@@ -3292,7 +3407,10 @@ impl Switcher {
         let seed = self.next_id;
         let file_name = std::path::Path::new(d.path.trim()).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let (kind, default_name) = match d.kind {
-            AddKind::Camera | AddKind::AudioInput => {
+            AddKind::Camera | AddKind::HyperDeck | AddKind::AudioInput => {
+                if d.kind == AddKind::HyperDeck && d.path.trim().parse::<std::net::IpAddr>().is_err() {
+                    return Err("Enter the HyperDeck IP address.".into());
+                }
                 let Some(dev) = devices.get(d.device) else {
                     return Err(if d.kind == AddKind::AudioInput {
                         "No audio input found. Check microphone permissions and connected devices, then press Refresh.".into()
@@ -3330,10 +3448,20 @@ impl Switcher {
                 let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
                 (Kind::AudioFile { path: d.path.trim().into() }, name)
             }
-            AddKind::StreamSrt => {
-                d.srt.url()?;
-                let link = format!("srt:{}", serde_json::to_string(&d.srt).map_err(|e| e.to_string())?);
-                (Kind::Device { link, blackmagic: false }, d.srt.label())
+            AddKind::StreamSrt | AddKind::SonySrt => {
+                let sony = d.kind == AddKind::SonySrt;
+                let connection = if sony { &d.sony_srt } else { &d.srt };
+                connection.url()?;
+                if d.kind == AddKind::SonySrt && self.inputs.iter().any(|input| {
+                    matches!(&input.kind, Kind::Device { link, .. } if link.strip_prefix("srt:")
+                        .and_then(|json| serde_json::from_str::<crate::srt::Connection>(json).ok())
+                        .is_some_and(|other| other.listen && other.port == connection.port))
+                }) {
+                    return Err(format!("UDP port {} already belongs to a LiveMix SRT listener", connection.port));
+                }
+                let link = format!("srt:{}", serde_json::to_string(connection).map_err(|e| e.to_string())?);
+                let name = if sony { format!("Sony Camera · SRT :{}", connection.port) } else { connection.label() };
+                (Kind::Device { link, blackmagic: false }, name)
             }
             AddKind::Replay => {
                 self.ensure_replay_inputs();
@@ -3427,7 +3555,11 @@ impl Switcher {
         }
         i.decklink_port = d.decklink_port;
         i.decklink_mode = d.decklink_mode;
-        if d.kind == AddKind::Camera && matches!(&i.kind, Kind::Device { link, .. } if d.cam_modes_link == *link) {
+        if d.kind == AddKind::HyperDeck { i.hyperdeck_address = d.path.trim().into(); }
+        if d.kind == AddKind::SonySrt {
+            i.sony_camera = Some(String::new());
+        }
+        if matches!(d.kind, AddKind::Camera | AddKind::HyperDeck) && matches!(&i.kind, Kind::Device { link, .. } if d.cam_modes_link == *link) {
             i.cam_mode = d.cam_mode.clone();
             i.cam_modes = d.cam_modes.clone();
             i.cam_audio = d.cam_audio.clone();
@@ -3441,7 +3573,9 @@ impl Switcher {
         if matches!(d.kind, AddKind::ImageSequence | AddKind::Photos) {
             i.loop_on = true;
         }
+        let next_sony_port = (d.kind == AddKind::SonySrt).then(|| d.sony_srt.port.saturating_add(1));
         let id = self.add(i);
+        if let Some(port) = next_sony_port { self.add_dialog.sony_srt.port = port; }
         if self.preview.is_none() {
             self.select_preview(id);
         }
@@ -3610,7 +3744,8 @@ impl Switcher {
                 Kind::Telestrator { strokes } => ("telestrator",
                     serde_json::to_string(strokes).unwrap_or_else(|_| "[]".into()), String::new()),
                 Kind::Teleprompter(prompter) => ("teleprompter",
-                    serde_json::to_string(prompter).unwrap_or_else(|_| "{}".into()), String::new()),
+                    serde_json::to_string(prompter).unwrap_or_else(|_| "{}".into()),
+                    prompter.audio_source.map(|id| self.number_of(id).to_string()).unwrap_or_default()),
             };
             let cat = i.category.map(|c| c.to_string()).unwrap_or_default();
             let k = i.key;
@@ -3680,6 +3815,9 @@ impl Switcher {
             }
             if let Some(audio) = &i.cam_audio {
                 out.push_str(&format!("camaudio\t{}\t{}\n", n + 1, audio.replace(['\t', '\n'], " ")));
+            }
+            if let Some(json) = i.timing.as_ref().and_then(|source| serde_json::to_string(source).ok()) {
+                out.push_str(&format!("timing\t{}\t{}\n", n + 1, json));
             }
             if i.audio_effects != crate::audio::Effects::default() {
                 if let Ok(fx) = serde_json::to_string(&i.audio_effects) {
@@ -3787,6 +3925,7 @@ impl Switcher {
         let mut ids = Vec::new();
         // Video Delay source input numbers, resolved once every input exists.
         let mut delay_sources: Vec<(usize, usize)> = Vec::new();
+        let mut prompter_sources = Vec::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split('\t').collect();
             match f.first().copied() {
@@ -3859,7 +3998,16 @@ impl Switcher {
                             delay_sources.push((ids.len(), n));
                         }
                     }
+                    if matches!(i.kind, Kind::Teleprompter(_)) {
+                        if let Ok(source) = f[4].parse::<usize>() { prompter_sources.push((ids.len(), source)); }
+                    }
                     ids.push(s.add(i));
+                }
+                Some("timing") if f.len() >= 3 => {
+                    let n: usize = f[1].parse().unwrap_or(0);
+                    if let Some(i) = n.checked_sub(1).and_then(|k| ids.get(k)).copied().and_then(|id| s.input_mut(id)) {
+                        i.timing = serde_json::from_str::<crate::timing::Source>(f[2]).ok().map(crate::timing::Source::normalized);
+                    }
                 }
                 Some("camaudio") if f.len() >= 3 => {
                     let n: usize = f[1].parse().unwrap_or(0);
@@ -4042,6 +4190,12 @@ impl Switcher {
                 if let Kind::VideoDelay { source: field, .. } = &mut input.kind {
                     *field = source;
                 }
+            }
+        }
+        for (index, number) in prompter_sources {
+            let source = number.checked_sub(1).and_then(|n| ids.get(n)).copied().unwrap_or(0);
+            if let Some(Kind::Teleprompter(cfg)) = s.inputs.get_mut(index).map(|input| &mut input.kind) {
+                cfg.audio_source = Some(source);
             }
         }
         s.preset_name = "livemix_preset".into();
@@ -4433,6 +4587,43 @@ mod tests {
         let input = s.input(id).unwrap();
         assert_eq!(input.pos, 5.0);
         assert!(!input.playing, "the scroll stops at the end of the script");
+    }
+
+    #[test]
+    fn teleprompter_follows_audio_without_releasing_manual_pause() {
+        let mut s = Switcher::empty();
+        let discarded = s.add(Input::new(0, "Discard", Kind::Blank));
+        let mic = s.add(Input::new(0, "Mic", Kind::Device { link: "audio:test".into(), blackmagic: false }));
+        let id = s.add(Input::new(0, "Prompter", Kind::Teleprompter(Prompter {
+            audio_source: Some(mic), lines_per_min: 60.0, ..Default::default()
+        })));
+        s.remove_input(discarded);
+        s.input_mut(id).unwrap().playing = true;
+        s.tick(0.0, 0.1);
+        assert_eq!(s.input(id).unwrap().pos, 0.0);
+        let input = s.input_mut(mic).unwrap();
+        input.audio_on = false;
+        input.pre_fader_level = [0.1, 0.0];
+        s.tick(0.1, 0.1);
+        assert_eq!(s.input(id).unwrap().pos, 0.1);
+        s.input_mut(mic).unwrap().pre_fader_level = [0.0; 2];
+        s.tick(0.3, 0.1);
+        s.tick(0.7, 0.1);
+        assert_eq!(s.input(id).unwrap().pos, 0.2);
+        assert!(s.input(id).unwrap().playing);
+        s.input_mut(id).unwrap().playing = false;
+        s.input_mut(mic).unwrap().pre_fader_level = [0.1, 0.0];
+        s.tick(0.8, 0.1);
+        assert_eq!(s.input(id).unwrap().pos, 0.2);
+        let mut reopened = Switcher::empty();
+        reopened.load_preset_text(&s.preset_text());
+        let Kind::Teleprompter(cfg) = &reopened.inputs[1].kind else { panic!("expected Teleprompter") };
+        assert_eq!(cfg.audio_source, Some(reopened.inputs[0].id));
+        assert!(cfg.last_voice.is_none());
+        s.input_mut(id).unwrap().playing = true;
+        s.remove_input(mic);
+        s.tick(0.9, 0.1);
+        assert_eq!(s.input(id).unwrap().pos, 0.2);
     }
 
     #[test]

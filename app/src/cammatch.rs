@@ -20,12 +20,17 @@ pub struct Stats {
     pub p95: f32,
     /// Mean HSV saturation of display-referred pixels (0..1).
     pub sat: f32,
+    /// Share of pixels in 32 display-luma bins, dark to bright.
+    pub hist: [f32; 32],
 }
 
 impl Stats {
     fn blend(self, new: Stats, k: f32) -> Stats {
         let mix = |a: f32, b: f32| a + (b - a) * k;
+        let mut hist = [0.0; 32];
+        for (bin, out) in hist.iter_mut().enumerate() { *out = mix(self.hist[bin], new.hist[bin]); }
         Stats {
+            hist,
             lin: [mix(self.lin[0], new.lin[0]), mix(self.lin[1], new.lin[1]), mix(self.lin[2], new.lin[2])],
             luma: mix(self.luma, new.luma),
             p5: mix(self.p5, new.p5),
@@ -33,11 +38,6 @@ impl Stats {
             p95: mix(self.p95, new.p95),
             sat: mix(self.sat, new.sat),
         }
-    }
-
-    /// Mean colour as display bytes, for swatches.
-    pub fn display_rgb(&self) -> [u8; 3] {
-        [0, 1, 2].map(|c| (encode(self.lin[c]) * 255.0).round().clamp(0.0, 255.0) as u8)
     }
 }
 
@@ -58,16 +58,32 @@ fn encode(linear: f32) -> f32 {
     if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
-/// Measures the central `roi` fraction of an RGBA picture, using at most ~16k samples.
+/// A rectangle of the picture as fractions: left, top, right, bottom.
+pub type Area = [f32; 4];
+/// The whole picture.
+#[cfg(test)]
+pub const FULL: Area = [0.0, 0.0, 1.0, 1.0];
+/// The centre half of the picture, used until the operator drags a rectangle.
+pub const DEFAULT_AREA: Area = [0.25, 0.25, 0.75, 0.75];
+
+fn parse_area(text: &str) -> Option<Area> {
+    let v: Vec<f32> = text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+    let area: Area = v.try_into().ok()?;
+    (area.iter().all(|n| (0.0..=1.0).contains(n)) && area[2] - area[0] >= 0.02 && area[3] - area[1] >= 0.02).then_some(area)
+}
+
+/// Measures a rectangle of an RGBA picture, using at most ~16k samples.
 /// Clipped (≥250) and crushed (≤5) pixels are left out so they do not bias the averages.
-pub fn measure(rgba: &[u8], w: usize, h: usize, roi: f32) -> Option<Stats> {
+pub fn measure(rgba: &[u8], w: usize, h: usize, area: Area) -> Option<Stats> {
     if w == 0 || h == 0 || rgba.len() < w * h * 4 { return None; }
-    let roi = roi.clamp(0.1, 1.0);
-    let (rw, rh) = (((w as f32 * roi) as usize).clamp(1, w), ((h as f32 * roi) as usize).clamp(1, h));
-    let (x0, y0) = ((w - rw) / 2, (h - rh) / 2);
+    let x0 = ((w as f32 * area[0].clamp(0.0, 1.0)) as usize).min(w - 1);
+    let y0 = ((h as f32 * area[1].clamp(0.0, 1.0)) as usize).min(h - 1);
+    let x1 = ((w as f32 * area[2].clamp(0.0, 1.0)).ceil() as usize).clamp(x0 + 1, w);
+    let y1 = ((h as f32 * area[3].clamp(0.0, 1.0)).ceil() as usize).clamp(y0 + 1, h);
+    let (rw, rh) = (x1 - x0, y1 - y0);
     let step = ((rw * rh) as f32 / 16_384.0).sqrt().ceil().max(1.0) as usize;
     let table = decode_table();
-    let mut sum = [0.0f64; 3];
+    let mut sum = [0.0f64; 3]; // linear light
     let mut sat = 0.0f64;
     let mut histogram = [0u32; 256];
     let mut count = 0u32;
@@ -103,6 +119,7 @@ pub fn measure(rgba: &[u8], w: usize, h: usize, roi: f32) -> Option<Stats> {
         p50: percentile(0.5),
         p95: percentile(0.95),
         sat: (sat / n) as f32,
+        hist: std::array::from_fn(|bin| histogram[bin * 8..bin * 8 + 8].iter().sum::<u32>() as f32 / count as f32),
     })
 }
 
@@ -146,6 +163,8 @@ impl Camera {
 pub struct Suggestion {
     /// Untranslated label, e.g. "Exposure".
     pub setting: &'static str,
+    /// Plain-language headline, e.g. "The target is darker".
+    pub summary: &'static str,
     pub value: String,
     /// Untranslated note, empty when none.
     pub note: &'static str,
@@ -208,7 +227,7 @@ pub fn suggest(reference: &Stats, target: &Stats, ref_cam: &Camera, tgt_cam: &Ca
     let mut out = Vec::new();
     let ev = delta_ev(reference, target);
     if ev.abs() < 0.15 {
-        out.push(Suggestion { setting: "Exposure", value: format!("{ev:+.2} EV"), note: "", matched: true });
+        out.push(Suggestion { setting: "Exposure", summary: "Brightness matches", value: format!("{ev:+.2} EV"), note: "", matched: true });
     } else {
         let base = if tgt_cam.exposure_known() { Some((tgt_cam, "")) }
             else if ref_cam.exposure_known() { Some((ref_cam, "Based on the reference camera's settings")) }
@@ -217,17 +236,20 @@ pub fn suggest(reference: &Stats, target: &Stats, ref_cam: &Camera, tgt_cam: &Ca
             Some((cam, note)) => {
                 let plan = exposure_plan(ev, cam, fps);
                 for (index, (text, _)) in plan.into_iter().enumerate() {
-                    out.push(Suggestion { setting: if index == 0 { "Exposure" } else { "Exposure (then)" }, value: text, note, matched: false });
+                    out.push(Suggestion { setting: if index == 0 { "Exposure" } else { "Exposure (then)" },
+                        summary: if index > 0 { "" } else if ev > 0.0 { "The target is darker" } else { "The target is brighter" },
+                        value: text, note, matched: false });
                 }
             }
             None => out.push(Suggestion { setting: "Exposure",
+                summary: if ev > 0.0 { "The target is darker" } else { "The target is brighter" },
                 value: format!("{} {:.1} EV ({:+.0}%)", if ev > 0.0 { "Open up" } else { "Close down" }, ev.abs(), (2f32.powf(ev) - 1.0) * 100.0),
                 note: "Enter the camera settings for exact values", matched: false }),
         }
     }
     let mired = wb_mired(reference, target);
     if mired.abs() < 6.0 {
-        out.push(Suggestion { setting: "White balance", value: format!("{mired:+.0} mired"), note: "", matched: true });
+        out.push(Suggestion { setting: "White balance", summary: "Colour temperature matches", value: format!("{mired:+.0} mired"), note: "", matched: true });
     } else {
         let value = if tgt_cam.kelvin > 0.0 {
             let now = 1.0e6 / tgt_cam.kelvin;
@@ -237,27 +259,27 @@ pub fn suggest(reference: &Stats, target: &Stats, ref_cam: &Camera, tgt_cam: &Ca
             let to = 1.0e6 / (1.0e6 / 5600.0 - mired).clamp(60.0, 500.0);
             format!("{} {:.0} mired (≈ {:.0} K around 5600 K)", if mired > 0.0 { "Raise by" } else { "Lower by" }, mired.abs(), to)
         };
-        out.push(Suggestion { setting: "White balance", value, note: if mired > 0.0 { "Target is bluer: warm it up" } else { "Target is warmer: cool it down" }, matched: false });
+        out.push(Suggestion { setting: "White balance", summary: if mired > 0.0 { "The target looks bluer (cooler)" } else { "The target looks more orange (warmer)" }, value, note: if mired > 0.0 { "Target is bluer: warm it up" } else { "Target is warmer: cool it down" }, matched: false });
     }
     let green = tint(target) - tint(reference);
     if green.abs() < 0.02 {
-        out.push(Suggestion { setting: "Tint", value: "OK".into(), note: "", matched: true });
+        out.push(Suggestion { setting: "Tint", summary: "No green or magenta difference", value: "OK".into(), note: "", matched: true });
     } else {
-        out.push(Suggestion { setting: "Tint", value: format!("{:.0}% {}", green.abs() * 100.0, if green > 0.0 { "greener: add magenta" } else { "more magenta: add green" }), note: "", matched: false });
+        out.push(Suggestion { setting: "Tint", summary: if green > 0.0 { "The target looks greener" } else { "The target looks more magenta" }, value: format!("{:.0}% {}", green.abs() * 100.0, if green > 0.0 { "greener: add magenta" } else { "more magenta: add green" }), note: "", matched: false });
     }
     let (spread_r, spread_t) = ((reference.p95 - reference.p5).max(0.02), (target.p95 - target.p5).max(0.02));
     let contrast = spread_t / spread_r;
     if (contrast - 1.0).abs() < 0.08 {
-        out.push(Suggestion { setting: "Contrast", value: format!("{:+.0}%", (contrast - 1.0) * 100.0), note: "", matched: true });
+        out.push(Suggestion { setting: "Contrast", summary: "Contrast matches", value: format!("{:+.0}%", (contrast - 1.0) * 100.0), note: "", matched: true });
     } else {
-        out.push(Suggestion { setting: "Contrast", value: format!("{} {:.0}%", if contrast > 1.0 { "Lower by" } else { "Raise by" }, (contrast - 1.0).abs() * 100.0),
+        out.push(Suggestion { setting: "Contrast", summary: if contrast > 1.0 { "The target has more contrast" } else { "The target looks flatter (less contrast)" }, value: format!("{} {:.0}%", if contrast > 1.0 { "Lower by" } else { "Raise by" }, (contrast - 1.0).abs() * 100.0),
             note: "Picture profile, gamma or detail settings", matched: false });
     }
     let saturation = target.sat / reference.sat.max(0.01);
     if (saturation - 1.0).abs() < 0.1 {
-        out.push(Suggestion { setting: "Saturation", value: format!("{:+.0}%", (saturation - 1.0) * 100.0), note: "", matched: true });
+        out.push(Suggestion { setting: "Saturation", summary: "Colour intensity matches", value: format!("{:+.0}%", (saturation - 1.0) * 100.0), note: "", matched: true });
     } else {
-        out.push(Suggestion { setting: "Saturation", value: format!("{} {:.0}%", if saturation > 1.0 { "Lower by" } else { "Raise by" }, (saturation - 1.0).abs() * 100.0),
+        out.push(Suggestion { setting: "Saturation", summary: if saturation > 1.0 { "The target colours are stronger" } else { "The target colours are paler" }, value: format!("{} {:.0}%", if saturation > 1.0 { "Lower by" } else { "Raise by" }, (saturation - 1.0).abs() * 100.0),
             note: "Picture profile or colour matrix", matched: false });
     }
     out
@@ -308,8 +330,9 @@ pub struct State {
     pub open: bool,
     pub reference: Option<u32>,
     pub target: Option<u32>,
-    /// Central fraction of the picture that is measured.
-    pub roi: f32,
+    /// Part of each picture that is measured (drag on a preview to change it).
+    pub ref_area: Area,
+    pub tgt_area: Area,
     pub ref_cam: Camera,
     pub tgt_cam: Camera,
     /// What each camera delivers before the input's own Colour Correction.
@@ -323,13 +346,14 @@ pub struct State {
     pub steps: u32,
     pub undo: Option<ColourAdjust>,
     pub status: String,
+    pub hardware_request: Option<(u32, f32, f32)>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { open: false, reference: None, target: None, roi: 0.5, ref_cam: Camera::default(), tgt_cam: Camera::default(),
+        Self { open: false, reference: None, target: None, ref_area: DEFAULT_AREA, tgt_area: DEFAULT_AREA, ref_cam: Camera::default(), tgt_cam: Camera::default(),
             ref_raw: Meter::default(), tgt_raw: Meter::default(), ref_final: Meter::default(), tgt_final: Meter::default(),
-            auto: false, steps: 0, undo: None, status: String::new() }
+            auto: false, steps: 0, undo: None, status: String::new(), hardware_request: None }
     }
 }
 
@@ -362,13 +386,21 @@ impl State {
     pub fn save_line(&self, number: impl Fn(Option<u32>) -> usize) -> Option<String> {
         if self.reference.is_none() && self.target.is_none() { return None; }
         let cams = serde_json::to_string(&(self.ref_cam, self.tgt_cam)).ok()?;
-        Some(format!("cammatch\t{}\t{}\t{}\t{cams}\n", number(self.reference), number(self.target), self.roi))
+        let join = |a: Area| format!("{},{},{},{}", a[0], a[1], a[2], a[3]);
+        Some(format!("cammatch\t{}\t{}\t{};{}\t{cams}\n", number(self.reference), number(self.target),
+            join(self.ref_area), join(self.tgt_area)))
     }
 
-    pub fn load_fields(&mut self, reference: Option<u32>, target: Option<u32>, roi: &str, cams: &str) {
+    /// `areas` is "left,top,right,bottom;left,top,right,bottom". Older presets stored a single
+    /// centred fraction, which is read as a centred rectangle for both cameras.
+    pub fn load_fields(&mut self, reference: Option<u32>, target: Option<u32>, areas: &str, cams: &str) {
         self.reference = reference;
         self.target = target;
-        self.roi = roi.parse::<f32>().unwrap_or(0.5).clamp(0.1, 1.0);
+        let centred = |f: f32| { let m = (1.0 - f.clamp(0.1, 1.0)) / 2.0; [m, m, 1.0 - m, 1.0 - m] };
+        (self.ref_area, self.tgt_area) = match areas.split_once(';') {
+            Some((a, b)) => (parse_area(a).unwrap_or(DEFAULT_AREA), parse_area(b).unwrap_or(DEFAULT_AREA)),
+            None => { let a = areas.parse::<f32>().map_or(DEFAULT_AREA, centred); (a, a) }
+        };
         if let Ok((r, t)) = serde_json::from_str::<(Camera, Camera)>(cams) {
             self.ref_cam = r;
             self.tgt_cam = t;
@@ -440,21 +472,181 @@ fn camera_fields(ui: &mut egui::Ui, id: &str, cam: &mut Camera) {
     });
 }
 
-fn measurement(ui: &mut egui::Ui, title: &str, meter: &Meter) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new(title).strong());
-        match meter.stats {
-            Some(stats) => {
-                let [r, g, b] = stats.display_rgb();
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(150.0, 26.0), Sense::hover());
-                ui.painter().rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
-                ui.label(format!("RGB {r} {g} {b}"));
-                ui.label(format!("{}: {:.0}%  ({:.0}–{:.0}%)", tr(ui, "Luma"), stats.p50 * 100.0, stats.p5 * 100.0, stats.p95 * 100.0));
-                ui.label(format!("{}: {:.0}%", tr(ui, "Saturation"), stats.sat * 100.0));
+const REF_COLOUR: Color32 = Color32::from_rgb(110, 170, 255);
+const TARGET_COLOUR: Color32 = Color32::from_rgb(255, 170, 80);
+const GOOD: Color32 = Color32::from_rgb(110, 190, 120);
+const WARN: Color32 = Color32::from_rgb(235, 190, 90);
+const CHART_BG: Color32 = Color32::from_rgb(24, 26, 30);
+const CHART_W: f32 = 224.0;
+const CHART_H: f32 = 70.0;
+
+/// 0–100 similarity score from the colour difference of the two means.
+pub fn similarity(de: f32) -> f32 { (100.0 - de * 4.0).clamp(0.0, 100.0) }
+
+fn verdict(score: f32) -> (&'static str, Color32) {
+    if score >= 90.0 { ("Almost identical", GOOD) }
+    else if score >= 75.0 { ("Very close", GOOD) }
+    else if score >= 50.0 { ("Visible difference", WARN) }
+    else { ("Very different", Color32::from_rgb(230, 100, 90)) }
+}
+
+/// Live picture of an input. Drag on it to choose the measured area; double-click resets it.
+/// Returns true when the area changed.
+fn preview(ui: &mut egui::Ui, title: &str, colour: Color32, texture: Option<(egui::TextureId, [usize; 2])>, area: &mut Area) -> bool {
+    let size = Vec2::new(CHART_W, CHART_W * 9.0 / 16.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, Color32::BLACK);
+    let mut shown = rect;
+    if let Some((id, [w, h])) = texture {
+        let scale = (rect.width() / w.max(1) as f32).min(rect.height() / h.max(1) as f32);
+        shown = egui::Rect::from_center_size(rect.center(), Vec2::new(w as f32 * scale, h as f32 * scale));
+        painter.image(id, shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+    } else {
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, tr(ui, "No picture yet"), egui::FontId::proportional(13.0), Color32::GRAY);
+    }
+    let mut changed = false;
+    if shown.width() > 1.0 && shown.height() > 1.0 {
+        let to_fraction = |p: egui::Pos2| [((p.x - shown.left()) / shown.width()).clamp(0.0, 1.0),
+            ((p.y - shown.top()) / shown.height()).clamp(0.0, 1.0)];
+        if response.dragged() {
+            if let (Some(from), Some(to)) = (ui.input(|i| i.pointer.press_origin()), response.interact_pointer_pos()) {
+                let (a, b) = (to_fraction(from), to_fraction(to));
+                let dragged = [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])];
+                if dragged[2] - dragged[0] >= 0.05 && dragged[3] - dragged[1] >= 0.05 {
+                    *area = dragged;
+                    changed = true;
+                }
             }
-            None => { ui.label(tr(ui, "No picture yet")); }
         }
+        if response.double_clicked() { *area = DEFAULT_AREA; changed = true; }
+    }
+    let marked = egui::Rect::from_min_max(
+        egui::pos2(shown.left() + shown.width() * area[0], shown.top() + shown.height() * area[1]),
+        egui::pos2(shown.left() + shown.width() * area[2], shown.top() + shown.height() * area[3]));
+    let shade = Color32::from_black_alpha(130);
+    for outside in [
+        egui::Rect::from_min_max(shown.min, egui::pos2(shown.right(), marked.top())),
+        egui::Rect::from_min_max(egui::pos2(shown.left(), marked.bottom()), shown.max),
+        egui::Rect::from_min_max(egui::pos2(shown.left(), marked.top()), egui::pos2(marked.left(), marked.bottom())),
+        egui::Rect::from_min_max(egui::pos2(marked.right(), marked.top()), egui::pos2(shown.right(), marked.bottom())),
+    ] { painter.rect_filled(outside, 0.0, shade); }
+    painter.rect_stroke(marked, 0.0, egui::Stroke::new(1.5f32, colour), egui::StrokeKind::Middle);
+    let label = painter.layout_no_wrap(title.to_owned(), egui::FontId::proportional(12.0), Color32::BLACK);
+    let chip = egui::Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), label.size() + Vec2::new(10.0, 4.0));
+    painter.rect_filled(chip, 3.0, colour);
+    painter.galley(chip.min + Vec2::new(5.0, 2.0), label, Color32::BLACK);
+    response.on_hover_text(tr(ui, "Drag on the picture to choose the area to measure. Double-click to reset."));
+    changed
+}
+
+/// A titled dark chart area; returns its painter and plot rectangle.
+fn chart_area(ui: &mut egui::Ui, title: &str, hint: &str) -> (egui::Painter, egui::Rect) {
+    ui.label(RichText::new(title).strong());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(CHART_W, CHART_H), Sense::hover());
+    response.on_hover_text(hint);
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, CHART_BG);
+    (painter, rect.shrink2(Vec2::new(8.0, 8.0)))
+}
+
+fn legend(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.colored_label(REF_COLOUR, format!("■ {}", tr(ui, "Reference")));
+        ui.colored_label(TARGET_COLOUR, format!("■ {}", tr(ui, "Target")));
     });
+}
+
+/// Brightness distribution of both pictures: bars for the target, outline for the reference.
+fn brightness_chart(ui: &mut egui::Ui, r: &Stats, t: &Stats) {
+    let (p, plot) = chart_area(ui, tr(ui, "Brightness"), tr(ui, "Left is dark, right is bright. The shapes should overlap."));
+    let top = r.hist.iter().chain(t.hist.iter()).fold(0.01f32, |a, b| a.max(*b));
+    let bin = plot.width() / 32.0;
+    let height = |v: f32| plot.height() * (v / top).sqrt().min(1.0);
+    for (i, v) in t.hist.iter().enumerate() {
+        let x = plot.left() + i as f32 * bin;
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(x + 0.5, plot.bottom() - height(*v)), egui::pos2(x + bin - 0.5, plot.bottom())),
+            0.0, TARGET_COLOUR.gamma_multiply(0.7));
+    }
+    let points: Vec<_> = r.hist.iter().enumerate()
+        .map(|(i, v)| egui::pos2(plot.left() + (i as f32 + 0.5) * bin, plot.bottom() - height(*v))).collect();
+    p.add(egui::Shape::line(points, egui::Stroke::new(2.0f32, REF_COLOUR)));
+}
+
+/// Average red, green and blue of both pictures side by side.
+fn colour_chart(ui: &mut egui::Ui, r: &Stats, t: &Stats) {
+    let (p, plot) = chart_area(ui, tr(ui, "Colours"), tr(ui, "Each pair of bars should have the same height."));
+    let group = plot.width() / 3.0;
+    let base = plot.bottom() - 14.0;
+    let full = base - plot.top();
+    for (c, (name, colour)) in [("R", Color32::from_rgb(235, 90, 80)), ("G", Color32::from_rgb(110, 200, 110)), ("B", Color32::from_rgb(100, 140, 240))].into_iter().enumerate() {
+        let x = plot.left() + c as f32 * group;
+        for (k, (stats, tint)) in [(r, REF_COLOUR), (t, TARGET_COLOUR)].into_iter().enumerate() {
+            let h = full * encode(stats.lin[c]);
+            let bx = x + group * 0.18 + k as f32 * group * 0.32;
+            p.rect_filled(egui::Rect::from_min_max(egui::pos2(bx, base - h), egui::pos2(bx + group * 0.28, base)), 2.0, tint);
+        }
+        p.text(egui::pos2(x + group * 0.5, plot.bottom() - 6.0), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(12.0), colour);
+    }
+}
+
+/// Cool-to-warm scale with a marker per camera.
+fn temperature_chart(ui: &mut egui::Ui, r: &Stats, t: &Stats) {
+    let (p, plot) = chart_area(ui, tr(ui, "Colour temperature"), tr(ui, "Both markers should sit in the same place."));
+    let bar = egui::Rect::from_center_size(plot.center(), Vec2::new(plot.width(), 18.0));
+    let (cool, warm) = (Color32::from_rgb(110, 160, 255), Color32::from_rgb(255, 160, 70));
+    let steps = 32;
+    let mut mesh = egui::epaint::Mesh::default();
+    for i in 0..steps {
+        let (a, b) = (i as f32 / steps as f32, (i + 1) as f32 / steps as f32);
+        let colour = |k: f32| {
+            let mid = Color32::from_gray(235);
+            if k < 0.5 { lerp_colour(cool, mid, k * 2.0) } else { lerp_colour(mid, warm, (k - 0.5) * 2.0) }
+        };
+        let (x0, x1) = (bar.left() + bar.width() * a, bar.left() + bar.width() * b);
+        let i0 = mesh.vertices.len() as u32;
+        mesh.colored_vertex(egui::pos2(x0, bar.top()), colour(a));
+        mesh.colored_vertex(egui::pos2(x1, bar.top()), colour(b));
+        mesh.colored_vertex(egui::pos2(x1, bar.bottom()), colour(b));
+        mesh.colored_vertex(egui::pos2(x0, bar.bottom()), colour(a));
+        mesh.add_triangle(i0, i0 + 1, i0 + 2);
+        mesh.add_triangle(i0, i0 + 2, i0 + 3);
+    }
+    p.add(egui::Shape::mesh(mesh));
+    let position = |s: &Stats| 0.5 - (s.lin[2].max(1e-4) / s.lin[0].max(1e-4)).ln() / 3.0;
+    for (stats, colour, above) in [(r, REF_COLOUR, true), (t, TARGET_COLOUR, false)] {
+        let x = bar.left() + bar.width() * position(stats).clamp(0.0, 1.0);
+        let (tip, far) = if above { (bar.top(), bar.top() - 12.0) } else { (bar.bottom(), bar.bottom() + 12.0) };
+        p.add(egui::Shape::convex_polygon(vec![egui::pos2(x, tip), egui::pos2(x - 6.0, far), egui::pos2(x + 6.0, far)], colour, egui::Stroke::new(1.0f32, Color32::BLACK)));
+    }
+    p.text(egui::pos2(bar.left(), plot.bottom()), egui::Align2::LEFT_BOTTOM, tr(ui, "Cooler"), egui::FontId::proportional(11.0), cool);
+    p.text(egui::pos2(bar.right(), plot.bottom()), egui::Align2::RIGHT_BOTTOM, tr(ui, "Warmer"), egui::FontId::proportional(11.0), warm);
+}
+
+/// Range from the darkest to the brightest areas of each picture.
+fn contrast_chart(ui: &mut egui::Ui, r: &Stats, t: &Stats) {
+    let (p, plot) = chart_area(ui, tr(ui, "Contrast range"), tr(ui, "Longer bars have more contrast. The ends should line up."));
+    for (row, (stats, colour)) in [(r, REF_COLOUR), (t, TARGET_COLOUR)].into_iter().enumerate() {
+        let y = plot.top() + plot.height() * (0.25 + 0.5 * row as f32);
+        let x = |v: f32| plot.left() + plot.width() * v.clamp(0.0, 1.0);
+        p.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0f32, Color32::from_gray(60)));
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(x(stats.p5), y - 7.0), egui::pos2(x(stats.p95), y + 7.0)), 3.0, colour.gamma_multiply(0.8));
+        p.line_segment([egui::pos2(x(stats.p50), y - 9.0), egui::pos2(x(stats.p50), y + 9.0)], egui::Stroke::new(2.0f32, Color32::WHITE));
+    }
+}
+
+fn camera_fields_row(ui: &mut egui::Ui, state: &mut State) {
+    ui.columns(2, |cols| {
+        cols[0].label(RichText::new(tr(&cols[0], "Reference")).color(REF_COLOUR).strong());
+        camera_fields(&mut cols[0], "cam-match-ref-fields", &mut state.ref_cam);
+        cols[1].label(RichText::new(tr(&cols[1], "Target")).color(TARGET_COLOUR).strong());
+        camera_fields(&mut cols[1], "cam-match-target-fields", &mut state.tgt_cam);
+    });
+}
+
+fn lerp_colour(a: Color32, b: Color32, k: f32) -> Color32 {
+    let mix = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * k).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 /// The Camera Match window (opened from the top bar).
@@ -462,74 +654,147 @@ pub fn window(ctx: &egui::Context, s: &mut Switcher) {
     if !s.cam_match.open { return; }
     let choices: Vec<(u32, String)> = s.inputs.iter().filter(|i| i.kind.streamed()).map(|i| (i.id, i.title.clone())).collect();
     let fps = output_fps();
+    let textures = {
+        let tex = |id: Option<u32>| id.and_then(|id| s.input(id)).and_then(|input| input.tex);
+        [tex(s.cam_match.reference), tex(s.cam_match.target)]
+    };
     let mut open = true;
     let mut state = std::mem::take(&mut s.cam_match);
+    if state.reference.is_none() && state.target.is_none() && choices.len() >= 2 {
+        state.reference = Some(choices[0].0);
+        state.target = Some(choices[1].0);
+    }
     let mut start = false;
     let mut stop = false;
     let mut undo = false;
     egui::Window::new(locale::text(ctx, "Camera Match")).id(egui::Id::new("Camera Match")).open(&mut open)
-        .default_width(560.0).show(ctx, |ui| {
-        ui.label(tr(ui, "Pick a reference camera and the camera to match. Enter the camera settings you know for better advice."));
-        ui.add_space(4.0);
-        let mut changed = false;
-        ui.columns(2, |cols| {
-            cols[0].label(RichText::new(tr(&cols[0], "Reference")).strong());
-            changed |= input_combo(&mut cols[0], "cam-match-ref", &choices, &mut state.reference);
-            camera_fields(&mut cols[0], "cam-match-ref-fields", &mut state.ref_cam);
-            cols[1].label(RichText::new(tr(&cols[1], "Target")).strong());
-            changed |= input_combo(&mut cols[1], "cam-match-target", &choices, &mut state.target);
-            camera_fields(&mut cols[1], "cam-match-target-fields", &mut state.tgt_cam);
-        });
-        if changed { state.reset_measurements(); state.auto = false; state.undo = None; state.status.clear(); }
-        ui.horizontal(|ui| {
-            ui.label(tr(ui, "Measured area"));
-            ui.add(egui::Slider::new(&mut state.roi, 0.1..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-            if ui.button(tr(ui, "Restart measuring")).clicked() { state.reset_measurements(); }
-        });
-        ui.separator();
-        if state.reference.is_some() && state.reference == state.target {
-            ui.label(tr(ui, "Choose two different inputs."));
-            return;
-        }
-        ui.horizontal_top(|ui| {
-            measurement(ui, &tr(ui, "Reference camera"), &state.ref_raw);
-            ui.add_space(24.0);
-            measurement(ui, &tr(ui, "Target camera"), &state.tgt_raw);
-        });
-        let ready = state.ref_raw.fresh >= SETTLE_PICTURES && state.tgt_raw.fresh >= SETTLE_PICTURES;
-        if let (Some(r), Some(t)) = (state.ref_raw.stats, state.tgt_raw.stats) {
-            ui.add_space(4.0);
-            ui.label(format!("{}: {:.1}", tr(ui, "Colour difference (ΔE)"), delta_e(&r, &t)));
-            if !ready { ui.label(RichText::new(tr(ui, "Measuring…")).weak()); }
-            ui.add_space(4.0);
-            ui.label(RichText::new(tr(ui, "Change on the target camera")).strong());
-            egui::Grid::new("cam-match-advice").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
-                for item in suggest(&r, &t, &state.ref_cam, &state.tgt_cam, fps) {
-                    let colour = if item.matched { Color32::from_rgb(110, 190, 120) } else { Color32::from_rgb(235, 190, 90) };
-                    ui.label(tr(ui, item.setting));
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&item.value).color(colour));
-                        if !item.note.is_empty() { ui.label(RichText::new(tr(ui, item.note)).weak().small()); }
-                    });
-                    ui.end_row();
-                }
-            });
-        } else if state.reference.is_some() && state.target.is_some() {
-            ui.label(tr(ui, "Waiting for pictures from both inputs…"));
-        }
-        ui.separator();
-        ui.label(RichText::new(tr(ui, "Match in software")).strong());
-        ui.label(RichText::new(tr(ui, "Adjusts the target input's Colour Correction. The cameras themselves are not changed.")).weak().small());
-        ui.horizontal(|ui| {
-            let can = state.reference.is_some() && state.target.is_some() && state.reference != state.target;
-            if state.auto {
-                if ui.button(tr(ui, "Stop")).clicked() { stop = true; }
-            } else if ui.add_enabled(can, egui::Button::new(tr(ui, "Match target"))).clicked() {
-                start = true;
+        .default_width(700.0).show(ctx, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if choices.len() < 2 {
+                ui.label(tr(ui, "Add at least two camera inputs to compare them."));
+                return;
             }
-            if ui.add_enabled(state.undo.is_some(), egui::Button::new(tr(ui, "Undo"))).clicked() { undo = true; }
+            ui.label(RichText::new(tr(ui, "1. Pick two cameras   2. Aim both at the same scene   3. Follow the tips or press Match automatically")).weak());
+            ui.add_space(4.0);
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.colored_label(REF_COLOUR, tr(ui, "Reference"));
+                changed |= input_combo(ui, "cam-match-ref", &choices, &mut state.reference);
+                if ui.button("⇄").on_hover_text(tr(ui, "Swap reference and target")).clicked() {
+                    std::mem::swap(&mut state.reference, &mut state.target);
+                    std::mem::swap(&mut state.ref_cam, &mut state.tgt_cam);
+                    changed = true;
+                }
+                ui.colored_label(TARGET_COLOUR, tr(ui, "Target"));
+                changed |= input_combo(ui, "cam-match-target", &choices, &mut state.target);
+            });
+            if changed { state.reset_measurements(); state.auto = false; state.undo = None; state.status.clear(); }
+            if state.reference.is_some() && state.reference == state.target {
+                ui.label(tr(ui, "Choose two different inputs."));
+                return;
+            }
+            ui.add_space(4.0);
+            let stats = state.ref_raw.stats.zip(state.tgt_raw.stats);
+            let ready = state.ref_raw.fresh >= SETTLE_PICTURES && state.tgt_raw.fresh >= SETTLE_PICTURES;
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    if preview(ui, tr(ui, "Reference"), REF_COLOUR, textures[0], &mut state.ref_area) {
+                        state.ref_raw.reset();
+                        state.ref_final.reset();
+                    }
+                    ui.add_space(4.0);
+                    if preview(ui, tr(ui, "Target"), TARGET_COLOUR, textures[1], &mut state.tgt_area) {
+                        state.tgt_raw.reset();
+                        state.tgt_final.reset();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    let Some((r, t)) = stats else {
+                        ui.label(tr(ui, "Waiting for pictures from both inputs…"));
+                        return;
+                    };
+                    let score = similarity(delta_e(&r, &t));
+                    let (words, colour) = verdict(score);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{score:.0}%")).size(30.0).strong().color(colour));
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(if ready { tr(ui, words) } else { tr(ui, "Measuring…") }).size(15.0).color(colour));
+                            ui.add(egui::ProgressBar::new(score / 100.0).desired_width(200.0).fill(colour));
+                        });
+                        ui.add_space(10.0);
+                        legend(ui);
+                    });
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| { brightness_chart(ui, &r, &t); ui.add_space(2.0); temperature_chart(ui, &r, &t); });
+                        ui.vertical(|ui| { colour_chart(ui, &r, &t); ui.add_space(2.0); contrast_chart(ui, &r, &t); });
+                    });
+                });
+            });
+            let Some((r, t)) = stats else { return };
+            ui.separator();
+            ui.columns(2, |cols| {
+                let ui = &mut cols[0];
+                ui.label(RichText::new(tr(ui, "What to change on the target camera")).strong());
+                for item in suggest(&r, &t, &state.ref_cam, &state.tgt_cam, fps) {
+                    let colour = if item.matched { GOOD } else { WARN };
+                    ui.horizontal_top(|ui| {
+                        ui.label(RichText::new(if item.matched { "✔" } else { "⚠" }).color(colour));
+                        ui.vertical(|ui| {
+                            if !item.summary.is_empty() { ui.label(RichText::new(tr(ui, item.summary)).color(colour).strong()); }
+                            if !item.matched || item.setting != "Exposure" {
+                                ui.label(format!("{}: {}", tr(ui, item.setting), item.value));
+                            }
+                            if !item.note.is_empty() { ui.label(RichText::new(tr(ui, item.note)).weak().small()); }
+                        });
+                    });
+                }
+                let ui = &mut cols[1];
+                ui.label(RichText::new(tr(ui, "Match automatically")).strong());
+                ui.label(RichText::new(tr(ui, "Corrects the target picture inside LiveMix. The camera itself is not changed, so you can undo it at any time.")).weak().small());
+                ui.horizontal(|ui| {
+                    if state.auto {
+                        if ui.button(tr(ui, "Stop")).clicked() { stop = true; }
+                        ui.add(egui::ProgressBar::new(state.steps as f32 / MAX_STEPS as f32).desired_width(110.0));
+                    } else if ui.add_sized([150.0, 28.0], egui::Button::new(tr(ui, "Match automatically"))).clicked() {
+                        start = true;
+                    }
+                    if ui.add_enabled(state.undo.is_some(), egui::Button::new(tr(ui, "Undo"))).clicked() { undo = true; }
+                });
+                if let Some(camera) = state.target.and_then(|id| s.input(id))
+                    .and_then(|input| input.sony_camera.as_deref()).filter(|camera| !camera.is_empty()) {
+                    crate::sony_remote::match_controls(ui, camera, delta_ev(&r, &t), wb_mired(&r, &t), fps, !state.auto);
+                }
+                #[cfg(windows)]
+                if let Some(target) = state.target.filter(|id| s.input(*id).is_some_and(|input| {
+                    matches!(&input.kind, crate::Kind::Device { link, .. } if link.starts_with(r"\\?\usb#"))
+                })) {
+                    if ui.add_enabled(!state.auto, egui::Button::new("Apply exposure and white balance to USB camera")).clicked() {
+                        state.hardware_request = Some((target, delta_ev(&r, &t).clamp(-3.0, 3.0), wb_mired(&r, &t).clamp(-100.0, 100.0)));
+                        state.status = "Sending exposure and white balance to the capture driver…".into();
+                    }
+                }
+                if let Some(status) = state.target.and_then(|id| s.input(id)).map(|input| &input.status)
+                    .filter(|status| status.starts_with("USB camera:")) {
+                    ui.label(status);
+                } else if !state.status.is_empty() {
+                    ui.label(&state.status);
+                }
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new(tr(ui, "Camera settings and measuring (optional)")).show(ui, |ui| {
+                    ui.label(RichText::new(tr(ui, "Enter the settings you know to get exact values instead of general advice.")).weak().small());
+                    camera_fields_row(ui, &mut state);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(ui, "Reset areas")).clicked() {
+                            state.ref_area = DEFAULT_AREA;
+                            state.tgt_area = DEFAULT_AREA;
+                            state.reset_measurements();
+                        }
+                        if ui.button(tr(ui, "Restart measuring")).clicked() { state.reset_measurements(); }
+                    });
+                });
+            });
         });
-        if !state.status.is_empty() { ui.label(&state.status); }
     });
     if start {
         if let Some(input) = state.target.and_then(|id| s.input_mut(id)) {
@@ -562,7 +827,7 @@ mod tests {
         (0..w * h).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect()
     }
 
-    fn stats(rgb: [u8; 3]) -> Stats { measure(&flat(64, 64, rgb), 64, 64, 1.0).unwrap() }
+    fn stats(rgb: [u8; 3]) -> Stats { measure(&flat(64, 64, rgb), 64, 64, FULL).unwrap() }
 
     #[test]
     fn measures_flat_pictures() {
@@ -570,8 +835,21 @@ mod tests {
         assert!((grey.lin[0] - 0.2158).abs() < 0.002, "{:?}", grey.lin);
         assert!((grey.p50 - 128.0 / 255.0).abs() < 0.01);
         assert!(grey.sat < 0.001);
-        assert!(measure(&flat(64, 64, [255, 255, 255]), 64, 64, 1.0).is_none(), "clipped pictures give no measurement");
-        assert!(measure(&[0; 4], 64, 64, 1.0).is_none());
+        assert!(measure(&flat(64, 64, [255, 255, 255]), 64, 64, FULL).is_none(), "clipped pictures give no measurement");
+        assert!(measure(&[0; 4], 64, 64, FULL).is_none());
+    }
+
+    #[test]
+    fn measures_only_the_chosen_rectangle() {
+        // Left half dark grey, right half light grey.
+        let (w, h) = (64usize, 64usize);
+        let picture: Vec<u8> = (0..w * h).flat_map(|i| { let v = if i % w < w / 2 { 60 } else { 180 }; [v, v, v, 255] }).collect();
+        let left = measure(&picture, w, h, [0.0, 0.0, 0.5, 1.0]).unwrap();
+        let right = measure(&picture, w, h, [0.5, 0.0, 1.0, 1.0]).unwrap();
+        assert!(right.luma > left.luma * 3.0, "{} vs {}", left.luma, right.luma);
+        assert!(measure(&picture, w, h, [0.9, 0.9, 0.9, 0.9]).is_none(), "a degenerate rectangle gives too few samples");
+        assert_eq!(parse_area("0.1,0.2,0.6,0.9"), Some([0.1, 0.2, 0.6, 0.9]));
+        assert_eq!(parse_area("0.5,0.5,0.5,0.5"), None);
     }
 
     #[test]
@@ -623,14 +901,14 @@ mod tests {
         let reference = [140u8, 120, 100];
         let shifted = [105u8, 118, 128];
         let source = flat(64, 64, shifted);
-        let goal = measure(&flat(64, 64, reference), 64, 64, 1.0).unwrap();
+        let goal = measure(&flat(64, 64, reference), 64, 64, FULL).unwrap();
         let mut adjust = ColourAdjust::default();
         let mut last = f32::MAX;
         let mut done = false;
         for _ in 0..30 {
             let mut picture = source.clone();
             adjust.apply(&mut picture);
-            let now = measure(&picture, 64, 64, 1.0).unwrap();
+            let now = measure(&picture, 64, 64, FULL).unwrap();
             let (next, de, finished) = correction_step(adjust, &goal, &now);
             last = de;
             adjust = next;
@@ -641,14 +919,14 @@ mod tests {
 
     #[test]
     fn state_round_trips_through_its_preset_line() {
-        let mut state = State { reference: Some(3), target: Some(5), roi: 0.4, ..State::default() };
+        let mut state = State { reference: Some(3), target: Some(5), ref_area: [0.1, 0.2, 0.6, 0.9], tgt_area: [0.3, 0.3, 0.8, 0.8], ..State::default() };
         state.tgt_cam = Camera { kelvin: 5600.0, iso: 800.0, shutter: 50.0, aperture: 2.8 };
         let line = state.save_line(|id| id.map_or(0, |id| id as usize)).unwrap();
         let f: Vec<&str> = line.trim_end().split('\t').collect();
         let mut loaded = State::default();
         loaded.load_fields(Some(3), Some(5), f[3], f[4]);
         assert_eq!(loaded.tgt_cam, state.tgt_cam);
-        assert!((loaded.roi - 0.4).abs() < 1e-6);
+        assert_eq!((loaded.ref_area, loaded.tgt_area), (state.ref_area, state.tgt_area));
         assert!(State::default().save_line(|_| 0).is_none());
     }
 }

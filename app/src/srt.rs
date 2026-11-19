@@ -171,6 +171,7 @@ fn receive_once(shared: &Shared, url: &str) -> Result<(), String> {
         let mut receiving = false;
         while !shared.stop.load(Relaxed) {
             let Some(frame) = read_frame(&mut pipe) else { break };
+            shared.tap_frame(&frame);
             *shared.size.lock().unwrap() = (frame.w, frame.h);
             *shared.frame.lock().unwrap() = Some(frame);
             shared.seq.fetch_add(1, Relaxed);

@@ -21,6 +21,10 @@ pub struct Shared {
     pub(crate) cpu_frames_required: AtomicBool,
     pub video_adapter: Mutex<Option<String>>,
     pub browser_fps: AtomicU64,
+    pub deinterlace_blend: AtomicBool,
+    #[cfg(windows)]
+    pub uvc_match: Mutex<Option<(f32, f32)>>,
+    pub browser_input: Mutex<std::collections::VecDeque<crate::web_input::Command>>,
     pub decoder: Mutex<String>,
     pub audio: Mutex<crate::audio::Buffer>,
     /// Smoothed mapping between the system clock and the file's media position.
@@ -46,6 +50,70 @@ pub struct Shared {
     /// in use, read when the camera opens.
     pub modes: Mutex<Vec<CamMode>>,
     pub mode: Mutex<Option<CamMode>>,
+    /// Replay recordings fed straight from this source's capture thread. Weak, so a
+    /// finished segment's encoder closes when the replay engine releases it.
+    pub(crate) replay_tap: Mutex<Vec<std::sync::Weak<Recorder>>>,
+}
+
+impl Shared {
+    /// Sends a captured picture to the replay recordings tapping this source, before the
+    /// picture reaches the interface. Costs one uncontended lock when nothing taps it.
+    pub(crate) fn tap_frame(&self, frame: &Frame) {
+        let recorders: Vec<Arc<Recorder>> = {
+            let Ok(mut taps) = self.replay_tap.lock() else { return };
+            if taps.is_empty() { return; }
+            taps.retain(|tap| tap.strong_count() > 0);
+            taps.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        Recorder::push_direct(&recorders, frame, Instant::now());
+    }
+
+    /// Adds `recorder` to the recordings fed from this source's capture thread.
+    pub(crate) fn add_replay_tap(&self, recorder: &Arc<Recorder>) {
+        let mut taps = self.replay_tap.lock().unwrap();
+        taps.retain(|tap| tap.strong_count() > 0);
+        if !taps.iter().any(|tap| std::ptr::eq(tap.as_ptr(), Arc::as_ptr(recorder))) {
+            taps.push(Arc::downgrade(recorder));
+        }
+    }
+
+    pub(crate) fn remove_replay_tap(&self, recorder: &Arc<Recorder>) {
+        self.replay_tap.lock().unwrap()
+            .retain(|tap| tap.strong_count() > 0 && !std::ptr::eq(tap.as_ptr(), Arc::as_ptr(recorder)));
+    }
+
+    pub(crate) fn tapped(&self) -> bool {
+        self.replay_tap.lock().is_ok_and(|taps| taps.iter().any(|tap| tap.strong_count() > 0))
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Limited-range BT.709 NV12 from RGBA in integer arithmetic, matching the Windows
+/// recorder's conversion (`media::fill_recording_nv12`) within one level. `w` and `h` are even.
+pub(crate) fn rgba_to_nv12(src: &[u8], w: usize, h: usize, dst: &mut [u8]) {
+    let (y_plane, uv_plane) = dst[..w * h * 3 / 2].split_at_mut(w * h);
+    for (row, luma) in src.chunks_exact(w * 4).zip(y_plane.chunks_exact_mut(w)).take(h) {
+        for (px, y) in row.chunks_exact(4).zip(luma) {
+            let sum = 11_966 * i32::from(px[0]) + 40_254 * i32::from(px[1]) + 4_064 * i32::from(px[2]);
+            *y = (16 + ((sum + 32_768) >> 16)) as u8;
+        }
+    }
+    for (pair, chroma) in src.chunks_exact(w * 8).zip(uv_plane.chunks_exact_mut(w)).take(h / 2) {
+        let (top, bottom) = pair.split_at(w * 4);
+        for x in (0..w).step_by(2) {
+            let mut rgb = [0i32; 3];
+            for line in [top, bottom] {
+                for px in line[x * 4..x * 4 + 8].chunks_exact(4) {
+                    for (total, &value) in rgb.iter_mut().zip(px) { *total += i32::from(value); }
+                }
+            }
+            let [r, g, b] = rgb;
+            let u = (128 << 16) + 7_196 * b - 1_649 * r - 5_547 * g + 32_768;
+            let v = (128 << 16) + 7_196 * r - 6_536 * g - 660 * b + 32_768;
+            chroma[x] = (u >> 16).clamp(0, 255) as u8;
+            chroma[x + 1] = (v >> 16).clamp(0, 255) as u8;
+        }
+    }
 }
 
 /// Largest picture height a camera's Auto mode picks (Settings → Performance).
@@ -137,6 +205,8 @@ pub enum Source {
 pub(crate) struct RecFrame {
     #[cfg(windows)]
     pub(crate) surface: Option<Arc<crate::dx_interop::Surface>>,
+    #[cfg(windows)]
+    pub(crate) nv12: bool,
     pub(crate) audio: crate::audio::Packet,
     pub(crate) pixels: Arc<Vec<u8>>,
     pub(crate) w: usize,
@@ -158,8 +228,44 @@ pub struct Recorder {
     /// Audio of frames dropped at a full queue, carried by the next accepted frame.
     lost_audio: Mutex<Vec<crate::audio::Stereo>>,
     pub(crate) replay_index: Option<ReplayIndex>,
+    /// Capture-thread pictures are kept at the recording's frame rate: when the next one is
+    /// due, and the frame interval.
+    direct_pace: Mutex<(Option<Instant>, Duration)>,
     #[cfg(windows)]
     gpu: Arc<AtomicBool>,
+    #[cfg(windows)]
+    nv12: (Arc<AtomicBool>, Option<(u32, u32)>),
+}
+
+/// Whether a picture captured at `at` is kept for a recording at one picture per `interval`,
+/// given when the next one is `due`. A camera faster than the recording loses the surplus
+/// pictures; small capture jitter is tolerated, so a camera at the same rate loses none.
+pub(crate) fn pace_picture(due: &mut Option<Instant>, interval: Duration, at: Instant) -> bool {
+    if let Some(next) = *due {
+        if at + interval / 2 < next { return false; }
+        // After a gap the schedule restarts from this picture instead of catching up.
+        *due = Some(if at > next + interval { at + interval } else { next + interval });
+    } else {
+        *due = Some(at + interval);
+    }
+    true
+}
+
+#[test]
+fn pacing_keeps_every_picture_at_the_same_rate_and_halves_a_double_rate() {
+    let start = Instant::now();
+    let interval = Duration::from_micros(33_333);
+    let mut due = None;
+    // 30 fps with up to 5 ms jitter: every picture is kept.
+    let kept = (0..60u64).filter(|n| {
+        let jitter = Duration::from_millis([0, 5, 2, 4][*n as usize % 4]);
+        pace_picture(&mut due, interval, start + Duration::from_micros(33_333 * n) + jitter)
+    }).count();
+    assert_eq!(kept, 60);
+    // 60 fps into 30 fps keeps one picture in two.
+    let mut due = None;
+    let kept = (0..120u64).filter(|n| pace_picture(&mut due, interval, start + Duration::from_micros(16_667 * n))).count();
+    assert!((59..=61).contains(&kept), "{kept}");
 }
 
 impl Recorder {
@@ -182,31 +288,48 @@ impl Recorder {
 
     pub(crate) fn spawn_writer_indexed(path: String, opts: RecOpts, indexed: bool) -> (Recorder, std::thread::JoinHandle<()>)
     {
-        // Keep the UI responsive and bound memory if the encoder falls behind.
-        let (tx, rx) = sync_channel(3);
+        // Keep the UI responsive and bound memory if the encoder falls behind. The original
+        // keeps 5 encoder input frames (vMixCodecLibraryNet MFCodec::Initialize 0x060001ad
+        // @0x5cd8, MFFramePool(len, 5, …)), so a short disk or encoder stall doesn't drop frames.
+        // A replay camera recorded from its capture thread also queues the audio-only frames
+        // the update loop sends, so it gets room for both.
+        let (tx, rx) = sync_channel(if indexed { RECORD_QUEUE_FRAMES * 2 } else { RECORD_QUEUE_FRAMES });
         let error = Arc::new(Mutex::new(String::new()));
         let encoder = Arc::new(Mutex::new("Waiting for first frame".into()));
         let (p2, e2) = (path.clone(), error.clone());
         let encoder_status = Arc::clone(&encoder);
         #[cfg(windows)]
-        let gpu = Arc::new(AtomicBool::new(opts.hw && matches!(opts.format, RecordFormat::H264 | RecordFormat::Hevc)));
+        // Replay fans out to multiple encoders. Keep their device lifetime separate
+        // from the compositor, including during overlapping segment finalizations.
+        let gpu = Arc::new(AtomicBool::new(!indexed && opts.hw && !crate::replay::fragmented_mp4(&path) && matches!(opts.format, RecordFormat::H264 | RecordFormat::Hevc)));
         #[cfg(windows)]
         let gpu_worker = gpu.clone();
+        #[cfg(windows)]
+        let nv12 = Arc::new(AtomicBool::new(indexed && opts.format == RecordFormat::H264
+            && !crate::replay::fragmented_mp4(&path)));
+        #[cfg(windows)]
+        let nv12_worker = nv12.clone();
         let replay_index: Option<ReplayIndex> = indexed.then(Default::default);
         let index = replay_index.clone();
         let worker = std::thread::spawn(move || crate::media::record_thread(p2, rx, e2, encoder_status, opts, index,
             #[cfg(windows)]
-            gpu_worker,
+            gpu_worker, #[cfg(windows)] nv12_worker,
         ));
+        let interval = Duration::from_secs_f64(1.0 / f64::from(if opts.fps.is_finite() { opts.fps.max(1.0) } else { 30.0 }));
         (Recorder { tx, path, error, encoder, dropped: AtomicU64::new(0), lost_audio: Mutex::default(), replay_index,
+            direct_pace: Mutex::new((None, interval)),
             #[cfg(windows)]
             gpu,
+            #[cfg(windows)]
+            nv12: (nv12, opts.size),
         }, worker)
     }
     pub fn push_audio(&self, rgba: Vec<u8>, w: usize, h: usize, captured_at: Instant, audio: crate::audio::Packet) {
         self.enqueue(RecFrame { pixels: Arc::new(rgba), w, h, captured_at, timeline_origin: None, bgra: false, audio,
             #[cfg(windows)]
             surface: None,
+            #[cfg(windows)]
+            nv12: false,
         });
     }
 
@@ -214,10 +337,46 @@ impl Recorder {
         let frame = RecFrame { pixels: pixels.into(), w, h, captured_at, timeline_origin: None, bgra, audio,
             #[cfg(windows)]
             surface: None,
+            #[cfg(windows)]
+            nv12: false,
         };
         for recorder in recorders {
             recorder.enqueue(frame.clone());
         }
+    }
+
+    /// A picture from a source's capture thread (`Shared::tap_frame`). Its audio arrives
+    /// separately through `push_audio_only`, at the recording's frame cadence.
+    pub(crate) fn push_direct(recorders: &[Arc<Self>], frame: &Frame, captured_at: Instant) {
+        let (w, h) = (frame.w, frame.h);
+        if w == 0 || h == 0 || frame.rgba.len() < w * h * 4 { return; }
+        let paced: Vec<Arc<Self>> = recorders.iter().filter(|recorder| {
+            let mut pace = recorder.direct_pace.lock().unwrap();
+            let interval = pace.1;
+            pace_picture(&mut pace.0, interval, captured_at)
+        }).cloned().collect();
+        let recorders = paced.as_slice();
+        if recorders.is_empty() { return; }
+        #[cfg(windows)]
+        if w % 2 == 0 && h % 2 == 0 && recorders.iter().all(|recorder| recorder.accepts_nv12([w as u32, h as u32])) {
+            // Same size as the recording: the encoder takes NV12 without converting again.
+            let mut nv12 = vec![0; w * h * 3 / 2];
+            rgba_to_nv12(&frame.rgba, w, h, &mut nv12);
+            Self::push_nv12_group(recorders, Arc::new(nv12), [w as u32, h as u32], captured_at, Default::default());
+            return;
+        }
+        Self::push_group_audio(recorders, frame.rgba[..w * h * 4].to_vec(), w, h, captured_at, false, Default::default());
+    }
+
+    /// Audio for a recording whose pictures come from a capture thread. It carries no picture
+    /// and is written with the following pictures.
+    pub(crate) fn push_audio_only(&self, captured_at: Instant, audio: crate::audio::Packet) {
+        self.enqueue(RecFrame { pixels: Arc::default(), w: 0, h: 0, captured_at, timeline_origin: None, bgra: false, audio,
+            #[cfg(windows)]
+            surface: None,
+            #[cfg(windows)]
+            nv12: false,
+        });
     }
 
     #[cfg(windows)]
@@ -226,10 +385,24 @@ impl Recorder {
     }
 
     #[cfg(windows)]
+    pub(crate) fn accepts_nv12(&self, [w, h]: [u32; 2]) -> bool {
+        self.nv12.0.load(Ordering::Acquire) && self.nv12.1.is_none_or(|size| size == (w, h))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn push_nv12_group(recorders: &[Arc<Self>], pixels: Arc<Vec<u8>>, [w, h]: [u32; 2],
+        captured_at: Instant, audio: crate::audio::Packet)
+    {
+        let frame = RecFrame { surface: None, nv12: true, pixels, w: w as usize, h: h as usize,
+            captured_at, timeline_origin: None, bgra: false, audio };
+        for recorder in recorders { recorder.enqueue(frame.clone()); }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn push_surface_group(recorders: &[Arc<Self>], surface: crate::dx_interop::Surface,
         [w, h]: [u32; 2], captured_at: Instant, audio: crate::audio::Packet)
     {
-        let frame = RecFrame { surface: Some(Arc::new(surface)), pixels: Arc::default(),
+        let frame = RecFrame { surface: Some(Arc::new(surface)), nv12: false, pixels: Arc::default(),
             w: w as usize, h: h as usize, captured_at, timeline_origin: None, bgra: true, audio };
         for recorder in recorders { recorder.enqueue(frame.clone()); }
     }
@@ -257,6 +430,86 @@ impl Recorder {
         let encoder = self.encoder.lock().unwrap();
         format!("{encoder} | Dropped frames: {}", self.dropped.load(Ordering::Relaxed))
     }
+}
+
+/// Frames each recording may queue ahead of its encoder (original MFFramePool size 5).
+pub(crate) const RECORD_QUEUE_FRAMES: usize = 5;
+
+/// Recording "AudioBitRate" default, Kbps (`kh::get_k` @0xe42bc). The Windows AAC encoder gets
+/// at most 192 of it (`ka::.ctor` @0xe29e4).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const RECORD_AUDIO_KBPS: u32 = 384;
+
+/// Writes a recorded picture into an encoder buffer as opaque BGRA `w`×`h` in one pass.
+/// With `scale` the picture is resized to fit (bilinear, 8-bit fixed point); otherwise it sits
+/// at the top left and the rest is black. Replaces a separate resize (new buffer, float filter)
+/// plus a byte-by-byte colour swap; large frames are split across up to 4 threads.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn fill_bgra(dst: &mut [u8], w: usize, h: usize, src: &[u8], sw: usize, sh: usize, src_bgra: bool, scale: bool) {
+    let row = w * 4;
+    let dst = &mut dst[..row * h];
+    if sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
+        dst.chunks_exact_mut(4).for_each(|d| d.copy_from_slice(&[0, 0, 0, 255]));
+        return;
+    }
+    if src_bgra && (sw, sh) == (w, h) {
+        dst.copy_from_slice(&src[..row * h]);
+        return;
+    }
+    let (r, b) = if src_bgra { (2, 0) } else { (0, 2) };
+    let resize = scale && (sw, sh) != (w, h);
+    // Source position of each output column: (offset of left pixel, offset of right, weight 0..256).
+    let map = |d: usize, n: usize, s: usize| -> (usize, usize, u32) {
+        let f = ((d as f64 + 0.5) * s as f64 / n as f64 - 0.5).clamp(0.0, (s - 1) as f64);
+        let i = f as usize;
+        (i, (i + 1).min(s - 1), ((f - i as f64) * 256.0) as u32)
+    };
+    let columns: Vec<(usize, usize, u32)> = if resize {
+        (0..w).map(|x| { let (a, c, f) = map(x, w, sw); (a * 4, c * 4, f) }).collect()
+    } else {
+        Vec::new()
+    };
+    let rows = |first: usize, out: &mut [u8]| {
+        for (y, line) in (first..).zip(out.chunks_exact_mut(row)) {
+            if resize {
+                let (y0, y1, fy) = map(y, h, sh);
+                let (top, bottom) = (&src[y0 * sw * 4..][..sw * 4], &src[y1 * sw * 4..][..sw * 4]);
+                for (d, &(a, c, fx)) in line.chunks_exact_mut(4).zip(&columns) {
+                    let mix = |k: usize| -> u8 {
+                        let t = u32::from(top[a + k]) * (256 - fx) + u32::from(top[c + k]) * fx;
+                        let u = u32::from(bottom[a + k]) * (256 - fx) + u32::from(bottom[c + k]) * fx;
+                        ((t * (256 - fy) + u * fy + 32768) >> 16) as u8
+                    };
+                    d.copy_from_slice(&[mix(b), mix(1), mix(r), 255]);
+                }
+            } else if y < sh {
+                let copied = w.min(sw);
+                let (head, tail) = line.split_at_mut(copied * 4);
+                for (d, s) in head.chunks_exact_mut(4).zip(src[y * sw * 4..][..copied * 4].chunks_exact(4)) {
+                    d.copy_from_slice(&[s[b], s[1], s[r], 255]);
+                }
+                tail.chunks_exact_mut(4).for_each(|d| d.copy_from_slice(&[0, 0, 0, 255]));
+            } else {
+                line.chunks_exact_mut(4).for_each(|d| d.copy_from_slice(&[0, 0, 0, 255]));
+            }
+        }
+    };
+    let bands = if w * h >= 1280 * 720 {
+        std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4)
+    } else {
+        1
+    };
+    if bands == 1 {
+        rows(0, dst);
+        return;
+    }
+    let per_band = h.div_ceil(bands);
+    std::thread::scope(|scope| {
+        for (i, band) in dst.chunks_mut(per_band * row).enumerate() {
+            let rows = &rows;
+            scope.spawn(move || rows(i * per_band, band));
+        }
+    });
 }
 
 /// MP4 video bit rate unless Recording Setup says otherwise: the original's recording settings
@@ -472,7 +725,7 @@ pub(crate) fn run_pictures(sh: Arc<Shared>, folder: String, sequence: bool, fps:
             continue;
         }
         let t0 = Instant::now();
-        if let Ok(img) = image::open(&files[i]) {
+        if let Ok(img) = open_image(&files[i]) {
             let img = img.to_rgba8();
             let (w, h) = (img.width() as usize, img.height() as usize);
             *sh.size.lock().unwrap() = (w, h);
@@ -498,6 +751,12 @@ pub(crate) fn run_pictures(sh: Arc<Shared>, folder: String, sequence: bool, fps:
     }
 }
 
+/// Opens a picture detecting its format from the file contents, so a JPEG saved
+/// with a `.png` extension (or vice versa) still loads.
+pub fn open_image(path: impl AsRef<std::path::Path>) -> image::ImageResult<image::DynamicImage> {
+    image::ImageReader::open(path)?.with_guessed_format()?.decode()
+}
+
 /// Saves a picture by its extension like kb::d @0xe3930 (.png → PNG, .jpg → JPEG, else BMP).
 pub fn save_picture(path: &str, rgba: &[u8], w: usize, h: usize) -> Result<(), String> {
     let lower = path.to_lowercase();
@@ -510,4 +769,42 @@ pub fn save_picture(path: &str, rgba: &[u8], w: usize, h: usize) -> Result<(), S
         image::DynamicImage::ImageRgba8(img).to_rgb8().save_with_format(path, image::ImageFormat::Bmp)
     };
     res.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::fill_bgra;
+
+    #[test]
+    fn copies_rgba_as_opaque_bgra_and_pads_with_black() {
+        let src = [10, 20, 30, 0, 40, 50, 60, 7];
+        let mut dst = vec![9u8; 3 * 2 * 4];
+        fill_bgra(&mut dst, 3, 2, &src, 2, 1, false, false);
+        assert_eq!(&dst[..8], &[30, 20, 10, 255, 60, 50, 40, 255]);
+        assert!(dst[8..].chunks(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn scales_to_the_output_size() {
+        // A 4×2 frame, left half black and right half white, halved to 2×1.
+        let mut src = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 { let v = if x < 2 { 0 } else { 255 }; src.extend_from_slice(&[v, v, v, 255]); }
+        }
+        let mut dst = vec![0u8; 2 * 4];
+        fill_bgra(&mut dst, 2, 1, &src, 4, 2, true, true);
+        assert_eq!(dst, [0, 0, 0, 255, 255, 255, 255, 255]);
+        // Upscaling a flat colour keeps it exactly, also across worker threads.
+        let flat = [1u8, 2, 3, 255].repeat(640 * 360);
+        let mut big = vec![0u8; 1280 * 720 * 4];
+        fill_bgra(&mut big, 1280, 720, &flat, 640, 360, false, true);
+        assert!(big.chunks(4).all(|p| p == [3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn a_short_source_records_black_instead_of_panicking() {
+        let mut dst = vec![5u8; 2 * 2 * 4];
+        fill_bgra(&mut dst, 2, 2, &[1, 2, 3], 2, 2, false, true);
+        assert!(dst.chunks(4).all(|p| p == [0, 0, 0, 255]));
+    }
 }
