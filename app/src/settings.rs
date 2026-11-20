@@ -284,6 +284,23 @@ pub(crate) fn decklink_mode_picker(ui: &mut egui::Ui, id: &str, device: usize, p
     });
 }
 
+/// Broadcast formats for the External Renderer, picked in one step: label, OUTPUT_SIZES index,
+/// FRAME_RATES index (DeckLink frame rate, so 1080i59.94 is 29.97 interlaced) and interlacing.
+pub(crate) const EXTERNAL_PRESETS: [(&str, u8, u8, bool); 13] = [
+    ("720p50", 5, 5, false), ("720p59.94", 5, 6, false),
+    ("1080i50", 6, 2, true), ("1080i59.94", 6, 3, true),
+    ("1080p23.98", 6, 0, false), ("1080p25", 6, 2, false), ("1080p29.97", 6, 3, false),
+    ("1080p50", 6, 5, false), ("1080p59.94", 6, 6, false),
+    ("2160p25", 8, 2, false), ("2160p29.97", 8, 3, false), ("2160p50", 8, 5, false), ("2160p59.94", 8, 6, false),
+];
+
+/// The preset a route's size, rate and interlacing match, if any.
+pub(crate) fn external_preset(route: &crate::model::DeckLinkRoute) -> Option<&'static str> {
+    EXTERNAL_PRESETS.iter().find(|(_, size, rate, interlaced)| {
+        route.format_size == Some(*size) && route.format_rate == Some(*rate) && route.format_interlaced == *interlaced
+    }).map(|preset| preset.0)
+}
+
 pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
     let key = ui.id().with("external-output-channel");
     let mut channel = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(OUTPUT_COUNT - 1);
@@ -331,6 +348,27 @@ pub(crate) fn external_output_settings(ui: &mut egui::Ui, s: &mut Switcher) {
                 } else {
                     ui.label("Select a device");
                 }
+            });
+            ui.end_row();
+            ui.label("Format preset");
+            ui.label("");
+            ui.add_enabled_ui(route.mode == 0, |ui| {
+                let current = if route.format_size.is_none() && route.format_rate.is_none() { "Project format" }
+                    else { external_preset(route).unwrap_or("Custom") };
+                egui::ComboBox::from_id_salt("renderer-preset").selected_text(current).show_ui(ui, |ui| {
+                    if ui.selectable_label(current == "Project format", "Project format").clicked() {
+                        route.format_size = None;
+                        route.format_rate = None;
+                        route.format_interlaced = false;
+                    }
+                    for (label, size, rate, interlaced) in EXTERNAL_PRESETS {
+                        if ui.selectable_label(current == label, label).clicked() {
+                            route.format_size = Some(size);
+                            route.format_rate = Some(rate);
+                            route.format_interlaced = interlaced;
+                        }
+                    }
+                });
             });
             ui.end_row();
             ui.label("Output Size");
@@ -1046,4 +1084,26 @@ pub(crate) fn recording_profile(ui: &mut egui::Ui, id: &str, format: &mut media:
         }
     });
     *format != before
+}
+
+#[cfg(test)]
+mod external_preset_tests {
+    use super::{external_preset, EXTERNAL_PRESETS};
+    use crate::model::{DeckLinkRoute, FRAME_RATES, OUTPUT_SIZES};
+
+    #[test]
+    fn presets_name_broadcast_formats_and_are_recognised() {
+        for (label, size, rate, interlaced) in EXTERNAL_PRESETS {
+            let (w, h) = OUTPUT_SIZES[usize::from(size)];
+            let fps = FRAME_RATES[usize::from(rate)].1;
+            // Interlaced labels give the field rate; DeckLink modes use the frame rate.
+            let named = if interlaced { fps * 2.0 } else { fps };
+            assert!(label.starts_with(&h.to_string()), "{label} is {w}x{h}");
+            assert!(label.contains(if interlaced { 'i' } else { 'p' }), "{label}");
+            assert!((label[label.find(['i', 'p']).unwrap() + 1..].parse::<f32>().unwrap() - named).abs() < 0.02, "{label} at {fps}");
+            let route = DeckLinkRoute { format_size: Some(size), format_rate: Some(rate), format_interlaced: interlaced, ..Default::default() };
+            assert_eq!(external_preset(&route), Some(label));
+        }
+        assert_eq!(external_preset(&DeckLinkRoute::default()), None);
+    }
 }

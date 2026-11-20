@@ -1592,7 +1592,7 @@ pub fn report(path: &Path) -> Result<String> {
     Ok(out)
 }
 
-fn clock_text(value: &str, now_ms: u32) -> Option<String> {
+pub(crate) fn clock_text(value: &str, now_ms: u32) -> Option<String> {
     let pattern = value.strip_prefix("{0:")?.strip_suffix('}')?;
     let (ms, pattern, countdown) = match pattern.split_once('|') {
         Some((target, pattern)) => (clock_target(target)?.saturating_sub(now_ms), pattern, true),

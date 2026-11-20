@@ -17,7 +17,10 @@ fn replay_capture_input(s: &Switcher, source: u32, failed: &std::collections::Ha
     if !s.replay_setup.direct_capture || matches!(source, SRC_OUTPUT | MV_AUTO) { return None; }
     let id = source.checked_sub(1)?;
     let input = s.input(id)?;
-    (matches!(&input.kind, Kind::Device { link, .. } if !link.starts_with("audio:")) && !failed.contains(&id)).then_some(id)
+    // An input with a position, layers, colour, key or other picture setting is composed, so
+    // the recording shows it as it looks on Program.
+    (matches!(&input.kind, Kind::Device { link, .. } if !link.starts_with("audio:"))
+        && input.shows_capture_only() && !failed.contains(&id)).then_some(id)
 }
 
 impl App {
@@ -434,7 +437,11 @@ impl App {
             let mut files = std::array::from_fn(|_| None);
             let mut frames = std::array::from_fn(|_| Vec::new());
             let mut storage = std::array::from_fn(|_| None);
+            let mut late = [0u64; 8];
             for track in segment.tracks {
+                if let Some(slot) = late.get_mut(track.angle) {
+                    *slot = track.late;
+                }
                 let joined = track.worker.join().is_ok();
                 let file = track.storage.as_deref().unwrap_or(&folder).join(&track.file);
                 if joined && track.error.lock().unwrap().is_empty() && std::fs::metadata(&file).is_ok_and(|entry| entry.len() > 0) {
@@ -453,6 +460,26 @@ impl App {
                     self.s.replay_status = if error.is_empty() { format!("Camera {} failed to record", track.angle + 1) }
                         else { format!("Camera {}: {error}", track.angle + 1) };
                 }
+            }
+            // Report cameras that skipped frames in this segment, like the original's per-camera
+            // dropped-frame count (VMXWriter.DroppedFrames).
+            let fps = self.s.replay_setup.fps.unwrap_or(self.record_format.1 as f32);
+            let skipped: Vec<String> = frames.iter().enumerate()
+                .filter_map(|(angle, stamps)| {
+                    let count = replay::skipped_frames(stamps, fps);
+                    // Frames the camera's encoder could not take in time are a separate cause.
+                    let late = late.get(angle).copied().unwrap_or(0);
+                    (count + late > 0).then(|| {
+                        let plural = |n: u64| if n == 1 { "" } else { "s" };
+                        match (count, late) {
+                            (_, 0) => format!("camera {} skipped {count} frame{}", angle + 1, plural(count)),
+                            (0, _) => format!("camera {}: {late} frame{} not encoded in time", angle + 1, plural(late)),
+                            _ => format!("camera {} skipped {count} frame{} ({late} not encoded in time)", angle + 1, plural(count)),
+                        }
+                    })
+                }).collect();
+            if !skipped.is_empty() {
+                self.s.replay_status = format!("Last segment: {}", skipped.join(", "));
             }
             if files.iter().any(Option::is_some) && segment.end > segment.start {
                 replay.session.segments.push(replay::Segment { start: segment.start, end: segment.end, files, frames, storage });
@@ -741,7 +768,8 @@ impl App {
             let origin = replay.current[0].origin;
             let tracks = replay.current.drain(..).map(|track| {
                 drop(track.direct);
-                FinalizingTrack { angle: track.angle, encoded: track.recording.is_some(), file: track.file, storage: track.storage,
+                let late = track.recording.as_ref().map_or(0, |recording| recording.recorder.dropped_frames());
+                FinalizingTrack { angle: track.angle, encoded: track.recording.is_some(), late, file: track.file, storage: track.storage,
                     error: track.error, index: track.index, worker: track.worker }
             }).collect();
             replay.finalizing.push(FinalizingReplay { origin, start, end: position, tracks,
@@ -940,7 +968,7 @@ fn replay_keeps_recording_after_hardware_segment_fails() {
     app.replay.finalizing.push(FinalizingReplay {
         origin: Instant::now(), start: 0, end: 100, hardware_encoding: true,
         tracks: vec![FinalizingTrack {
-            angle: 0, encoded: true, file: "failed.mp4".into(), storage: None,
+            angle: 0, encoded: true, late: 0, file: "failed.mp4".into(), storage: None,
             error: Arc::new(Mutex::new("Recording GPU failure (0x887A0005)".into())),
             index: None, worker,
         }],
@@ -1187,4 +1215,37 @@ fn replay_camera_from_capture_falls_back_to_the_renderer_without_pictures() {
         app.update_replay(3.0);
     }
     let _ = std::fs::remove_dir_all(folder);
+}
+
+#[test]
+fn replay_camera_with_picture_settings_is_composed_not_recorded_from_capture() {
+    let mut app = App::new(None);
+    let s = &mut app.s;
+    s.replay_setup.direct_capture = true;
+    let camera = s.add(Input::new(0, "Camera", Kind::Device { link: "test:camera".into(), blackmagic: false }));
+    let none = std::collections::HashSet::new();
+    assert_eq!(replay_capture_input(&s, camera + 1, &none), Some(camera));
+    let change: [(&str, fn(&mut Input)); 8] = [
+        ("position", |input| input.place.zoom = 1.5),
+        ("crop", |input| input.place.crop[0] = 0.1),
+        ("layer", |input| input.layers[0].on = true),
+        ("colour", |input| input.colour_adjust.brightness = 0.2),
+        ("key", |input| input.key.on = true),
+        ("mirror", |input| input.mirror = true),
+        ("aspect", |input| input.aspect = 1.0),
+        ("delay", |input| input.delay_frames = 3),
+    ];
+    for (name, apply) in change {
+        let input = s.inputs.iter_mut().find(|input| input.id == camera).unwrap();
+        let original = input.clone();
+        apply(input);
+        assert_eq!(replay_capture_input(&s, camera + 1, &none), None, "{name} is recorded from the capture");
+        *s.inputs.iter_mut().find(|input| input.id == camera).unwrap() = original;
+        assert_eq!(replay_capture_input(&s, camera + 1, &none), Some(camera), "{name} was not restored");
+    }
+    // The option off, Program and an angle that already failed are composed too.
+    assert_eq!(replay_capture_input(&s, camera + 1, &[camera].into_iter().collect()), None);
+    assert_eq!(replay_capture_input(&s, SRC_OUTPUT, &none), None);
+    s.replay_setup.direct_capture = false;
+    assert_eq!(replay_capture_input(&s, camera + 1, &none), None);
 }

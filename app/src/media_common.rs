@@ -422,6 +422,11 @@ impl Recorder {
         }
     }
 
+    /// Frames that never reached the encoder (full queue or failed readback).
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     pub fn note_dropped_frames(&self, count: u64) {
         self.dropped.fetch_add(count, Ordering::Relaxed);
     }

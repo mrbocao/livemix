@@ -21,6 +21,7 @@ mod program;
 mod performance;
 mod gt;
 mod timing;
+mod countdown;
 mod preset;
 #[cfg(target_os = "macos")]
 #[path = "decklink_macos.rs"]
@@ -478,6 +479,8 @@ impl ReplayTrack {
 struct FinalizingTrack {
     angle: usize,
     encoded: bool,
+    /// Frames this camera's encoder could not take in time while the segment recorded.
+    late: u64,
     file: String,
     storage: Option<std::path::PathBuf>,
     error: Arc<Mutex<String>>,
@@ -769,6 +772,7 @@ impl eframe::App for App {
         self.update_replay(t);
         self.probe.mark("replay");
         timing::update(&mut self.s.inputs, &mut self.timing, t);
+        for input in &mut self.s.inputs { input.tick_countdowns(t); }
         if self.replay.close_after_recording && self.replay.finalizing.is_empty() && self.replay.current.is_empty() {
             self.replay.close_after_recording = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

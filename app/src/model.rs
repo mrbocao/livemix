@@ -571,6 +571,9 @@ pub struct Input {
     pub decklink_audio_channels: u8,
     /// GT fields that changed recently, each with its own data-change animation.
     pub gt_changes: Vec<crate::gt::DataChange>,
+    /// Title countdowns by field name (StartCountdown, SetCountdown…), like the original's
+    /// per-field `TitleObject.Countdown`.
+    pub countdowns: std::collections::BTreeMap<String, crate::countdown::Countdown>,
     /// The page animation of a GT title that is playing: its number and when it started.
     pub gt_page: Option<(usize, f64)>,
     /// Live timing source of a GT title, and what its last read did.
@@ -581,6 +584,22 @@ pub struct Input {
 }
 
 impl Input {
+    /// Whether the picture this input shows is exactly what its source captures. Position,
+    /// crop, layers, colour and effects, key, mirror, sharpen, deinterlace, aspect and video
+    /// delay are applied while the input is drawn, so a recording taken from the capture
+    /// thread would lose them.
+    pub fn shows_capture_only(&self) -> bool {
+        self.place == Position::default()
+            && !self.layers.iter().any(|layer| layer.on)
+            && self.colour_adjust == ColourAdjust::default()
+            && self.colour_fx == crate::colour_fx::Effects::default()
+            && !self.key.on
+            && !self.mirror && !self.sharpen && !self.deinterlace
+            && !self.rec601 && !self.premultiplied && !self.flatten
+            && self.aspect <= 0.0
+            && self.delay_frames == 0
+    }
+
     pub fn reload_gt(&mut self) -> Result<(), String> {
         let Kind::GtTitle { path, document, .. } = &mut self.kind else {
             return Err("This input is not a GT Title.".into());
@@ -612,6 +631,38 @@ impl Input {
         self.gt_changes.retain(|change| change.field != name && document.data_cue(age(change), &change.field).is_some());
         self.gt_changes.push(crate::gt::DataChange { started: now, field: name, previous });
         Ok(true)
+    }
+
+    /// The title field a countdown shortcut names: a field name (with or without `.Text`), a
+    /// 0-based index (the original's SelectedIndex), or the first field when none is given.
+    pub fn countdown_field(&self, field: Option<&str>) -> Result<String, String> {
+        let Kind::GtTitle { document: Some(document), .. } = &self.kind else {
+            return Err("Countdowns need a GT Title input".into());
+        };
+        let names: Vec<&String> = document.fields.keys().collect();
+        let Some(field) = field.filter(|f| !f.is_empty()) else {
+            return names.first().map(|name| (*name).clone()).ok_or_else(|| "This title has no text fields".into());
+        };
+        if let Ok(index) = field.parse::<usize>() {
+            return names.get(index).map(|name| (*name).clone()).ok_or_else(|| format!("No title field {index}"));
+        }
+        let lower = field.to_ascii_lowercase();
+        names.into_iter().find(|name| name.eq_ignore_ascii_case(field)
+            || lower.strip_suffix(".text").is_some_and(|base| name.eq_ignore_ascii_case(base)))
+            .cloned().ok_or_else(|| format!("Unknown GT title field {field:?}"))
+    }
+
+    /// Advances this title's countdowns (the original's 250 ms timer) and writes their text into
+    /// the fields. Like the original, the text is replaced without a data-change animation.
+    pub fn tick_countdowns(&mut self, now: f64) {
+        if self.countdowns.is_empty() { return; }
+        let Kind::GtTitle { texts, .. } = &mut self.kind else { return };
+        for (field, countdown) in &mut self.countdowns {
+            countdown.tick(now);
+            if let Some(value) = &countdown.value {
+                if texts.get(field) != Some(value) { texts.insert(field.clone(), value.clone()); }
+            }
+        }
     }
 
     /// Plays a page animation (`Page1`, `Page2`…) of a GT title once.
@@ -688,6 +739,7 @@ impl Input {
             decklink_mode: 0,
             decklink_audio_channels: 2,
             gt_changes: Vec::new(),
+            countdowns: Default::default(),
             gt_page: None,
             timing: None,
             timing_run: Default::default(),

@@ -64,7 +64,7 @@ pub(crate) fn replay_windows(ctx: &egui::Context, s: &mut Switcher, t: f64) {
                     ui.checkbox(&mut setup.fragmented_mp4, "Play MP4 while recording (FFmpeg)")
                         .on_hover_text("Records fragmented MP4. Enable before starting the session.");
                     ui.checkbox(&mut setup.direct_capture, tr(ui, "Record cameras from capture"))
-                        .on_hover_text(tr(ui, "Camera angles are encoded from the capture thread instead of the Program renderer. Program and other inputs are still rendered."));
+                        .on_hover_text(tr(ui, "Camera angles with no position, layers, colour, key or other picture setting are encoded from the capture thread. Every other angle is still rendered."));
                     ui.checkbox(&mut setup.resume_on_speed, "Resume playback when speed rises above 0%");
                     ui.checkbox(&mut setup.compressed_omt, tr(ui, "Record original OMT video"))
                         .on_hover_text("Uses source format and embedded audio with Follow camera. Records to MKV.");

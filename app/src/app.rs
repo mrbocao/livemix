@@ -221,6 +221,16 @@ impl App {
                     i.layers[0] = Layer { on: true, input: Some(tower), ..Layer::default() };
                 }
             }
+            "teleprompter" if screenshot.is_some() => {
+                // A Teleprompter in Preview.
+                s.external[0].open = false;
+                s.add_dialog.kind = AddKind::Teleprompter;
+                s.add_dialog.script = "Good evening and welcome to the show.\n\nTonight we look at the match highlights, the replay of the winning goal and the results from the other grounds.\n\nStay with us after the break for the full analysis.\n\nThe script scrolls at the reading speed, and the highlighted line marks where the presenter is reading.".into();
+                if s.add_from_dialog().is_ok() {
+                    if let Some(i) = s.inputs.last_mut() { i.pos = 1.0; }
+                    s.preview = s.inputs.last().map(|i| i.id);
+                }
+            }
             "replay-advanced" if screenshot.is_some() => {
                 s.ensure_replay_inputs();
                 s.replay_open = true;

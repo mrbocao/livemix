@@ -43,7 +43,13 @@ Test builds for Windows x64 and Apple Silicon are published under [GitHub Releas
 | --- | --- |
 | ![Waveform and vectorscope in Preview](docs/screenshots/video-scopes.png) | ![Advanced Replay camera monitors and event controls](docs/screenshots/replay.png) |
 
-![Virtual Set in Preview and static presentation in Program](docs/screenshots/studio.png)
+| Replay controller | Teleprompter |
+| --- | --- |
+| ![Replay controller with event list, playlist and tag buttons](docs/screenshots/replay-controller.png) | ![Teleprompter with a highlighted reading line](docs/screenshots/teleprompter.png) |
+
+| Live timing tower | Virtual Set |
+| --- | --- |
+| ![Timing tower GT title over a camera](docs/screenshots/timing-tower.png) | ![Virtual Set in Preview and static presentation in Program](docs/screenshots/studio.png) |
 
 ## Quick start
 

@@ -10,7 +10,7 @@
   "Record original OMT video": "Gravar vídeo OMT original",
   "Use hardware encoder for Replay": "Usar codificador por hardware no Replay",
   "Record cameras from capture": "Gravar câmeras direto da captura",
-  "Camera angles are encoded from the capture thread instead of the Program renderer. Program and other inputs are still rendered.": "Os ângulos de câmera são codificados direto da captura, sem passar pelo renderizador do Program. O Program e as demais entradas continuam renderizados.",
+  "Camera angles with no position, layers, colour, key or other picture setting are encoded from the capture thread. Every other angle is still rendered.": "Os ângulos de câmera sem posição, layers, cor, key ou outro ajuste de imagem são codificados direto da captura. Os demais continuam renderizados.",
   "Record original NDI video": "Gravar vídeo NDI original",
   "Save NDI as MKV after recording": "Salvar NDI em MKV ao parar",
   "Configure Storage": "Configurar armazenamento",

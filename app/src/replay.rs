@@ -63,6 +63,18 @@ pub struct FrameStamp {
     pub media_ms: u64,
 }
 
+/// Frames a camera skipped while recording, counted like the original's replay writer
+/// (`VMXWriter::a` 0x0600733a): every whole frame interval missing between two recorded frames is
+/// one dropped frame (vMix writes an empty entry for each). Half an interval of jitter is allowed.
+pub fn skipped_frames(frames: &[FrameStamp], fps: f32) -> u64 {
+    if !(fps.is_finite() && fps > 0.0) { return 0; }
+    let interval = 1000.0 / f64::from(fps);
+    frames.windows(2).map(|pair| {
+        let gap = pair[1].show_ms.saturating_sub(pair[0].show_ms) as f64;
+        ((gap + interval / 2.0) / interval).floor().max(1.0) as u64 - 1
+    }).sum()
+}
+
 pub fn camera_storage(requested: &str) -> std::io::Result<Option<PathBuf>> {
     let requested = requested.trim();
     if requested.is_empty() { return Ok(None); }
@@ -610,6 +622,21 @@ pub enum Action {
     PlayQueue { items: Vec<QueueItem>, channel: usize, program: bool, looped: bool },
     Reverse,
     Export { event: u64, angle: usize },
+}
+
+#[cfg(test)]
+mod skipped_frame_tests {
+    use super::{skipped_frames, FrameStamp};
+
+    #[test]
+    fn missing_frame_intervals_count_as_skipped() {
+        let stamps = |times: &[u64]| times.iter().map(|&show_ms| FrameStamp { show_ms, media_ms: show_ms }).collect::<Vec<_>>();
+        // 25 fps = 40 ms: steady frames with a little jitter skip nothing.
+        assert_eq!(skipped_frames(&stamps(&[0, 40, 81, 119, 160]), 25.0), 0);
+        // A 120 ms hole is two missing frames; a 59 ms one still rounds to a single interval.
+        assert_eq!(skipped_frames(&stamps(&[0, 40, 160, 219]), 25.0), 2);
+        assert_eq!(skipped_frames(&stamps(&[0, 40]), 0.0), 0);
+    }
 }
 
 #[cfg(test)]

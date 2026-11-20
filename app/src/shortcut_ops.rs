@@ -9,7 +9,8 @@ SetLayer 1 2 3 · LayerOnOff 1 2 · SetLayer2Width 1 640 · SetLayer2Crop 1 0,0,
 SetOutput2 Preview · SetOutputFullscreen2 MultiView1 · StartSRTOutput 2 · StopSRTOutput 2\n\
 ReplayPlayEventToOutput 0 · ReplaySetSelectedEventText Great save · ReplayToggleSelectedEventCamera2 · ReplayDeleteLastEvent\n\
 TeleprompterPlayPause · TeleprompterFaster · TeleprompterSlower 10 · TeleprompterSpeed 40 · TeleprompterScroll -3 · TeleprompterHome · TeleprompterEnd\n\
-TeleprompterBigger · TeleprompterSmaller · TeleprompterFlipSides · TeleprompterFlipVertical · TeleprompterLoop · TeleprompterSpeed {value}";
+TeleprompterBigger · TeleprompterSmaller · TeleprompterFlipSides · TeleprompterFlipVertical · TeleprompterLoop · TeleprompterSpeed {value}
+\nStartCountdown 1 · PauseCountdown 1 · StopCountdown 1 · SetCountdown 1 00:10:00 · AdjustCountdown 1 -30 · ChangeCountdown 1 00:05:00 Time";
 
 fn parse_index(text: &str, count: usize) -> Result<usize, String> {
     text.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).filter(|&n| n < count)
@@ -84,12 +85,14 @@ fn layer_property(name: &str) -> bool {
 fn has_input(op: &str) -> bool {
     matches!(op, "activeinput" | "inputpreviewshow" | "inputpreviewshowhide" | "mirroron" | "mirroroff"
         | "deinterlaceon" | "deinterlaceoff" | "autoplayon" | "autoplayoff" | "autopauseon" | "autopauseoff"
-        | "autorestarton" | "autorestartoff" | "soloon" | "solooff" | "solo" | "solopfl")
+        | "autorestarton" | "autorestartoff" | "soloon" | "solooff" | "solo" | "solopfl"
+        | "startcountdown" | "stopcountdown" | "pausecountdown" | "suspendcountdown")
 }
 
 fn has_value(op: &str) -> bool {
     matches!(op, "setgain" | "setbalance" | "setalpha" | "setccsaturation" | "setframedelay"
         | "setposition" | "setcrop" | "setinputname" | "settext" | "setcolor" | "moveinput" | "settimingmode" | "settimingclass" | "titlebeginanimation"
+        | "setcountdown" | "changecountdown" | "adjustcountdown"
         | "setlayer" | "layeron" | "layeroff" | "layeronoff" | "movelayer" | "audiobus" | "audiobuson"
         | "audiobusoff" | "setmultiviewoverlay" | "multiviewoverlay" | "multiviewoverlayon" | "multiviewoverlayoff")
         || op.strip_prefix("setlayer").is_some_and(|rest| {
@@ -254,6 +257,33 @@ pub fn run(
                 }
             }
         }
+        // Title countdowns (vMix.Countdown). `StartCountdown 1 [field]`, `SetCountdown 1 00:10:00 [field]`,
+        // `ChangeCountdown 1 00:05:00 [field]`, `AdjustCountdown 1 -30 [field]` (whole seconds,
+        // ×1000 like kzzzzzs at IL_25c6). The field is a name or index; the first field by default.
+        "startcountdown" | "stopcountdown" | "pausecountdown" | "suspendcountdown"
+        | "setcountdown" | "changecountdown" | "adjustcountdown" => {
+            let id = input(s, 0)?;
+            let item = s.input_mut(id).unwrap();
+            let takes_value = matches!(op, "setcountdown" | "changecountdown" | "adjustcountdown");
+            let value = if takes_value { Some(arg(1)?) } else { None };
+            let field = item.countdown_field(args.get(if takes_value { 2 } else { 1 }).copied())?;
+            let countdown = item.countdowns.entry(field).or_default();
+            match op {
+                "startcountdown" => countdown.start(now),
+                "stopcountdown" => countdown.stop(),
+                "pausecountdown" => countdown.pause(now),
+                "suspendcountdown" => countdown.suspend(now),
+                "setcountdown" => countdown.set_duration(crate::countdown::parse_time(value.unwrap())
+                    .ok_or("Enter a time such as 00:10:00")?),
+                "changecountdown" => countdown.change(crate::countdown::parse_time(value.unwrap())
+                    .ok_or("Enter a time such as 00:05:00")?, now),
+                _ => {
+                    let seconds: i64 = value.unwrap().parse().map_err(|_| "Enter whole seconds, e.g. 30 or -30")?;
+                    countdown.adjust(seconds.saturating_mul(1000), now);
+                }
+            }
+            item.tick_countdowns(now);
+        }
         "moveinput" => s.move_input(input(s, 0)?, input(s, 1)?),
         "setlayer" | "layeron" | "layeroff" | "layeronoff" | "movelayer" => {
             let id = input(s, 0)?;
@@ -415,6 +445,32 @@ fn set_title_text(input: &mut Input, field: &str, value: String, now: f64) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn countdown_shortcuts_drive_a_title_field() {
+        let mut s = Switcher::empty();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/examples/timing-tower/timing-tower.gtzip");
+        let mut title = Input::new(0, "Clock", Kind::GtTitle { path: path.into(), texts: Default::default(), document: None });
+        title.reload_gt().unwrap();
+        s.add(title);
+        s.perform_action("SetCountdown 1 00:01:30 Header.Event", 10.0).unwrap();
+        s.perform_action("StartCountdown 1 Header.Event", 10.0).unwrap();
+        let shown = |s: &Switcher| match &s.inputs[0].kind {
+            Kind::GtTitle { texts, .. } => texts.get("Header.Event").cloned(),
+            _ => None,
+        };
+        assert_eq!(shown(&s).as_deref(), Some("00:01:30"));
+        s.inputs[0].tick_countdowns(40.0);
+        assert_eq!(shown(&s).as_deref(), Some("00:01:00"));
+        s.perform_action("AdjustCountdown 1 -30 Header.Event", 40.0).unwrap();
+        s.inputs[0].tick_countdowns(40.0);
+        assert_eq!(shown(&s).as_deref(), Some("00:00:30"));
+        s.inputs[0].tick_countdowns(41.0);
+        s.perform_action("PauseCountdown 1 Header.Event", 41.0).unwrap();
+        s.inputs[0].tick_countdowns(60.0);
+        assert_eq!(shown(&s).as_deref(), Some("00:00:29"));
+        assert!(s.perform_action("StartCountdown 1 Nope", 61.0).is_err());
+    }
 
     #[test]
     fn shortcuts_transform_and_persist_layer_dimensions() {

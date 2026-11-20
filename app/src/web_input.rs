@@ -77,11 +77,28 @@ pub fn interact(ui: &mut egui::Ui, rect: egui::Rect, id: u32, shared: &Shared) {
 const MAX_CAPTURE: usize = 16 * 1024 * 1024;
 static HOST: Mutex<Weak<Browser>> = Mutex::new(Weak::new());
 
-// The browser's hardware output remains muted. Tap its top-level Web Audio
-// graph and eligible HTML media elements before samples reach the output.
+// The browser's hardware output remains muted. Tap the Web Audio graphs and eligible HTML
+// media elements of the page and of its embedded frames before samples reach the output.
+// Frames send their samples to the top page, which mixes every source together (several
+// players at once are summed, not queued one after another).
 const AUDIO_TAP: &str = r#"
-if (window === window.top) (() => {
-    const chunks = [];
+(() => {
+    const top = window === window.top;
+    const sources = new Map();
+    const frameId = Math.random().toString(36).slice(2);
+    let next = 0;
+    function store(id, samples) {
+        let queue = sources.get(id);
+        if (!queue) { queue = []; sources.set(id, queue); }
+        if (queue.length >= 16) queue.shift();
+        queue.push(samples);
+    }
+    if (top) addEventListener("message", event => {
+        const data = event.data;
+        if (!data || !Array.isArray(data.__liveMixAudio)) return;
+        const [id, samples] = data.__liveMixAudio;
+        if (typeof id === "string" && samples instanceof Int16Array && samples.length <= 65536) store(id, samples);
+    });
     const taps = new WeakMap();
     const media = new WeakSet();
     const connect = AudioNode.prototype.connect;
@@ -89,23 +106,23 @@ if (window === window.top) (() => {
     function tap(context) {
         if (taps.has(context)) return taps.get(context);
         const processor = context.createScriptProcessor(1024, 2, 1);
+        const id = frameId + ":" + (next++);
         let phase = 0;
         processor.onaudioprocess = event => {
             const input = event.inputBuffer;
             const left = input.getChannelData(0);
             const right = input.numberOfChannels > 1 ? input.getChannelData(1) : left;
-            let bytes = "";
             const step = input.sampleRate / 48000;
+            const out = [];
             for (; phase < left.length; phase += step) {
                 const i = Math.floor(phase);
-                for (const channel of [left, right]) {
-                    const sample = Math.round(Math.max(-1, Math.min(1, channel[i])) * 32767);
-                    bytes += String.fromCharCode(sample & 255, (sample >> 8) & 255);
-                }
+                out.push(Math.round(Math.max(-1, Math.min(1, left[i])) * 32767),
+                    Math.round(Math.max(-1, Math.min(1, right[i])) * 32767));
             }
             phase -= left.length;
-            if (chunks.length >= 8) chunks.shift();
-            chunks.push(btoa(bytes));
+            const samples = Int16Array.from(out);
+            if (top) store(id, samples);
+            else try { window.top.postMessage({__liveMixAudio: [id, samples]}, "*"); } catch (_) {}
         };
         connect.call(processor, context.destination);
         taps.set(context, processor);
@@ -130,9 +147,40 @@ if (window === window.top) (() => {
         } catch (_) {}
     }
     addEventListener("playing", event => attach(event.target), true);
+    if (!top) {
+        // Frames resume their own media context; the top page collects what they send.
+        setInterval(() => { if (mediaContext?.state === "suspended") mediaContext.resume().catch(() => {}); }, 1000);
+        return;
+    }
     Object.defineProperty(window, "__liveMixTakeAudio", {value: () => {
         if (mediaContext?.state === "suspended") mediaContext.resume().catch(() => {});
-        return chunks.splice(0);
+        // Sum every source sample by sample, clipped to 16 bits, then send 8 KiB pieces.
+        let length = 0;
+        const joined = [];
+        for (const queue of sources.values()) {
+            const total = queue.reduce((sum, part) => sum + part.length, 0);
+            const all = new Int16Array(total);
+            let at = 0;
+            for (const part of queue) { all.set(part, at); at += part.length; }
+            joined.push(all);
+            length = Math.max(length, total);
+        }
+        sources.clear();
+        if (!length) return [];
+        const mixed = new Int16Array(length);
+        for (let i = 0; i < length; i++) {
+            let sum = 0;
+            for (const all of joined) if (i < all.length) sum += all[i];
+            mixed[i] = Math.max(-32768, Math.min(32767, sum));
+        }
+        const bytes = new Uint8Array(mixed.buffer);
+        const chunks = [];
+        for (let start = 0; start < bytes.length && chunks.length < 8; start += 8192) {
+            let text = "";
+            for (const byte of bytes.subarray(start, start + 8192)) text += String.fromCharCode(byte);
+            chunks.push(btoa(text));
+        }
+        return chunks;
     }});
 })();
 "#;
@@ -204,7 +252,9 @@ impl Browser {
         let process = command.args(["--headless=new", "--remote-debugging-address=127.0.0.1",
             "--remote-debugging-port=0", "--no-first-run", "--disable-extensions",
             "--disable-background-networking", "--disable-sync", "--no-default-browser-check", "--hide-scrollbars",
-            "--mute-audio", "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "about:blank"])
+            "--mute-audio", "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+            // Keep embedded frames in the page's process so the audio tap also runs inside them.
+            "--disable-site-isolation-trials", "--disable-features=IsolateOrigins,site-per-process", "about:blank"])
             .arg(format!("--user-data-dir={}", profile.display()))
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         let process = match process {
