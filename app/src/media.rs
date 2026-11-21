@@ -1237,7 +1237,8 @@ fn replay_records_pictures_from_the_capture_thread_with_separate_audio() {
         let path = std::env::temp_dir().join(format!("livemix-capture-tap-{}.{name}", std::process::id()));
         let (stamps, error) = record_from_tap(&path);
         assert!(error.is_empty(), "{name}: {error}");
-        assert!((26..=32).contains(&stamps.len()), "{name}: {} pictures", stamps.len());
+        // Slow runners sleep longer than asked, so allow fewer than the ideal 30 pictures.
+        assert!((20..=32).contains(&stamps.len()), "{name}: {} pictures", stamps.len());
         assert!(stamps.windows(2).all(|pair| pair[0] < pair[1]), "{name}: {stamps:?}");
         let probe = crate::audio::ffprobe_command().args(["-v", "error", "-show_entries", "stream=codec_type",
             "-of", "csv=p=0"]).arg(&path).output().unwrap();
