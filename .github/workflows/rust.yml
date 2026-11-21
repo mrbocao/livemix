@@ -25,6 +25,9 @@ jobs:
       run: rustup default stable-x86_64-pc-windows-msvc
     - name: Build
       run: cargo build --locked --release
+    - name: Install FFmpeg
+      # The Replay recording tests run ffprobe on the files they write.
+      run: choco install ffmpeg --yes --no-progress
     - name: Run tests
       # These two tests require an interactive desktop or a physical camera.
       run: cargo test --locked --release -- --skip desktop_capture_delivers_frames --skip first_camera_delivers_frames

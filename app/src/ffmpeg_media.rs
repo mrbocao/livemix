@@ -393,7 +393,7 @@ fn recording_profiles_mux_video_and_stereo_audio() {
                 .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         }
         #[cfg(not(windows))]
-        record(path.to_str().unwrap(), rx, &Mutex::new(String::new()), opts)
+        record(path.to_str().unwrap(), rx, &Mutex::new(String::new()), opts, None)
             .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         let probe = crate::audio::ffprobe_command().args(["-v", "error", "-show_entries", "stream=codec_type",
             "-of", "csv=p=0"]).arg(&path).output().unwrap();
